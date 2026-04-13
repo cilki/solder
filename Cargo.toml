@@ -1,0 +1,21 @@
+[package]
+name = "solder"
+version = "0.1.0"
+edition = "2021"
+# Someone already took this crate name
+publish = false
+
+[[bin]]
+name = "solder"
+path = "src/main.rs"
+
+[dependencies]
+object = { version = "0.36", features = ["read_core", "elf"] }
+goblin = "0.8"
+memmap2 = "0.9"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+indexmap = "2"
+
+[dev-dependencies]
+tempfile = "3"
