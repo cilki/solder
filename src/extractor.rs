@@ -4,12 +4,13 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 
-use crate::types::{
-    ExtractedReloc, ExtractedUnit, RelocTarget, SectionKind, UnitId,
-};
+use crate::types::{ExtractedReloc, ExtractedUnit, RelocTarget, SectionKind, UnitId};
 
 /// Relocation type names we explicitly reject with a helpful error.
-fn describe_reloc(kind: object::RelocationKind, encoding: object::RelocationEncoding) -> &'static str {
+fn describe_reloc(
+    kind: object::RelocationKind,
+    encoding: object::RelocationEncoding,
+) -> &'static str {
     match (kind, encoding) {
         (object::RelocationKind::Got, _) => "GOT-relative (GOTPCREL/GOTPCRELX)",
         (object::RelocationKind::GotRelative, _) => "GOT-relative",
@@ -114,8 +115,8 @@ pub fn extract_units(
 /// Process a single symbol: extract its bytes, parse its relocations, and
 /// return new symbols to enqueue.
 fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<UnitKey>> {
-    let lib_bytes = std::fs::read(&key.lib)
-        .with_context(|| format!("reading {}", key.lib.display()))?;
+    let lib_bytes =
+        std::fs::read(&key.lib).with_context(|| format!("reading {}", key.lib.display()))?;
 
     // Check for unsupported features before extraction.
     {
@@ -224,9 +225,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
 
         // Resolve the relocation target symbol.
         let target_sym = match reloc.target() {
-            object::RelocationTarget::Symbol(si) => {
-                elf64.symbol_by_index(si).ok()
-            }
+            object::RelocationTarget::Symbol(si) => elf64.symbol_by_index(si).ok(),
             _ => None,
         };
 
@@ -316,7 +315,11 @@ fn find_symbol(elf: &object::read::elf::ElfFile64<'_>, name: &str) -> Result<Sym
                 object::SymbolSection::Section(si) => si,
                 _ => bail!("symbol '{name}' is not in a regular section"),
             };
-            return Ok(SymInfo { vaddr: sym.address(), size: sym.size(), section });
+            return Ok(SymInfo {
+                vaddr: sym.address(),
+                size: sym.size(),
+                section,
+            });
         }
     }
     // Fall back to .dynsym.
@@ -326,7 +329,11 @@ fn find_symbol(elf: &object::read::elf::ElfFile64<'_>, name: &str) -> Result<Sym
                 object::SymbolSection::Section(si) => si,
                 _ => bail!("symbol '{name}' is not in a regular section"),
             };
-            return Ok(SymInfo { vaddr: sym.address(), size: sym.size(), section });
+            return Ok(SymInfo {
+                vaddr: sym.address(),
+                size: sym.size(),
+                section,
+            });
         }
     }
     bail!("symbol '{name}' not found in .symtab or .dynsym")
@@ -352,7 +359,9 @@ fn infer_symbol_size(elf: &object::read::elf::ElfFile64<'_>, sym: &SymInfo) -> R
         }
     }
 
-    let section = elf.section_by_index(sym_section).context("section lookup")?;
+    let section = elf
+        .section_by_index(sym_section)
+        .context("section lookup")?;
     let section_end = section.address() + section.size();
     let limit = next_addr.unwrap_or(section_end);
 

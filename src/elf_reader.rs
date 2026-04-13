@@ -19,8 +19,8 @@ unsafe impl Sync for MappedElf {}
 
 impl MappedElf {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
+        let file =
+            std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("cannot mmap {}", path.display()))?;
         let ptr = mmap.as_ptr();
@@ -45,7 +45,6 @@ impl MappedElf {
             .with_context(|| format!("failed to parse ELF {}", self.path.display()))
     }
 }
-
 
 /// Convert a virtual address in a parsed ELF to a file offset.
 /// Returns None if the VA is not covered by any PT_LOAD segment.
@@ -88,10 +87,12 @@ pub fn next_free_va(elf: &ElfFile64<'_>) -> u64 {
 
 /// Validate that the input ELF is a supported target:
 /// - 64-bit ELF
-/// - ET_EXEC (not PIE/ET_DYN)
+/// - ET_EXEC or ET_DYN (PIE)
 /// - EM_X86_64
 /// - Has PT_DYNAMIC (dynamically linked)
-pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<()> {
+///
+/// Returns `true` if the executable is PIE (ET_DYN), `false` if non-PIE (ET_EXEC).
+pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<bool> {
     use object::elf::{ET_DYN, ET_EXEC};
     use object::read::elf::{FileHeader, ProgramHeader};
 
@@ -107,27 +108,25 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<()> {
             e_machine
         );
     }
-    if e_type == ET_DYN {
-        bail!(
-            "{}: PIE executables (ET_DYN) are not yet supported; relink with -no-pie",
-            path.display()
-        );
-    }
-    if e_type != ET_EXEC {
+
+    let is_pie = if e_type == ET_DYN {
+        true // PIE executable
+    } else if e_type == ET_EXEC {
+        false // Non-PIE executable
+    } else {
         bail!(
             "{}: not an executable (e_type=0x{:04x})",
             path.display(),
             e_type
         );
-    }
+    };
 
     // Check for PT_DYNAMIC
-    let has_dynamic = elf
-        .elf_program_headers()
-        .iter()
-        .any(|s: &object::elf::ProgramHeader64<object::Endianness>| {
+    let has_dynamic = elf.elf_program_headers().iter().any(
+        |s: &object::elf::ProgramHeader64<object::Endianness>| {
             s.p_type(endian) == object::elf::PT_DYNAMIC
-        });
+        },
+    );
     if !has_dynamic {
         bail!(
             "{}: statically linked binary — nothing to merge",
@@ -135,5 +134,25 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<()> {
         );
     }
 
-    Ok(())
+    Ok(is_pie)
+}
+
+/// Convert a file offset to a virtual address in a parsed ELF.
+/// Returns None if the offset is not covered by any PT_LOAD segment.
+pub fn file_offset_to_va(elf: &ElfFile64<'_>, offset: u64) -> Option<u64> {
+    use object::read::elf::ProgramHeader;
+    let endian = elf.endian();
+    for seg in elf.elf_program_headers() {
+        let p_type = seg.p_type(endian);
+        if p_type != object::elf::PT_LOAD {
+            continue;
+        }
+        let p_offset = seg.p_offset(endian);
+        let p_filesz = seg.p_filesz(endian);
+        let p_vaddr = seg.p_vaddr(endian);
+        if offset >= p_offset && offset < p_offset + p_filesz {
+            return Some(offset - p_offset + p_vaddr);
+        }
+    }
+    None
 }

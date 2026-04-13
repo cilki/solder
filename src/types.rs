@@ -1,5 +1,15 @@
 use std::path::PathBuf;
 
+/// A runtime relocation (R_X86_64_RELATIVE) to be added to .rela.dyn for PIE executables.
+/// At runtime, ld.so computes: `*(vaddr + load_base) = load_base + addend`
+#[derive(Debug, Clone)]
+pub struct RelativeReloc {
+    /// Virtual address (offset from load base) of the 8-byte slot to fix up.
+    pub vaddr: u64,
+    /// The addend value (the offset-based address already stored at the location).
+    pub addend: i64,
+}
+
 /// Stable identifier for an extracted unit across pipeline stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UnitId(pub u32);
@@ -96,6 +106,8 @@ pub struct TrampolineStub {
 pub struct GotPatch {
     /// File offset of the 8-byte GOT slot.
     pub got_file_offset: u64,
+    /// Virtual address of the GOT slot (for PIE relative reloc generation).
+    pub got_vaddr: u64,
     /// The value to write (the resolved virtual address of the merged symbol).
     pub value: u64,
 }
@@ -103,6 +115,8 @@ pub struct GotPatch {
 /// The complete merge plan produced after layout, ready for relocation application and output.
 #[derive(Debug)]
 pub struct MergePlan {
+    /// Whether the executable is PIE (ET_DYN).
+    pub is_pie: bool,
     /// Base virtual address of the new PT_LOAD segment.
     pub load_address: u64,
     pub text_units: Vec<AssignedUnit>,
@@ -116,13 +130,20 @@ pub struct MergePlan {
     pub jump_slot_reloc_offsets: Vec<u64>,
     /// DT_NEEDED string values to remove from the dynamic section.
     pub remove_needed: Vec<String>,
+    /// R_X86_64_RELATIVE relocations to add for PIE executables.
+    pub relative_relocs: Vec<RelativeReloc>,
 }
 
 impl MergePlan {
     /// Total size in bytes of the merged segment (all units + trampolines).
     pub fn segment_size(&self) -> usize {
         let mut sz = 0usize;
-        for u in self.text_units.iter().chain(&self.rodata_units).chain(&self.data_units) {
+        for u in self
+            .text_units
+            .iter()
+            .chain(&self.rodata_units)
+            .chain(&self.data_units)
+        {
             let end = (u.assigned_vaddr - self.load_address) as usize + u.unit.size;
             if end > sz {
                 sz = end;
@@ -140,12 +161,17 @@ impl MergePlan {
 
     /// Iterate all assigned units across all section kinds.
     pub fn all_units(&self) -> impl Iterator<Item = &AssignedUnit> {
-        self.text_units.iter().chain(&self.rodata_units).chain(&self.data_units)
+        self.text_units
+            .iter()
+            .chain(&self.rodata_units)
+            .chain(&self.data_units)
     }
 
     /// Iterate all assigned units mutably.
     pub fn all_units_mut(&mut self) -> impl Iterator<Item = &mut AssignedUnit> {
-        self.text_units.iter_mut().chain(&mut self.rodata_units).chain(&mut self.data_units)
+        self.text_units
+            .iter_mut()
+            .chain(&mut self.rodata_units)
+            .chain(&mut self.data_units)
     }
-
 }

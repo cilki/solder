@@ -37,27 +37,32 @@ fn apply_unit_relocations(
 
         // S = target symbol VA
         let s: u64 = match &reloc.target {
-            RelocTarget::MergedUnit(id) => {
-                *id_to_vaddr.get(id).with_context(|| {
-                    format!("reloc target UnitId({}) not found in plan", id.0)
-                })?
-            }
-            RelocTarget::External(name) => {
-                *tramp_to_vaddr.get(name).with_context(|| {
-                    format!("no trampoline for external symbol '{name}'")
-                })?
-            }
+            RelocTarget::MergedUnit(id) => *id_to_vaddr
+                .get(id)
+                .with_context(|| format!("reloc target UnitId({}) not found in plan", id.0))?,
+            RelocTarget::External(name) => *tramp_to_vaddr
+                .get(name)
+                .with_context(|| format!("no trampoline for external symbol '{name}'"))?,
         };
 
         let a: i64 = reloc.addend;
 
-        apply_one_reloc(&mut au.unit.bytes, reloc.kind, reloc.encoding, reloc.size, off, s, a, p)
-            .with_context(|| {
-                format!(
-                    "reloc at offset 0x{:x} (kind={:?}, size={}b)",
-                    off, reloc.kind, reloc.size
-                )
-            })?;
+        apply_one_reloc(
+            &mut au.unit.bytes,
+            reloc.kind,
+            reloc.encoding,
+            reloc.size,
+            off,
+            s,
+            a,
+            p,
+        )
+        .with_context(|| {
+            format!(
+                "reloc at offset 0x{:x} (kind={:?}, size={}b)",
+                off, reloc.kind, reloc.size
+            )
+        })?;
     }
     Ok(())
 }
@@ -85,12 +90,10 @@ pub fn apply_one_reloc(
 ) -> Result<()> {
     let value: i128 = match kind {
         // R_X86_64_64: S + A, 64-bit absolute
-        object::RelocationKind::Absolute if size == 64 => {
-            (s as i128) + (a as i128)
-        }
+        object::RelocationKind::Absolute if size == 64 => (s as i128) + (a as i128),
         // R_X86_64_32: (S + A), truncate to 32 bits, unsigned — must not overflow
-        object::RelocationKind::Absolute if size == 32
-            && encoding == object::RelocationEncoding::Generic =>
+        object::RelocationKind::Absolute
+            if size == 32 && encoding == object::RelocationEncoding::Generic =>
         {
             let v = (s as i128) + (a as i128);
             if v < 0 || v > u32::MAX as i128 {
@@ -99,8 +102,8 @@ pub fn apply_one_reloc(
             v
         }
         // R_X86_64_32S: S + A, sign-extended 32 bits — must fit in i32
-        object::RelocationKind::Absolute if size == 32
-            && encoding == object::RelocationEncoding::X86Signed =>
+        object::RelocationKind::Absolute
+            if size == 32 && encoding == object::RelocationEncoding::X86Signed =>
         {
             let v = (s as i128) + (a as i128);
             if v < i32::MIN as i128 || v > i32::MAX as i128 {
@@ -132,9 +135,7 @@ pub fn apply_one_reloc(
             v
         }
         // R_X86_64_PC64: S + A - P, 64-bit PC-relative (rare)
-        object::RelocationKind::Relative if size == 64 => {
-            (s as i128) + (a as i128) - (p as i128)
-        }
+        object::RelocationKind::Relative if size == 64 => (s as i128) + (a as i128) - (p as i128),
         other => {
             bail!("unsupported relocation kind {:?} (size={size})", other);
         }
@@ -156,14 +157,20 @@ fn write_reloc_value(bytes: &mut [u8], offset: usize, size: u8, value: i128) -> 
         32 => {
             let v = (value as u32).to_le_bytes();
             if offset + 4 > bytes.len() {
-                bail!("reloc write at offset {offset} + 4 bytes overflows unit of size {}", bytes.len());
+                bail!(
+                    "reloc write at offset {offset} + 4 bytes overflows unit of size {}",
+                    bytes.len()
+                );
             }
             bytes[offset..offset + 4].copy_from_slice(&v);
         }
         64 => {
             let v = (value as u64).to_le_bytes();
             if offset + 8 > bytes.len() {
-                bail!("reloc write at offset {offset} + 8 bytes overflows unit of size {}", bytes.len());
+                bail!(
+                    "reloc write at offset {offset} + 8 bytes overflows unit of size {}",
+                    bytes.len()
+                );
             }
             bytes[offset..offset + 8].copy_from_slice(&v);
         }
@@ -183,7 +190,8 @@ mod tests {
             &mut bytes,
             object::RelocationKind::Absolute,
             object::RelocationEncoding::Generic,
-            64, 0,
+            64,
+            0,
             0x0000_0000_0040_1000, // S
             0,                     // A
             0x0000_0000_0040_0100, // P (unused for Absolute)
@@ -200,7 +208,8 @@ mod tests {
             &mut bytes,
             object::RelocationKind::Relative,
             object::RelocationEncoding::Generic,
-            32, 0,
+            32,
+            0,
             0x402000, // S
             -4,       // A
             0x401000, // P
@@ -217,7 +226,8 @@ mod tests {
             &mut bytes,
             object::RelocationKind::Absolute,
             object::RelocationEncoding::Generic,
-            32, 0,
+            32,
+            0,
             0xffff_ffff_0000_0000, // S — too large for u32
             0,
             0,
@@ -232,7 +242,8 @@ mod tests {
             &mut bytes,
             object::RelocationKind::Relative,
             object::RelocationEncoding::Generic,
-            32, 0,
+            32,
+            0,
             0x8000_0000_0000_0000, // S — too far
             0,
             0x0000_0000_0040_0000, // P

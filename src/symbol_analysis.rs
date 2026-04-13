@@ -44,7 +44,11 @@ pub fn parse_dynamic(elf: &ElfFile64<'_>) -> Result<DynamicInfo> {
         }
     }
 
-    Ok(DynamicInfo { needed, rpath, runpath })
+    Ok(DynamicInfo {
+        needed,
+        rpath,
+        runpath,
+    })
 }
 
 /// Collect all symbols the executable imports from shared libraries, resolving
@@ -56,7 +60,6 @@ pub fn collect_imports(
     extra_lib_paths: &[PathBuf],
     merge_filter: Option<&[String]>,
 ) -> Result<Vec<ImportedSymbol>> {
-
     let bytes = elf.data();
 
     // Build a map from symbol name → source library path.
@@ -74,25 +77,24 @@ pub fn collect_imports(
             continue;
         }
         if let Some(filter) = merge_filter {
-            if !filter.iter().any(|f| f == needed || needed.starts_with(f.as_str())) {
+            if !filter
+                .iter()
+                .any(|f| f == needed || needed.starts_with(f.as_str()))
+            {
                 continue;
             }
         }
 
-        let lib_path =
-            resolve_library(needed, &search_rpath, search_runpath, ldso_cache)
-                .with_context(|| format!("resolving DT_NEEDED '{needed}'"))?;
+        let lib_path = resolve_library(needed, &search_rpath, search_runpath, ldso_cache)
+            .with_context(|| format!("resolving DT_NEEDED '{needed}'"))?;
 
-        let lib_bytes = std::fs::read(&lib_path)
-            .with_context(|| format!("reading {}", lib_path.display()))?;
-        let lib_goblin =
-            goblin::elf::Elf::parse(&lib_bytes).with_context(|| {
-                format!("parsing {}", lib_path.display())
-            })?;
+        let lib_bytes =
+            std::fs::read(&lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
+        let lib_goblin = goblin::elf::Elf::parse(&lib_bytes)
+            .with_context(|| format!("parsing {}", lib_path.display()))?;
 
         for sym in lib_goblin.dynsyms.iter() {
-            if sym.st_shndx != goblin::elf::section_header::SHN_UNDEF as usize
-                && sym.st_shndx != 0
+            if sym.st_shndx != goblin::elf::section_header::SHN_UNDEF as usize && sym.st_shndx != 0
             {
                 if let Some(name) = lib_goblin.dynstrtab.get_at(sym.st_name) {
                     sym_to_lib
@@ -213,7 +215,10 @@ pub fn find_jump_slot_reloc_offsets(
             .iter()
             .enumerate()
             .filter_map(|(i, sym)| {
-                goblin_exe.dynstrtab.get_at(sym.st_name).map(|n| (i, n.to_owned()))
+                goblin_exe
+                    .dynstrtab
+                    .get_at(sym.st_name)
+                    .map(|n| (i, n.to_owned()))
             })
             .collect();
 

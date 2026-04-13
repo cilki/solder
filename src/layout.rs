@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 
+use crate::elf_reader::file_offset_to_va;
 use crate::elf_reader::next_free_va;
 use crate::types::{
-    AssignedUnit, ExtractedUnit, GotPatch, MergePlan, RelocTarget, SectionKind,
-    TrampolineStub,
+    AssignedUnit, ExtractedUnit, GotPatch, MergePlan, RelocTarget, SectionKind, TrampolineStub,
 };
 
 /// Plan the virtual address layout of all extracted units and trampolines,
@@ -15,6 +15,7 @@ pub fn plan_layout(
     exe_elf: &object::read::elf::ElfFile64<'_>,
     imports: &[crate::types::ImportedSymbol],
     base_override: Option<u64>,
+    is_pie: bool,
 ) -> Result<MergePlan> {
     let load_address = base_override.unwrap_or_else(|| next_free_va(exe_elf));
 
@@ -85,10 +86,20 @@ pub fn plan_layout(
     let mut got_patches: Vec<GotPatch> = Vec::new();
     for imp in imports {
         let vaddr = unit_vaddr_by_name.get(&imp.name).with_context(|| {
-            format!("imported symbol '{}' was not extracted — internal error", imp.name)
+            format!(
+                "imported symbol '{}' was not extracted — internal error",
+                imp.name
+            )
+        })?;
+        let got_vaddr = file_offset_to_va(exe_elf, imp.got_file_offset).with_context(|| {
+            format!(
+                "GOT file offset 0x{:x} for '{}' is not in any PT_LOAD segment",
+                imp.got_file_offset, imp.name
+            )
         })?;
         got_patches.push(GotPatch {
             got_file_offset: imp.got_file_offset,
+            got_vaddr,
             value: *vaddr,
         });
     }
@@ -119,7 +130,9 @@ pub fn plan_layout(
     };
 
     // Jump-slot reloc offsets are populated by the caller (patcher.rs), so leave empty here.
+    // Relative relocs are populated during segment building (trampolines) and patching (GOT).
     Ok(MergePlan {
+        is_pie,
         load_address,
         text_units,
         rodata_units,
@@ -128,6 +141,7 @@ pub fn plan_layout(
         got_patches,
         jump_slot_reloc_offsets: Vec::new(),
         remove_needed,
+        relative_relocs: Vec::new(),
     })
 }
 
@@ -143,7 +157,10 @@ fn assign_addresses(
             *offset = align_up(*offset, align);
             let assigned_vaddr = load_address + *offset;
             *offset += unit.size as u64;
-            AssignedUnit { unit, assigned_vaddr }
+            AssignedUnit {
+                unit,
+                assigned_vaddr,
+            }
         })
         .collect()
 }
@@ -159,9 +176,7 @@ pub fn align_up(value: u64, align: u64) -> u64 {
 /// relocations in the executable.  This is how we find the GOT slot VA for external
 /// symbols that merged library code calls through (we'll create trampolines that
 /// jump to these GOT slots at load time after ld.so fills them).
-fn build_exe_got_map(
-    elf: &object::read::elf::ElfFile64<'_>,
-) -> Result<HashMap<String, u64>> {
+fn build_exe_got_map(elf: &object::read::elf::ElfFile64<'_>) -> Result<HashMap<String, u64>> {
     let bytes = elf.data();
     let goblin_exe = goblin::elf::Elf::parse(bytes).context("goblin for GOT map")?;
 
@@ -170,13 +185,20 @@ fn build_exe_got_map(
         .iter()
         .enumerate()
         .filter_map(|(i, sym)| {
-            goblin_exe.dynstrtab.get_at(sym.st_name).map(|n| (i, n.to_owned()))
+            goblin_exe
+                .dynstrtab
+                .get_at(sym.st_name)
+                .map(|n| (i, n.to_owned()))
         })
         .collect();
 
     let mut map: HashMap<String, u64> = HashMap::new();
 
-    for rela in goblin_exe.pltrelocs.iter().chain(goblin_exe.dynrelas.iter()) {
+    for rela in goblin_exe
+        .pltrelocs
+        .iter()
+        .chain(goblin_exe.dynrelas.iter())
+    {
         let sym_idx = rela.r_sym;
         if let Some(name) = dynidx_to_name.get(&sym_idx) {
             map.entry(name.clone()).or_insert(rela.r_offset);

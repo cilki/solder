@@ -1,13 +1,16 @@
 use anyhow::{bail, Context, Result};
 
-use crate::types::MergePlan;
+use crate::types::{MergePlan, RelativeReloc};
 
 /// Apply all in-place patches to a mutable copy of the executable bytes:
 ///   1. Pre-fill GOT entries with resolved merged symbol addresses.
 ///   2. Zero out JUMP_SLOT relocation entries so ld.so won't overwrite our patches.
 ///   3. Remove DT_NEEDED entries for fully-merged libraries.
 ///   4. Remove PT_INTERP if no DT_NEEDED entries remain.
-pub fn apply_patches(exe_bytes: &mut Vec<u8>, plan: &MergePlan) -> Result<()> {
+///
+/// For PIE executables, this also populates `plan.relative_relocs` with entries
+/// for the patched GOT slots that need R_X86_64_RELATIVE relocations.
+pub fn apply_patches(exe_bytes: &mut Vec<u8>, plan: &mut MergePlan) -> Result<()> {
     patch_got(exe_bytes, plan)?;
     zero_jump_slot_relocs(exe_bytes, plan)?;
     remove_dt_needed(exe_bytes, plan)?;
@@ -15,13 +18,26 @@ pub fn apply_patches(exe_bytes: &mut Vec<u8>, plan: &MergePlan) -> Result<()> {
 }
 
 /// Write each resolved symbol address into the executable's GOT.
-fn patch_got(bytes: &mut Vec<u8>, plan: &MergePlan) -> Result<()> {
+/// For PIE, also record RELATIVE relocations for each patched slot.
+fn patch_got(bytes: &mut Vec<u8>, plan: &mut MergePlan) -> Result<()> {
     for patch in &plan.got_patches {
         let off = patch.got_file_offset as usize;
         if off + 8 > bytes.len() {
-            bail!("GOT patch offset 0x{:x} + 8 out of bounds (file size {})", off, bytes.len());
+            bail!(
+                "GOT patch offset 0x{:x} + 8 out of bounds (file size {})",
+                off,
+                bytes.len()
+            );
         }
         bytes[off..off + 8].copy_from_slice(&patch.value.to_le_bytes());
+
+        // For PIE: the patched GOT slot holds an absolute address that needs runtime fixup
+        if plan.is_pie {
+            plan.relative_relocs.push(RelativeReloc {
+                vaddr: patch.got_vaddr,
+                addend: patch.value as i64,
+            });
+        }
     }
     Ok(())
 }
@@ -53,8 +69,8 @@ fn remove_dt_needed(bytes: &mut Vec<u8>, plan: &MergePlan) -> Result<()> {
     // Parse goblin to collect the entry indices and section offset, then drop
     // the borrow before mutating `bytes`.
     let (dyn_section_offset, num_entries, removal_indices): (u64, usize, Vec<usize>) = {
-        let goblin_elf = goblin::elf::Elf::parse(bytes)
-            .context("goblin parse for DT_NEEDED removal")?;
+        let goblin_elf =
+            goblin::elf::Elf::parse(bytes).context("goblin parse for DT_NEEDED removal")?;
 
         let dynamic = match &goblin_elf.dynamic {
             Some(d) => d,

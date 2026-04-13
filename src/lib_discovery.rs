@@ -75,8 +75,14 @@ pub fn resolve_library(
     }
 
     // 5. Default paths
-    for dir in &["/lib64", "/usr/lib64", "/lib", "/usr/lib",
-                  "/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu"] {
+    for dir in &[
+        "/lib64",
+        "/usr/lib64",
+        "/lib",
+        "/usr/lib",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+    ] {
         let candidate = Path::new(dir).join(soname);
         if candidate.exists() {
             return Ok(candidate);
@@ -103,8 +109,7 @@ impl LdsoCache {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         Self::parse(&data).with_context(|| format!("parsing {}", path.display()))
     }
 
@@ -125,8 +130,8 @@ impl LdsoCache {
             bail!("ld.so.cache too small");
         }
 
-        let nlibs = u32::from_le_bytes(data[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap())
-            as usize;
+        let nlibs =
+            u32::from_le_bytes(data[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap()) as usize;
         let entries_start = HEADER_SIZE + 4;
         let entry_size = 12; // flags(4) + key(4) + value(4)
         let strings_start = entries_start + nlibs * entry_size;
@@ -138,10 +143,8 @@ impl LdsoCache {
         for i in 0..nlibs {
             let off = entries_start + i * entry_size;
             // Skip flags (4 bytes)
-            let key_off =
-                u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
-            let val_off =
-                u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
+            let key_off = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
+            let val_off = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap()) as usize;
 
             let key = read_cstr(data, strings_start + key_off)?;
             let val = read_cstr(data, strings_start + val_off)?;

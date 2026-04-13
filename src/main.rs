@@ -66,7 +66,10 @@ fn run() -> Result<()> {
         .merge_base
         .as_deref()
         .map(|s| {
-            let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            let s = s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .unwrap_or(s);
             u64::from_str_radix(s, 16).context("--merge-base must be a hex address")
         })
         .transpose()?;
@@ -84,11 +87,15 @@ fn run() -> Result<()> {
     }
 
     // ── Step 0: load and validate the input executable ───────────────────────
-    let exe_mapped = MappedElf::open(&cli.input)
-        .with_context(|| format!("opening {}", cli.input.display()))?;
+    let exe_mapped =
+        MappedElf::open(&cli.input).with_context(|| format!("opening {}", cli.input.display()))?;
     let exe_elf = exe_mapped.parse()?;
 
-    elf_reader::validate_executable(&exe_elf, &cli.input)?;
+    let is_pie = elf_reader::validate_executable(&exe_elf, &cli.input)?;
+
+    if cli.verbose && is_pie {
+        println!("Input is a PIE executable (ET_DYN)");
+    }
 
     // ── Step 1: parse dynamic section + collect imports ──────────────────────
     let dyn_info = parse_dynamic(&exe_elf)?;
@@ -113,7 +120,10 @@ fn run() -> Result<()> {
     }
 
     if cli.verbose || cli.dry_run {
-        println!("Discovered {} directly imported symbol(s) to merge:", imports.len());
+        println!(
+            "Discovered {} directly imported symbol(s) to merge:",
+            imports.len()
+        );
         for imp in &imports {
             println!(
                 "  {:?}  {}  (from {})",
@@ -147,13 +157,10 @@ fn run() -> Result<()> {
     }
 
     // ── Step 3: layout planning ───────────────────────────────────────────────
-    let mut plan = layout::plan_layout(units, &exe_elf, &imports, merge_base)?;
+    let mut plan = layout::plan_layout(units, &exe_elf, &imports, merge_base, is_pie)?;
 
     if cli.verbose || cli.dry_run {
-        println!(
-            "\nMerged segment base VA: 0x{:016x}",
-            plan.load_address
-        );
+        println!("\nMerged segment base VA: 0x{:016x}", plan.load_address);
         println!("GOT patches: {}", plan.got_patches.len());
         println!("Trampolines: {}", plan.trampoline_stubs.len());
         for t in &plan.trampoline_stubs {
@@ -181,11 +188,18 @@ fn run() -> Result<()> {
             .context("finding JUMP_SLOT reloc offsets")?;
 
     let mut patched_exe = exe_mapped.bytes().to_vec();
-    patcher::apply_patches(&mut patched_exe, &plan)?;
+    patcher::apply_patches(&mut patched_exe, &mut plan)?;
 
     // ── Step 6: build merged segment + write output ────────────────────────────
-    let merged_seg = writer::build_merged_segment(&plan)?;
+    let merged_seg = writer::build_merged_segment(&mut plan)?;
     writer::write_output(&patched_exe, &plan, &merged_seg, &cli.input)?;
+
+    if cli.verbose && plan.is_pie {
+        println!(
+            "Added {} R_X86_64_RELATIVE relocation(s) for PIE",
+            plan.relative_relocs.len()
+        );
+    }
 
     println!(
         "Merged {} symbol(s) ({} bytes) into {}",
