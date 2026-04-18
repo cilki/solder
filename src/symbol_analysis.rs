@@ -182,57 +182,87 @@ pub fn collect_imports(
 }
 
 /// For a given set of imported symbols, find the file offsets of their JUMP_SLOT
-/// relocation entries (so we can zero them out later to prevent ld.so from
-/// overwriting our pre-patched GOT entries).
+/// and GLOB_DAT relocation entries (so we can zero them out later to prevent ld.so
+/// from overwriting our pre-patched GOT entries).
+///
+/// JUMP_SLOT relocations are in .rela.plt, GLOB_DAT relocations are in .rela.dyn.
 pub fn find_jump_slot_reloc_offsets(
     elf: &ElfFile64<'_>,
     imported_names: &std::collections::HashSet<String>,
 ) -> Result<Vec<u64>> {
+    use goblin::elf64::reloc::R_X86_64_GLOB_DAT;
+
     let bytes = elf.data();
     let goblin_exe = goblin::elf::Elf::parse(bytes).context("goblin parse")?;
 
     let mut offsets = Vec::new();
 
-    // Find the .rela.plt section to get its file offset.
+    // Build dynsym index → name map once for both sections
+    let dynidx_to_name: std::collections::HashMap<usize, String> = goblin_exe
+        .dynsyms
+        .iter()
+        .enumerate()
+        .filter_map(|(i, sym)| {
+            goblin_exe
+                .dynstrtab
+                .get_at(sym.st_name)
+                .map(|n| (i, n.to_owned()))
+        })
+        .collect();
+
     // Each Rela64 entry is 24 bytes: r_offset(8) + r_info(8) + r_addend(8)
     // We need the file offset of the r_info field (offset +8) and r_addend (offset+16)
     // to zero them out.
-    //
-    // goblin gives us the VAs of relocations; we need file offsets.
-    // Find the .rela.plt section by name.
+
+    // Process .rela.plt for JUMP_SLOT relocations
     for section in elf.sections() {
         if section.name() != Ok(".rela.plt") {
             continue;
         }
         let sh_offset = section.file_range().map(|(off, _)| off).unwrap_or(0);
-
-        // Parse entries manually: each is 24 bytes
         let data = section.data().context(".rela.plt data")?;
         let n = data.len() / 24;
-
-        let dynidx_to_name: std::collections::HashMap<usize, String> = goblin_exe
-            .dynsyms
-            .iter()
-            .enumerate()
-            .filter_map(|(i, sym)| {
-                goblin_exe
-                    .dynstrtab
-                    .get_at(sym.st_name)
-                    .map(|n| (i, n.to_owned()))
-            })
-            .collect();
 
         for i in 0..n {
             let entry = &data[i * 24..(i + 1) * 24];
             let r_info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-            // r_info encodes: sym_index (upper 32 bits) | reloc_type (lower 32 bits)
             let sym_idx = (r_info >> 32) as usize;
             let name = match dynidx_to_name.get(&sym_idx) {
                 Some(n) => n,
                 None => continue,
             };
             if imported_names.contains(name) {
-                // File offset of this entry's r_info (to zero r_info + r_addend)
+                offsets.push(sh_offset + (i as u64) * 24 + 8);
+            }
+        }
+        break;
+    }
+
+    // Process .rela.dyn for GLOB_DAT relocations
+    for section in elf.sections() {
+        if section.name() != Ok(".rela.dyn") {
+            continue;
+        }
+        let sh_offset = section.file_range().map(|(off, _)| off).unwrap_or(0);
+        let data = section.data().context(".rela.dyn data")?;
+        let n = data.len() / 24;
+
+        for i in 0..n {
+            let entry = &data[i * 24..(i + 1) * 24];
+            let r_info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+            let r_type = (r_info & 0xffffffff) as u32;
+
+            // Only zero out GLOB_DAT relocations for merged symbols
+            if r_type != R_X86_64_GLOB_DAT {
+                continue;
+            }
+
+            let sym_idx = (r_info >> 32) as usize;
+            let name = match dynidx_to_name.get(&sym_idx) {
+                Some(n) => n,
+                None => continue,
+            };
+            if imported_names.contains(name) {
                 offsets.push(sh_offset + (i as u64) * 24 + 8);
             }
         }

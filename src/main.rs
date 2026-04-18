@@ -1,3 +1,4 @@
+mod dep_graph;
 mod elf_reader;
 mod extractor;
 mod layout;
@@ -135,7 +136,7 @@ fn run() -> Result<()> {
     }
 
     // ── Step 2: transitive closure extraction ────────────────────────────────
-    let units = extractor::extract_units(&imports, &exe_elf)?;
+    let (units, init_fini) = extractor::extract_units(&imports, &exe_elf)?;
 
     if cli.verbose || cli.dry_run {
         println!(
@@ -154,10 +155,39 @@ fn run() -> Result<()> {
         }
         let total: usize = units.iter().map(|u| u.size).sum();
         println!("  Total: {total} bytes");
+
+        if !init_fini.init_entries.is_empty() || !init_fini.fini_entries.is_empty() {
+            println!(
+                "\nInit/fini arrays: {} init entries, {} fini entries",
+                init_fini.init_entries.len(),
+                init_fini.fini_entries.len()
+            );
+        }
     }
 
+    // ── Step 2.5: topological ordering of merged libraries ────────────────────
+    let merged_libs: Vec<PathBuf> = imports
+        .iter()
+        .map(|i| i.source_library.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let lib_order = dep_graph::topological_order(&merged_libs)?;
+
+    // ── Step 2.6: parse executable's existing init/fini info ──────────────────
+    let exe_init_fini = parse_exe_init_fini(&exe_elf)?;
+
     // ── Step 3: layout planning ───────────────────────────────────────────────
-    let mut plan = layout::plan_layout(units, &exe_elf, &imports, merge_base, is_pie)?;
+    let mut plan = layout::plan_layout(
+        units,
+        &exe_elf,
+        &imports,
+        merge_base,
+        is_pie,
+        init_fini,
+        exe_init_fini,
+        &lib_order,
+    )?;
 
     if cli.verbose || cli.dry_run {
         println!("\nMerged segment base VA: 0x{:016x}", plan.load_address);
@@ -209,4 +239,36 @@ fn run() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Parse the executable's existing init/fini array info from .dynamic.
+fn parse_exe_init_fini(
+    exe_elf: &object::read::elf::ElfFile64<'_>,
+) -> Result<types::ExeInitFiniInfo> {
+    let exe_bytes = exe_elf.data();
+    let goblin = goblin::elf::Elf::parse(exe_bytes).context("goblin for init/fini parsing")?;
+
+    let mut info = types::ExeInitFiniInfo::default();
+
+    if let Some(dynamic) = &goblin.dynamic {
+        for entry in &dynamic.dyns {
+            match entry.d_tag {
+                goblin::elf::dynamic::DT_INIT_ARRAY => {
+                    info.init_array_vaddr = Some(entry.d_val);
+                }
+                goblin::elf::dynamic::DT_INIT_ARRAYSZ => {
+                    info.init_array_size = entry.d_val;
+                }
+                goblin::elf::dynamic::DT_FINI_ARRAY => {
+                    info.fini_array_vaddr = Some(entry.d_val);
+                }
+                goblin::elf::dynamic::DT_FINI_ARRAYSZ => {
+                    info.fini_array_size = entry.d_val;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(info)
 }

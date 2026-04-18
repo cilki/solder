@@ -4,7 +4,7 @@
 with pkgs;
 
 mkShell rec {
-  nativeBuildInputs = [ cargo rustc rust-analyzer rustfmt clippy ];
+  nativeBuildInputs = [ cargo rustc rust-analyzer rustfmt clippy binutils gdb ];
   buildInputs = [ ];
   LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
 }

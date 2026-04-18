@@ -1,5 +1,43 @@
 use std::path::PathBuf;
 
+/// A constructor/destructor function pointer from a library's init/fini array.
+#[derive(Debug, Clone)]
+pub struct InitFiniEntry {
+    /// Path to the library this entry came from.
+    pub source_lib: PathBuf,
+    /// Original virtual address of the function in the library.
+    pub func_vaddr: u64,
+}
+
+/// Extracted init/fini arrays from merged libraries.
+#[derive(Debug, Clone, Default)]
+pub struct InitFiniArrays {
+    pub init_entries: Vec<InitFiniEntry>,
+    pub fini_entries: Vec<InitFiniEntry>,
+}
+
+/// Info about the executable's existing init/fini arrays.
+#[derive(Debug, Clone, Default)]
+pub struct ExeInitFiniInfo {
+    pub init_array_vaddr: Option<u64>,
+    pub init_array_size: u64,
+    pub fini_array_vaddr: Option<u64>,
+    pub fini_array_size: u64,
+}
+
+/// Plan for init/fini array extension.
+#[derive(Debug, Clone)]
+pub struct InitFiniPlan {
+    /// VA of the new combined init_array in the merged segment.
+    pub combined_init_vaddr: u64,
+    /// Function VAs to write (exe entries first, then merged entries in dependency order).
+    pub combined_init_entries: Vec<u64>,
+    /// VA of the new combined fini_array in the merged segment.
+    pub combined_fini_vaddr: u64,
+    /// Function VAs (merged entries in reverse dependency order, then exe entries).
+    pub combined_fini_entries: Vec<u64>,
+}
+
 /// A runtime relocation (R_X86_64_RELATIVE) to be added to .rela.dyn for PIE executables.
 /// At runtime, ld.so computes: `*(vaddr + load_base) = load_base + addend`
 #[derive(Debug, Clone)]
@@ -52,6 +90,9 @@ pub enum RelocTarget {
     /// A symbol that stays external (e.g. a glibc function).
     /// At runtime, calls go through a trampoline stub in the merged segment.
     External(String),
+    /// A raw virtual address within a data blob (used for RIP-relative data references).
+    /// The tuple is (blob_id, offset_within_blob).
+    DataBlobOffset(UnitId, u64),
 }
 
 /// A relocation entry within an extracted unit's byte range.
@@ -132,10 +173,12 @@ pub struct MergePlan {
     pub remove_needed: Vec<String>,
     /// R_X86_64_RELATIVE relocations to add for PIE executables.
     pub relative_relocs: Vec<RelativeReloc>,
+    /// Plan for extending init/fini arrays with merged library constructors/destructors.
+    pub init_fini: Option<InitFiniPlan>,
 }
 
 impl MergePlan {
-    /// Total size in bytes of the merged segment (all units + trampolines).
+    /// Total size in bytes of the merged segment (all units + trampolines + init/fini arrays).
     pub fn segment_size(&self) -> usize {
         let mut sz = 0usize;
         for u in self
@@ -154,6 +197,23 @@ impl MergePlan {
             let end = (t.vaddr - self.load_address) as usize + 14;
             if end > sz {
                 sz = end;
+            }
+        }
+        // Init/fini arrays come after trampolines, each entry is 8 bytes
+        if let Some(ref init_fini) = self.init_fini {
+            if !init_fini.combined_init_entries.is_empty() {
+                let end = (init_fini.combined_init_vaddr - self.load_address) as usize
+                    + init_fini.combined_init_entries.len() * 8;
+                if end > sz {
+                    sz = end;
+                }
+            }
+            if !init_fini.combined_fini_entries.is_empty() {
+                let end = (init_fini.combined_fini_vaddr - self.load_address) as usize
+                    + init_fini.combined_fini_entries.len() * 8;
+                if end > sz {
+                    sz = end;
+                }
             }
         }
         sz

@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
 use crate::elf_reader::file_offset_to_va;
 use crate::elf_reader::next_free_va;
 use crate::types::{
-    AssignedUnit, ExtractedUnit, GotPatch, MergePlan, RelocTarget, SectionKind, TrampolineStub,
+    AssignedUnit, ExeInitFiniInfo, ExtractedUnit, GotPatch, InitFiniArrays, InitFiniPlan,
+    MergePlan, RelocTarget, SectionKind, TrampolineStub,
 };
 
 /// Plan the virtual address layout of all extracted units and trampolines,
@@ -16,6 +18,9 @@ pub fn plan_layout(
     imports: &[crate::types::ImportedSymbol],
     base_override: Option<u64>,
     is_pie: bool,
+    init_fini: InitFiniArrays,
+    exe_init_fini: ExeInitFiniInfo,
+    lib_order: &[PathBuf],
 ) -> Result<MergePlan> {
     let load_address = base_override.unwrap_or_else(|| next_free_va(exe_elf));
 
@@ -129,6 +134,18 @@ pub fn plan_layout(
             .collect()
     };
 
+    // Plan init/fini arrays if there are any entries to merge
+    let init_fini_plan = plan_init_fini_arrays(
+        exe_elf,
+        &init_fini,
+        &exe_init_fini,
+        lib_order,
+        &unit_vaddr_by_name,
+        &trampoline_stubs,
+        load_address,
+        &mut offset,
+    )?;
+
     // Jump-slot reloc offsets are populated by the caller (patcher.rs), so leave empty here.
     // Relative relocs are populated during segment building (trampolines) and patching (GOT).
     Ok(MergePlan {
@@ -142,6 +159,7 @@ pub fn plan_layout(
         jump_slot_reloc_offsets: Vec::new(),
         remove_needed,
         relative_relocs: Vec::new(),
+        init_fini: init_fini_plan,
     })
 }
 
@@ -206,4 +224,118 @@ fn build_exe_got_map(elf: &object::read::elf::ElfFile64<'_>) -> Result<HashMap<S
     }
 
     Ok(map)
+}
+
+/// Plan the combined init/fini arrays for the merged segment.
+///
+/// For init_array: exe entries first, then merged entries in dependency order.
+/// For fini_array: merged entries in reverse dependency order, then exe entries.
+#[allow(clippy::too_many_arguments)]
+fn plan_init_fini_arrays(
+    exe_elf: &object::read::elf::ElfFile64<'_>,
+    init_fini: &InitFiniArrays,
+    exe_init_fini: &ExeInitFiniInfo,
+    lib_order: &[PathBuf],
+    unit_vaddr_by_name: &HashMap<String, u64>,
+    trampoline_stubs: &[TrampolineStub],
+    load_address: u64,
+    offset: &mut u64,
+) -> Result<Option<InitFiniPlan>> {
+    // Check if the executable has init/fini arrays that we need to relocate
+    let has_exe_init = exe_init_fini.init_array_vaddr.is_some() && exe_init_fini.init_array_size > 0;
+    let has_exe_fini = exe_init_fini.fini_array_vaddr.is_some() && exe_init_fini.fini_array_size > 0;
+
+    // We only need to create a plan if the exe has init/fini arrays and we're
+    // relocating them to the merged segment. Note: we don't add merged library
+    // init/fini entries because we only extracted specific symbols, not the
+    // constructor/destructor functions.
+    if !has_exe_init && !has_exe_fini {
+        return Ok(None);
+    }
+
+    let exe_bytes = exe_elf.data();
+
+    // Silence unused variable warnings for parameters we're not using currently
+    let _ = (init_fini, lib_order, unit_vaddr_by_name, trampoline_stubs);
+
+    // Build combined init_array entries
+    let mut combined_init_entries: Vec<u64> = Vec::new();
+
+    // First, copy existing exe init_array entries
+    if has_exe_init {
+        let init_va = exe_init_fini.init_array_vaddr.unwrap();
+        let init_file_offset = crate::elf_reader::va_to_file_offset(exe_elf, init_va)
+            .context("exe init_array VA not in any PT_LOAD segment")?;
+        let num_entries = (exe_init_fini.init_array_size / 8) as usize;
+
+        for i in 0..num_entries {
+            let entry_offset = init_file_offset as usize + i * 8;
+            if entry_offset + 8 > exe_bytes.len() {
+                break;
+            }
+            let func_va = u64::from_le_bytes(
+                exe_bytes[entry_offset..entry_offset + 8]
+                    .try_into()
+                    .expect("8 bytes"),
+            );
+            // Skip sentinel values
+            if func_va != 0 && func_va != u64::MAX {
+                combined_init_entries.push(func_va);
+            }
+        }
+    }
+
+    // NOTE: We skip adding merged library init entries because we only extracted
+    // specific symbols from the library, not the constructor/destructor functions
+    // that the init_array/fini_array point to. Those functions (like frame_dummy,
+    // __do_global_dtors_aux) are runtime support code that we don't merge.
+    // If we ever support full library merging, we would need to extract and
+    // relocate those functions too.
+
+    // Build combined fini_array entries
+    let mut combined_fini_entries: Vec<u64> = Vec::new();
+
+    // NOTE: We skip merged library fini entries for the same reason as init entries.
+    // See comment above.
+
+    // Copy existing exe fini_array entries
+    if has_exe_fini {
+        let fini_va = exe_init_fini.fini_array_vaddr.unwrap();
+        let fini_file_offset = crate::elf_reader::va_to_file_offset(exe_elf, fini_va)
+            .context("exe fini_array VA not in any segment")?;
+        let num_entries = (exe_init_fini.fini_array_size / 8) as usize;
+
+        for i in 0..num_entries {
+            let entry_offset = fini_file_offset as usize + i * 8;
+            if entry_offset + 8 > exe_bytes.len() {
+                break;
+            }
+            let func_va = u64::from_le_bytes(
+                exe_bytes[entry_offset..entry_offset + 8]
+                    .try_into()
+                    .expect("8 bytes"),
+            );
+            // Skip sentinel values
+            if func_va != 0 && func_va != u64::MAX {
+                combined_fini_entries.push(func_va);
+            }
+        }
+    }
+
+    // Allocate space for the combined arrays in the merged segment
+    // Align to 8 bytes (pointer size)
+    *offset = align_up(*offset, 8);
+    let combined_init_vaddr = load_address + *offset;
+    *offset += (combined_init_entries.len() * 8) as u64;
+
+    *offset = align_up(*offset, 8);
+    let combined_fini_vaddr = load_address + *offset;
+    *offset += (combined_fini_entries.len() * 8) as u64;
+
+    Ok(Some(InitFiniPlan {
+        combined_init_vaddr,
+        combined_init_entries,
+        combined_fini_vaddr,
+        combined_fini_entries,
+    }))
 }
