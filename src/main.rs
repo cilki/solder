@@ -1,6 +1,7 @@
 mod dep_graph;
 mod elf_reader;
 mod extractor;
+mod jump_table;
 mod layout;
 mod lib_discovery;
 mod patcher;

@@ -30,6 +30,12 @@ fn apply_unit_relocations(
     id_to_vaddr: &std::collections::HashMap<crate::types::UnitId, u64>,
     tramp_to_vaddr: &std::collections::HashMap<String, u64>,
 ) -> Result<()> {
+    let is_debug = au.unit.name.contains("pcre2_config_8") || au.unit.name.contains(".rodata");
+
+    if au.unit.name.contains(".rodata") {
+        eprintln!("DEBUG: Applying {} relocations to {}", au.unit.relocations.len(), au.unit.name);
+    }
+
     for reloc in &au.unit.relocations {
         // P = patch site VA
         let p: u64 = au.assigned_vaddr + reloc.offset_within_unit;
@@ -47,11 +53,20 @@ fn apply_unit_relocations(
                 let blob_base = *id_to_vaddr
                     .get(blob_id)
                     .with_context(|| format!("data blob UnitId({}) not found in plan", blob_id.0))?;
+                if is_debug {
+                    eprintln!("DEBUG: Applying DataBlob reloc at offset {:#x}: blob_base={:#x}, offset={}, s={:#x}, p={:#x}",
+                        off, blob_base, offset, blob_base + offset, p);
+                }
                 blob_base + offset
             }
         };
 
         let a: i64 = reloc.addend;
+
+        if is_debug {
+            eprintln!("DEBUG: apply_one_reloc: s={:#x}, a={}, p={:#x}, result={:#x}",
+                s, a, p, (s as i128 + a as i128 - p as i128) as i64);
+        }
 
         apply_one_reloc(
             &mut au.unit.bytes,
@@ -142,6 +157,9 @@ pub fn apply_one_reloc(
         }
         // R_X86_64_PC64: S + A - P, 64-bit PC-relative (rare)
         object::RelocationKind::Relative if size == 64 => (s as i128) + (a as i128) - (p as i128),
+        // R_X86_64_RELATIVE: For relocations with unknown kind but size 64, treat as absolute
+        // This handles R_X86_64_RELATIVE from .rela.dyn which the object crate may not recognize
+        object::RelocationKind::Unknown if size == 64 => (s as i128) + (a as i128),
         other => {
             bail!("unsupported relocation kind {:?} (size={size})", other);
         }

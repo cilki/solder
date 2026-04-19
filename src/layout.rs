@@ -40,9 +40,13 @@ pub fn plan_layout(
     // Assign virtual addresses, packing units together with alignment.
     let mut offset: u64 = 0;
 
+    eprintln!("DEBUG: Layout: {} text units, {} rodata units, {} data units", text.len(), rodata.len(), data.len());
     let text_units = assign_addresses(load_address, &mut offset, text);
+    eprintln!("DEBUG: Text units placed, offset now: {:#x}", offset);
     let rodata_units = assign_addresses(load_address, &mut offset, rodata);
+    eprintln!("DEBUG: Rodata units placed, offset now: {:#x}", offset);
     let data_units = assign_addresses(load_address, &mut offset, data);
+    eprintln!("DEBUG: Data units placed, offset now: {:#x}", offset);
 
     // Collect unique External symbol names referenced by any relocation.
     let mut external_names: indexmap::IndexSet<String> = indexmap::IndexSet::new();
@@ -174,6 +178,10 @@ fn assign_addresses(
             let align = unit.alignment.max(1);
             *offset = align_up(*offset, align);
             let assigned_vaddr = load_address + *offset;
+            if unit.name.contains(".rodata") {
+                eprintln!("DEBUG: Assigning {} (UnitId={}) to VA {:#x} (offset from load={:#x})",
+                    unit.name, unit.id.0, assigned_vaddr, *offset);
+            }
             *offset += unit.size as u64;
             AssignedUnit {
                 unit,

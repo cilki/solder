@@ -18,6 +18,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 indexmap = "2"
 petgraph = "0.6"
+iced-x86 = { version = "1.21.0", features = ["decoder", "instr_info"] }
 
 [dev-dependencies]
 tempfile = "3"
