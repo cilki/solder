@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Context, Result};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use object::{Object, ObjectSection, ObjectSymbol};
+use tracing::debug;
 
 /// A detected jump table in .rodata
 #[derive(Debug, Clone)]
@@ -93,10 +94,7 @@ pub fn detect_jump_tables(
         return Ok(Vec::new());
     }
 
-    eprintln!(
-        "DEBUG: Scanning {} for jump tables (has indirect branch)",
-        symbol_name
-    );
+    debug!(symbol=symbol_name, "Scanning for jump tables");
 
     // Symbolic execution pass
     let mut regs: HashMap<Register, AbstractValue> = HashMap::new();
@@ -127,10 +125,10 @@ pub fn detect_jump_tables(
                             if let Some(AbstractValue::ComputedTarget { table_base }) =
                                 regs.get(&gpr)
                             {
-                                eprintln!(
-                                    "DEBUG:   Confirmed jump table at {:#x} via indirect jmp at {:#x}",
-                                    table_base,
-                                    instr.ip()
+                                debug!(
+                                    table_base=format_args!("{:#x}", table_base),
+                                    jmp_addr=format_args!("{:#x}", instr.ip()),
+                                    "Confirmed jump table"
                                 );
                                 confirmed_bases.insert(*table_base);
                             }
@@ -158,16 +156,18 @@ pub fn detect_jump_tables(
         let next_table = sorted_bases.get(i + 1).copied();
         match identify_table_bounds(elf, table_addr, base_vaddr, code.len() as u64, next_table) {
             Ok(table) => {
-                eprintln!(
-                    "DEBUG:   Validated jump table at {:#x} with {} entries",
-                    table.table_vaddr, table.num_entries
+                debug!(
+                    vaddr=format_args!("{:#x}", table.table_vaddr),
+                    entries=table.num_entries,
+                    "Validated jump table"
                 );
                 jump_tables.push(table);
             }
             Err(e) => {
-                eprintln!(
-                    "DEBUG:   Table at {:#x} failed validation: {}",
-                    table_addr, e
+                debug!(
+                    vaddr=format_args!("{:#x}", table_addr),
+                    error=%e,
+                    "Jump table validation failed"
                 );
             }
         }
@@ -289,11 +289,6 @@ fn handle_lea(
     if instr.is_ip_rel_memory_operand() {
         let target = instr.ip_rel_memory_address();
         if is_rodata_address(elf, target) {
-            eprintln!(
-                "DEBUG:   LEA loading rodata address {:#x} at {:#x}",
-                target,
-                instr.ip()
-            );
             regs.insert(gpr, AbstractValue::RodataAddr(target));
             return;
         }
@@ -496,11 +491,6 @@ pub fn identify_table_bounds(
     // Maximum reasonable table size (256 entries for switch statements)
     let max_entries = 256;
 
-    eprintln!(
-        "DEBUG:     Identifying table bounds at {:#x} in {}",
-        table_base, section_name
-    );
-
     for entry_idx in 0..max_entries {
         if current_offset + 4 > section_data.len() {
             break;
@@ -536,12 +526,6 @@ pub fn identify_table_bounds(
         };
 
         if distance > 1024 * 1024 {
-            eprintln!(
-                "DEBUG:     Entry {} target {:#x} too far from function ({}MB), stopping",
-                entry_idx,
-                target,
-                distance / 1024 / 1024
-            );
             break;
         }
 
@@ -554,10 +538,6 @@ pub fn identify_table_bounds(
         });
 
         if !in_text {
-            eprintln!(
-                "DEBUG:     Entry {} target {:#x} not in text section, stopping",
-                entry_idx, target
-            );
             break;
         }
 
@@ -575,8 +555,6 @@ pub fn identify_table_bounds(
             targets.len()
         );
     }
-
-    eprintln!("DEBUG:     Found {} valid entries", targets.len());
 
     Ok(JumpTable {
         table_vaddr: table_base,

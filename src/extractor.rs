@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
+use tracing::{debug, warn};
 
 use crate::types::{
     ExtractedReloc, ExtractedUnit, InitFiniArrays, InitFiniEntry, RelocTarget, SectionKind, UnitId,
@@ -125,12 +126,11 @@ pub fn extract_units(
         let target_unit_id = match state.extracted.get(&target_key) {
             Some(id) => *id,
             None => {
-                eprintln!(
-                    "WARNING: Unresolved relocation to '{}' in '{}' - relocation will be skipped",
-                    target_key.sym,
-                    target_key.lib.display()
+                warn!(
+                    target=target_key.sym,
+                    lib=%target_key.lib.display(),
+                    "Unresolved relocation, skipping"
                 );
-                // Mark this relocation for removal
                 unresolved_relocs.push((unit_id, reloc_idx));
                 continue;
             },
@@ -268,9 +268,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
 
         let target = if let Some(ts) = target_sym {
             let ts_name = ts.name().unwrap_or("").to_owned();
-            if ts_name.contains("cpu_feature") {
-                eprintln!("DEBUG: Code symbol '{}' has relocation to '{}', undefined={}", key.sym, ts_name, ts.is_undefined());
-            }
             if ts.is_undefined() || ts_name.is_empty() {
                 // External symbol.
                 if !state.external_syms.contains(&ts_name) && !ts_name.is_empty() {
@@ -297,8 +294,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                     let extract_result = ensure_data_blob_extracted(elf64, ts_vaddr, &key.lib, state);
                     if let Ok(Some((blob_id, blob_base, blob_deps))) = extract_result {
                         let offset_in_blob = ts_vaddr - blob_base;
-                        eprintln!("DEBUG: Code relocation to '{}' at {:#x} -> DataBlobOffset(blob={:?}, offset={:#x})",
-                            ts_name, ts_vaddr, blob_id, offset_in_blob);
                         for dep in blob_deps {
                             if !new_deps.iter().any(|k| k.sym == dep.sym) {
                                 new_deps.push(dep);
@@ -306,8 +301,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         }
                         RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
                     } else {
-                        eprintln!("DEBUG: Failed to extract data blob for '{}' at {:#x}, treating as code unit",
-                            ts_name, ts_vaddr);
                         // It's a code symbol or unknown - extract as a unit
                         let dep_key = UnitKey {
                             lib: key.lib.clone(),
@@ -359,7 +352,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
             }
 
             if rip_ref.is_code_ref {
-                eprintln!("DEBUG: {} code ref at offset {:#x} -> target {:#x}", key.sym, rip_ref.offset, target_addr);
                 // First check if this is a PLT call (call to external symbol)
                 if let Some(ext_name) = find_plt_target(elf64, target_addr, &lib_bytes) {
                     // This is a call to an external symbol via PLT
@@ -443,8 +435,12 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         target: RelocTarget::DataBlobOffset(blob_id, offset_in_blob),
                     });
                 } else {
-                    eprintln!("WARNING: RIP-relative data ref in {} at offset {:#x} -> target {:#x} NOT FOUND",
-                        key.sym, rip_ref.offset, target_addr);
+                    warn!(
+                        symbol=key.sym,
+                        offset=format_args!("{:#x}", rip_ref.offset),
+                        target=format_args!("{:#x}", target_addr),
+                        "RIP-relative data ref target not found"
+                    );
                 }
             }
         }
@@ -460,7 +456,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
             &lib_bytes,
         ) {
             if !jump_tables.is_empty() {
-                eprintln!("DEBUG: Found {} jump table(s) in {}", jump_tables.len(), key.sym);
+                debug!(count=jump_tables.len(), symbol=key.sym, "Found jump tables");
             }
 
             for table in jump_tables {
@@ -473,9 +469,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             new_deps.push(dep);
                         }
                     }
-                    eprintln!("DEBUG:   Table at {:#x}: {} entries in {}",
-                        table.table_vaddr, table.num_entries, table.section_name);
-
                     // 2. Create relocations for each table entry
                     for (idx, target_addr) in table.targets.iter().enumerate() {
                         let entry_offset_in_blob = (table.table_vaddr - blob_base) + (idx * 4) as u64;
@@ -526,15 +519,8 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
 
                         // 6. Add jump table entry relocation to the data blob
                         // Find the blob unit and add the relocation
-                        let blob_found = state.units.iter().any(|u| u.id == blob_id);
-                        if !blob_found {
-                            eprintln!("DEBUG:     ERROR: Blob unit {:?} not found in state.units!", blob_id);
-                        }
                         if let Some(blob_unit) = state.units.iter_mut().find(|u| u.id == blob_id) {
                             let reloc_idx = blob_unit.relocations.len();
-
-                            eprintln!("DEBUG:     Adding jump table reloc for entry {}: target={} (vaddr={:#x}), target_sym_vaddr={:#x}, offset_in_target={}, entry_offset={:#x}, addend={}",
-                                idx, target_name, target_addr, target_sym_vaddr, offset_in_target, entry_offset_in_blob, addend);
 
                             blob_unit.relocations.push(ExtractedReloc {
                                 offset_within_unit: entry_offset_in_blob,
@@ -559,10 +545,9 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             // Only add as dependency if it's a real symbol we can extract
                             // For internal jumps, we don't need to add as a new dependency
                             // since we're already extracting it
-                            if !is_internal && find_symbol(elf64, &target_name).is_ok() {
-                                if !new_deps.iter().any(|k| k.sym == dep_key.sym) {
-                                    new_deps.push(dep_key.clone());
-                                }
+                            if !is_internal && find_symbol(elf64, &target_name).is_ok()
+                                && !new_deps.iter().any(|k| k.sym == dep_key.sym) {
+                                new_deps.push(dep_key.clone());
                             }
 
                             // Add to pending resolutions for this blob
@@ -582,13 +567,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
     // Record pending resolutions using our explicit tracking.
     for (reloc_idx, dep_key) in pending_relocs {
         state.pending.push((id, reloc_idx, dep_key));
-    }
-
-    if key.sym.contains("pcre2_config_8") {
-        eprintln!("DEBUG: Extracting {} with {} relocations", key.sym, relocations.len());
-        for (i, r) in relocations.iter().enumerate() {
-            eprintln!("  [{}] offset={:#x}, target={:?}", i, r.offset_within_unit, r.target);
-        }
     }
 
     state.units.push(ExtractedUnit {
@@ -804,7 +782,7 @@ fn find_existing_data_blob(
     addr: u64,
     state: &ExtractionState,
 ) -> Option<(UnitId, u64)> {
-    for (_, info) in &state.data_blobs {
+    for info in state.data_blobs.values() {
         if addr >= info.base_vaddr && addr < info.base_vaddr + info.size as u64 {
             return Some((info.id, info.base_vaddr));
         }
@@ -831,7 +809,7 @@ fn find_section_for_address(
                 _ => return None, // Skip unsupported section types
             };
             // Handle NOBITS sections (.bss) which have no data in the file
-            let data = if kind == SectionKind::Data && section.data().ok().map_or(true, |d| d.is_empty()) {
+            let data = if kind == SectionKind::Data && section.data().ok().is_none_or(|d| d.is_empty()) {
                 // NOBITS section - create zero-filled data
                 vec![0u8; sec_size as usize]
             } else {
@@ -845,6 +823,7 @@ fn find_section_for_address(
 
 /// Extract a data section blob if not already extracted.
 /// Returns the blob's UnitId and base vaddr.
+#[allow(clippy::ptr_arg)]
 fn ensure_data_blob_extracted(
     elf64: &object::read::elf::ElfFile64<'_>,
     target_addr: u64,
@@ -1012,22 +991,8 @@ fn ensure_data_blob_extracted(
         state.pending.push((id, reloc_idx, dep_key));
     }
 
-    // Debug output for data blobs with relocations
     if !relocations.is_empty() {
-        eprintln!(
-            "DEBUG: Extracted data blob '{}' with {} relocations",
-            sec_name,
-            relocations.len()
-        );
-        for (i, r) in relocations.iter().take(10).enumerate() {
-            eprintln!(
-                "  [{}] offset={:#x}, kind={:?}, size={}, target={:?}",
-                i, r.offset_within_unit, r.kind, r.size, r.target
-            );
-        }
-        if relocations.len() > 10 {
-            eprintln!("  ... and {} more", relocations.len() - 10);
-        }
+        debug!(section=sec_name, relocations=relocations.len(), "Extracted data blob");
     }
 
     let unit = ExtractedUnit {

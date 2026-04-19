@@ -19,6 +19,8 @@ anyhow = "1"
 indexmap = "2"
 petgraph = "0.6"
 iced-x86 = { version = "1.21.0", features = ["decoder", "instr_info"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"

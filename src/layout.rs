@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use tracing::{debug, trace};
 
 use crate::elf_reader::file_offset_to_va;
 use crate::elf_reader::next_free_va;
@@ -40,13 +41,10 @@ pub fn plan_layout(
     // Assign virtual addresses, packing units together with alignment.
     let mut offset: u64 = 0;
 
-    eprintln!("DEBUG: Layout: {} text units, {} rodata units, {} data units", text.len(), rodata.len(), data.len());
+    debug!(text=text.len(), rodata=rodata.len(), data=data.len(), "Layout unit counts");
     let text_units = assign_addresses(load_address, &mut offset, text);
-    eprintln!("DEBUG: Text units placed, offset now: {:#x}", offset);
     let rodata_units = assign_addresses(load_address, &mut offset, rodata);
-    eprintln!("DEBUG: Rodata units placed, offset now: {:#x}", offset);
     let data_units = assign_addresses(load_address, &mut offset, data);
-    eprintln!("DEBUG: Data units placed, offset now: {:#x}", offset);
 
     // Collect unique External symbol names referenced by any relocation.
     let mut external_names: indexmap::IndexSet<String> = indexmap::IndexSet::new();
@@ -178,8 +176,13 @@ fn assign_addresses(
             let align = unit.alignment.max(1);
             *offset = align_up(*offset, align);
             let assigned_vaddr = load_address + *offset;
-            eprintln!("DEBUG: Assigning {} (UnitId={}, size={:#x}) to VA {:#x} (offset from load={:#x})",
-                unit.name, unit.id.0, unit.size, assigned_vaddr, *offset);
+            trace!(
+                name=unit.name,
+                unit_id=unit.id.0,
+                size=format_args!("{:#x}", unit.size),
+                vaddr=format_args!("{:#x}", assigned_vaddr),
+                "Assigned unit VA"
+            );
             *offset += unit.size as u64;
             AssignedUnit {
                 unit,

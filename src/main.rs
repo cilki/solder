@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tracing::{info, warn};
 
 use elf_reader::MappedElf;
 use lib_discovery::LdsoCache;
@@ -49,12 +50,17 @@ struct Cli {
     #[arg(long, value_name = "HEX")]
     merge_base: Option<String>,
 
-    /// Show verbose relocation details
-    #[arg(short, long)]
-    verbose: bool,
 }
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -95,8 +101,8 @@ fn run() -> Result<()> {
 
     let is_pie = elf_reader::validate_executable(&exe_elf, &cli.input)?;
 
-    if cli.verbose && is_pie {
-        println!("Input is a PIE executable (ET_DYN)");
+    if is_pie {
+        info!("Input is a PIE executable (ET_DYN)");
     }
 
     // ── Step 1: parse dynamic section + collect imports ──────────────────────
@@ -117,53 +123,41 @@ fn run() -> Result<()> {
     )?;
 
     if imports.is_empty() {
-        eprintln!("warning: no mergeable imported symbols found");
+        warn!("No mergeable imported symbols found");
         return Ok(());
     }
 
-    if cli.verbose || cli.dry_run {
-        println!(
-            "Discovered {} directly imported symbol(s) to merge:",
-            imports.len()
+    for imp in &imports {
+        info!(
+            kind=?imp.kind,
+            name=imp.name,
+            source=%imp.source_library.display(),
+            "Imported symbol to merge"
         );
-        for imp in &imports {
-            println!(
-                "  {:?}  {}  (from {})",
-                imp.kind,
-                imp.name,
-                imp.source_library.display()
-            );
-        }
     }
 
     // ── Step 2: transitive closure extraction ────────────────────────────────
     let (units, init_fini) = extractor::extract_units(&imports, &exe_elf)?;
 
-    if cli.verbose || cli.dry_run {
-        println!(
-            "\nExtracted {} unit(s) (including transitive dependencies):",
-            units.len()
+    for u in &units {
+        info!(
+            section_kind=?u.section_kind,
+            name=u.name,
+            size=u.size,
+            relocations=u.relocations.len(),
+            source=%u.source_lib.display(),
+            "Extracted unit"
         );
-        for u in &units {
-            println!(
-                "  [{:?}] {} ({} bytes, {} relocs)  from {}",
-                u.section_kind,
-                u.name,
-                u.size,
-                u.relocations.len(),
-                u.source_lib.display()
-            );
-        }
-        let total: usize = units.iter().map(|u| u.size).sum();
-        println!("  Total: {total} bytes");
+    }
+    let total: usize = units.iter().map(|u| u.size).sum();
+    info!(total_bytes=total, units=units.len(), "Extraction complete");
 
-        if !init_fini.init_entries.is_empty() || !init_fini.fini_entries.is_empty() {
-            println!(
-                "\nInit/fini arrays: {} init entries, {} fini entries",
-                init_fini.init_entries.len(),
-                init_fini.fini_entries.len()
-            );
-        }
+    if !init_fini.init_entries.is_empty() || !init_fini.fini_entries.is_empty() {
+        info!(
+            init_entries=init_fini.init_entries.len(),
+            fini_entries=init_fini.fini_entries.len(),
+            "Init/fini arrays"
+        );
     }
 
     // ── Step 2.5: topological ordering of merged libraries ────────────────────
@@ -190,22 +184,25 @@ fn run() -> Result<()> {
         &lib_order,
     )?;
 
-    if cli.verbose || cli.dry_run {
-        println!("\nMerged segment base VA: 0x{:016x}", plan.load_address);
-        println!("GOT patches: {}", plan.got_patches.len());
-        println!("Trampolines: {}", plan.trampoline_stubs.len());
-        for t in &plan.trampoline_stubs {
-            println!(
-                "  trampoline '{}' at 0x{:x} → GOT[0x{:x}]",
-                t.symbol_name, t.vaddr, t.target_got_vaddr
-            );
-        }
-        println!("DT_NEEDED entries to remove: {:?}", plan.remove_needed);
+    info!(
+        load_address=format_args!("0x{:016x}", plan.load_address),
+        got_patches=plan.got_patches.len(),
+        trampolines=plan.trampoline_stubs.len(),
+        "Merge plan"
+    );
+    for t in &plan.trampoline_stubs {
+        info!(
+            symbol=t.symbol_name,
+            vaddr=format_args!("0x{:x}", t.vaddr),
+            got_vaddr=format_args!("0x{:x}", t.target_got_vaddr),
+            "Trampoline"
+        );
+    }
+    info!(remove_needed=?plan.remove_needed, "DT_NEEDED entries to remove");
 
-        if cli.dry_run {
-            println!("\n(dry-run: no output written)");
-            return Ok(());
-        }
+    if cli.dry_run {
+        info!("Dry-run: no output written");
+        return Ok(());
     }
 
     // ── Step 4: apply relocations ─────────────────────────────────────────────
@@ -225,18 +222,15 @@ fn run() -> Result<()> {
     let merged_seg = writer::build_merged_segment(&mut plan)?;
     writer::write_output(&patched_exe, &plan, &merged_seg, &cli.input)?;
 
-    if cli.verbose && plan.is_pie {
-        println!(
-            "Added {} R_X86_64_RELATIVE relocation(s) for PIE",
-            plan.relative_relocs.len()
-        );
+    if plan.is_pie {
+        info!(count=plan.relative_relocs.len(), "Added R_X86_64_RELATIVE relocations for PIE");
     }
 
-    println!(
-        "Merged {} symbol(s) ({} bytes) into {}",
-        imports.len(),
-        merged_seg.len(),
-        cli.input.display()
+    info!(
+        symbols=imports.len(),
+        bytes=merged_seg.len(),
+        output=%cli.input.display(),
+        "Merge complete"
     );
 
     Ok(())
