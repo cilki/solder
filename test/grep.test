@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+
+testHelp() {
+	grep --help
+}
+
+testVersion() {
+	grep --version
+}
+
+testBasicMatch() {
+	result=$(echo -e "hello\nworld\nhello" | grep "hello")
+	[ "${result}" = "$(echo -e "hello\nhello")" ]
+}
+
+testNoMatch() {
+	result=$(echo -e "hello\nworld" | grep "notfound")
+	[ -z "${result}" ]
+}
+
+testCaseInsensitive() {
+	result=$(echo -e "Hello\nworld" | grep -i "hello")
+	[ "${result}" = "Hello" ]
+}
+
+testInvertMatch() {
+	result=$(echo -e "hello\nworld\nhello" | grep -v "hello")
+	[ "${result}" = "world" ]
+}
+
+testCountMatches() {
+	result=$(echo -e "hello\nworld\nhello" | grep -c "hello")
+	[ "${result}" = "2" ]
+}
+
+testLineNumbers() {
+	result=$(echo -e "hello\nworld\nhello" | grep -n "hello")
+	expected=$(echo -e "1:hello\n3:hello")
+	[ "${result}" = "${expected}" ]
+}
+
+testRegexPattern() {
+	result=$(echo -e "test123\nfoo\nbar456" | grep "[0-9]")
+	expected=$(echo -e "test123\nbar456")
+	[ "${result}" = "${expected}" ]
+}
+
+testAnchorStart() {
+	result=$(echo -e "hello\nworld\nhello world" | grep "^hello")
+	expected=$(echo -e "hello\nhello world")
+	[ "${result}" = "${expected}" ]
+}
+
+testAnchorEnd() {
+	result=$(echo -e "hello\nworld\nsay hello" | grep "hello$")
+	expected=$(echo -e "hello\nsay hello")
+	[ "${result}" = "${expected}" ]
+}
+
+testFileInput() {
+	echo -e "foo\nbar\nbaz" >testfile.txt
+	result=$(grep "bar" testfile.txt)
+	[ "${result}" = "bar" ]
+}
+
+testMultipleFiles() {
+	echo -e "apple\nbanana" >file1.txt
+	echo -e "cherry\napple" >file2.txt
+	result=$(grep "apple" file1.txt file2.txt)
+	[[ ${result} == *"apple"* ]]
+}
+
+testEmptyFile() {
+	touch empty.txt
+	result=$(grep "test" empty.txt)
+	[ -z "${result}" ]
+}
+
+testQuietMode() {
+	result=$(
+		echo "hello" | grep -q "hello"
+		echo $?
+	)
+	[ "${result}" = "0" ]
+}
+
+testMatchFail() {
+	result=$(
+		echo "hello" | grep -q "notfound"
+		echo $?
+	)
+	[ "${result}" = "1" ]
+}

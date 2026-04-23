@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+
+testHelp() {
+	bash --help
+}
+
+testVersion() {
+	bash --version
+}
+
+testEchoCommand() {
+	result=$(bash -c "echo hello")
+	[ "${result}" = "hello" ]
+}
+
+testVariable() {
+	result=$(bash -c 'x=42; echo $x')
+	[ "${result}" = "42" ]
+}
+
+testArithmetic() {
+	result=$(bash -c 'echo $((2 + 3))')
+	[ "${result}" = "5" ]
+}
+
+testIfStatement() {
+	result=$(bash -c "if [ 5 -gt 3 ]; then echo yes; else echo no; fi")
+	[ "${result}" = "yes" ]
+}
+
+testIfFalse() {
+	result=$(bash -c "if [ 5 -lt 3 ]; then echo yes; else echo no; fi")
+	[ "${result}" = "no" ]
+}
+
+testForLoop() {
+	result=$(bash -c 'for i in 1 2 3; do echo $i; done')
+	expected=$(echo -e "1\n2\n3")
+	[ "${result}" = "${expected}" ]
+}
+
+testWhileLoop() {
+	result=$(bash -c 'i=0; while [ $i -lt 3 ]; do echo $i; i=$((i+1)); done')
+	expected=$(echo -e "0\n1\n2")
+	[ "${result}" = "${expected}" ]
+}
+
+testStringConcatenation() {
+	result=$(bash -c "a='hello'; b='world'; echo \"\$a \$b\"")
+	[ "${result}" = "hello world" ]
+}
+
+testArrayAccess() {
+	result=$(bash -c 'arr=(a b c); echo ${arr[1]}')
+	[ "${result}" = "b" ]
+}
+
+testFunctionDefinition() {
+	result=$(bash -c "myfunc() { echo 'result'; }; myfunc")
+	[ "${result}" = "result" ]
+}
+
+testFunctionWithArg() {
+	result=$(bash -c 'myfunc() { echo $1; }; myfunc hello')
+	[ "${result}" = "hello" ]
+}
+
+testCommandSubstitution() {
+	result=$(bash -c 'echo $(echo world)')
+	[ "${result}" = "world" ]
+}
+
+testPipeOperator() {
+	result=$(bash -c "echo hello | tr a-z A-Z")
+	[ "${result}" = "HELLO" ]
+}
+
+testTestOperatorFileExists() {
+	echo "test" >myfile.txt
+	result=$(bash -c "if [ -f myfile.txt ]; then echo yes; else echo no; fi")
+	[ "${result}" = "yes" ]
+}
+
+testTestOperatorFileNotExists() {
+	result=$(bash -c "if [ -f nonexistent.txt ]; then echo yes; else echo no; fi")
+	[ "${result}" = "no" ]
+}
+
+testStringComparison() {
+	result=$(bash -c "if [ 'hello' = 'hello' ]; then echo yes; else echo no; fi")
+	[ "${result}" = "yes" ]
+}
+
+testCaseStatement() {
+	result=$(bash -c "case 'b' in a) echo a;; b) echo b;; c) echo c;; esac")
+	[ "${result}" = "b" ]
+}
+
+testMultipleCommands() {
+	result=$(bash -c "echo a; echo b; echo c")
+	expected=$(echo -e "a\nb\nc")
+	[ "${result}" = "${expected}" ]
+}
+
+testCommandChaining() {
+	result=$(bash -c "echo test && echo success")
+	expected=$(echo -e "test\nsuccess")
+	[ "${result}" = "${expected}" ]
+}
+
+testCommandFailure() {
+	result=$(bash -c "false || echo fallback")
+	[ "${result}" = "fallback" ]
+}
+
+testEnvironmentVariable() {
+	result=$(TEST_VAR=myvalue bash -c 'echo $TEST_VAR')
+	[ "${result}" = "myvalue" ]
+}
+
+testExitCode() {
+	bash -c "exit 42"
+	[ $? -eq 42 ]
+}
+
+testBuiltinCommand() {
+	result=$(bash -c "echo -n hello")
+	[ "${result}" = "hello" ]
+}
+
+testCommentHandling() {
+	result=$(bash -c "echo start # this is a comment
+echo end")
+	expected=$(echo -e "start\nend")
+	[ "${result}" = "${expected}" ]
+}

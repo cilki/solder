@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+testHelp() {
+	md5sum --help
+}
+
+testVersion() {
+	md5sum --version
+}
+
+testHello() {
+	result=$(echo hello | md5sum)
+
+	[ "${result}" = "b1946ac92492d2347c6235b4d2611184  -" ]
+}
