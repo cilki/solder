@@ -7,6 +7,8 @@ use crate::types::{MergePlan, RelativeReloc};
 ///   2. Zero out JUMP_SLOT relocation entries so ld.so won't overwrite our patches.
 ///   3. Remove DT_NEEDED entries for fully-merged libraries.
 ///   4. Remove version requirements (.gnu.version_r) for fully-merged libraries.
+///   5. Force eager binding so the loader processes the zeroed (R_X86_64_NONE)
+///      PLT relocations through the eager path, which accepts NONE.
 ///
 /// For PIE executables, this also populates `plan.relative_relocs` with entries
 /// for the patched GOT slots that need R_X86_64_RELATIVE relocations.
@@ -15,6 +17,7 @@ pub fn apply_patches(exe_bytes: &mut [u8], plan: &mut MergePlan) -> Result<()> {
     zero_jump_slot_relocs(exe_bytes, plan)?;
     remove_dt_needed(exe_bytes, plan)?;
     remove_verneed_entries(exe_bytes, plan)?;
+    ensure_bind_now(exe_bytes)?;
     Ok(())
 }
 
@@ -121,6 +124,120 @@ fn remove_dt_needed(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
         let last_start = base + (num_entries - 1) * ENTRY_SIZE;
         bytes[last_start..last_start + ENTRY_SIZE].fill(0);
     }
+
+    Ok(())
+}
+
+/// Force eager symbol binding on the modified executable by ensuring a
+/// `DF_BIND_NOW` flag (or equivalent) is set in the dynamic section.
+///
+/// Why this matters: `zero_jump_slot_relocs` rewrites the PLT relocations for
+/// merged symbols as `R_X86_64_NONE` (r_info = 0). Some glibc versions reject
+/// `R_X86_64_NONE` in the lazy PLT path (`elf_machine_lazy_rel`) and fail with
+/// "unexpected PLT reloc type 0x00". The eager path (`elf_machine_rela`) always
+/// treats NONE as a no-op, so forcing BIND_NOW makes the binary load reliably
+/// regardless of glibc version or binding mode.
+fn ensure_bind_now(bytes: &mut [u8]) -> Result<()> {
+    // DT_* tag values not all exposed by goblin as constants we want, hardcode:
+    const DT_NULL: u64 = 0;
+    const DT_FLAGS: u64 = 30;
+    const DT_BIND_NOW: u64 = 24;
+    const DT_FLAGS_1: u64 = 0x6ffffffb;
+    const DF_BIND_NOW: u64 = 0x8;
+    const DF_1_NOW: u64 = 0x1;
+    const ENTRY_SIZE: usize = 16;
+
+    let dyn_section_offset = find_section_file_offset(bytes, ".dynamic")?;
+    if dyn_section_offset == 0 {
+        return Ok(());
+    }
+
+    // Parse to discover current state, then drop the borrow before mutating.
+    let (already_now, flags_idx, num_entries, dyn_segment_filesz): (
+        bool,
+        Option<usize>,
+        usize,
+        u64,
+    ) = {
+        let goblin_elf = goblin::elf::Elf::parse(bytes).context("goblin parse for BIND_NOW")?;
+
+        let dyn_filesz = goblin_elf
+            .program_headers
+            .iter()
+            .find(|ph| ph.p_type == goblin::elf::program_header::PT_DYNAMIC)
+            .map(|ph| ph.p_filesz)
+            .unwrap_or(0);
+
+        let dynamic = match &goblin_elf.dynamic {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+
+        let mut already = false;
+        let mut flags_at: Option<usize> = None;
+        for (i, e) in dynamic.dyns.iter().enumerate() {
+            if e.d_tag == DT_BIND_NOW {
+                already = true;
+            } else if e.d_tag == DT_FLAGS {
+                flags_at = Some(i);
+                if e.d_val & DF_BIND_NOW != 0 {
+                    already = true;
+                }
+            } else if e.d_tag == DT_FLAGS_1 && e.d_val & DF_1_NOW != 0 {
+                already = true;
+            }
+        }
+
+        (already, flags_at, dynamic.dyns.len(), dyn_filesz)
+    };
+
+    if already_now {
+        return Ok(());
+    }
+
+    let base = dyn_section_offset as usize;
+
+    if let Some(idx) = flags_idx {
+        // OR DF_BIND_NOW into the existing DT_FLAGS entry.
+        let val_off = base + idx * ENTRY_SIZE + 8;
+        let current = u64::from_le_bytes(bytes[val_off..val_off + 8].try_into().unwrap());
+        let new = current | DF_BIND_NOW;
+        bytes[val_off..val_off + 8].copy_from_slice(&new.to_le_bytes());
+        return Ok(());
+    }
+
+    // Append a new DT_FLAGS entry. Goblin includes the DT_NULL terminator in
+    // `dynamic.dyns`, so the terminator lives at index `num_entries - 1`. We
+    // overwrite that slot with our new entry; the slot after becomes the new
+    // DT_NULL terminator.
+    if num_entries == 0 {
+        anyhow::bail!("empty dynamic section");
+    }
+    let new_entry_off = base + (num_entries - 1) * ENTRY_SIZE;
+    let next_off = new_entry_off + ENTRY_SIZE;
+
+    if (next_off + ENTRY_SIZE) > base + dyn_segment_filesz as usize {
+        anyhow::bail!(
+            "no room in PT_DYNAMIC to add DT_FLAGS=DF_BIND_NOW entry \
+             (segment filesz=0x{:x}, would need offset 0x{:x})",
+            dyn_segment_filesz,
+            next_off + ENTRY_SIZE - base
+        );
+    }
+
+    // Sanity: the slot we're overwriting should currently be DT_NULL.
+    let cur_tag = u64::from_le_bytes(bytes[new_entry_off..new_entry_off + 8].try_into().unwrap());
+    if cur_tag != DT_NULL {
+        anyhow::bail!(
+            "expected DT_NULL at .dynamic offset 0x{:x}, found tag 0x{:x}",
+            new_entry_off - base,
+            cur_tag
+        );
+    }
+
+    bytes[new_entry_off..new_entry_off + 8].copy_from_slice(&DT_FLAGS.to_le_bytes());
+    bytes[new_entry_off + 8..new_entry_off + 16].copy_from_slice(&DF_BIND_NOW.to_le_bytes());
+    bytes[next_off..next_off + ENTRY_SIZE].fill(0);
 
     Ok(())
 }

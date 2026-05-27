@@ -53,13 +53,21 @@ pub fn parse_dynamic(elf: &ElfFile64<'_>) -> Result<DynamicInfo> {
 
 /// Collect all symbols the executable imports from shared libraries, resolving
 /// each to an absolute library path and a GOT file offset.
+/// Result of `collect_imports`: the symbols the executable imports, plus a
+/// map of every symbol exported by any mergeable library (used by the
+/// extractor to resolve cross-library PLT calls).
+pub struct ImportInfo {
+    pub imports: Vec<ImportedSymbol>,
+    pub merged_lib_syms: std::collections::HashMap<String, PathBuf>,
+}
+
 pub fn collect_imports(
     elf: &ElfFile64<'_>,
     dyn_info: &DynamicInfo,
     ldso_cache: &LdsoCache,
     extra_lib_paths: &[PathBuf],
     merge_filter: Option<&[String]>,
-) -> Result<Vec<ImportedSymbol>> {
+) -> Result<ImportInfo> {
     let bytes = elf.data();
 
     // Build a map from symbol name → source library path.
@@ -177,7 +185,10 @@ pub fn collect_imports(
         seen.insert(sym_name);
     }
 
-    Ok(imports)
+    Ok(ImportInfo {
+        imports,
+        merged_lib_syms: sym_to_lib,
+    })
 }
 
 /// For a given set of imported symbols, find the file offsets of their JUMP_SLOT

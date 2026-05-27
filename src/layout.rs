@@ -8,7 +8,7 @@ use crate::elf_reader::file_offset_to_va;
 use crate::elf_reader::next_free_va;
 use crate::types::{
     AssignedUnit, ExeInitFiniInfo, ExtractedUnit, GotPatch, InitFiniArrays, InitFiniPlan,
-    MergePlan, RelocTarget, SectionKind, TrampolineStub,
+    MergePlan, NewExternalSym, RelocTarget, SectionKind, TrampolineStub,
 };
 
 /// Plan the virtual address layout of all extracted units and trampolines,
@@ -68,14 +68,28 @@ pub fn plan_layout(
 
     // Assign VA to each trampoline stub (14 bytes: FF 25 00 00 00 00 + 8 byte addr).
     // Trampolines are placed after all data units.
+    //
+    // For each external name we need a GOT slot the loader will fill with the
+    // resolved function address; the trampoline does `jmp [got_slot]`. If the
+    // executable already imports the symbol, we reuse its existing GOT slot.
+    // Otherwise we allocate a fresh 8-byte slot in the merged segment and
+    // record a NewExternalSym so the writer can inject a matching `.dynsym`
+    // entry and GLOB_DAT relocation.
     let mut trampoline_stubs: Vec<TrampolineStub> = Vec::new();
+    let mut new_externals: Vec<NewExternalSym> = Vec::new();
     for name in &external_names {
-        let target_got_vaddr = *exe_got_vas.get(name).with_context(|| {
-            format!(
-                "external symbol '{name}' referenced in merged library code is not \
-                 in the executable's GOT — cannot create trampoline"
-            )
-        })?;
+        let target_got_vaddr = if let Some(va) = exe_got_vas.get(name) {
+            *va
+        } else {
+            offset = align_up(offset, 8);
+            let got_vaddr = load_address + offset;
+            offset += 8;
+            new_externals.push(NewExternalSym {
+                name: name.clone(),
+                got_vaddr,
+            });
+            got_vaddr
+        };
         // Align each trampoline to 16 bytes for neatness.
         offset = align_up(offset, 16);
         let vaddr = load_address + offset;
@@ -167,6 +181,7 @@ pub fn plan_layout(
         jump_slot_reloc_offsets: Vec::new(),
         remove_needed,
         relative_relocs: Vec::new(),
+        new_externals,
         init_fini: init_fini_plan,
     })
 }

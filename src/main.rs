@@ -115,13 +115,15 @@ fn run() -> Result<()> {
 
     let ldso_cache = LdsoCache::load();
 
-    let imports = collect_imports(
+    let import_info = collect_imports(
         &exe_elf,
         &dyn_info,
         &ldso_cache,
         &library_path,
         merge_filter,
     )?;
+    let imports = import_info.imports;
+    let merged_lib_syms = import_info.merged_lib_syms;
 
     if imports.is_empty() {
         warn!("No mergeable imported symbols found");
@@ -138,7 +140,7 @@ fn run() -> Result<()> {
     }
 
     // ── Step 2: transitive closure extraction ────────────────────────────────
-    let (units, init_fini) = extractor::extract_units(&imports, &exe_elf)?;
+    let (units, init_fini) = extractor::extract_units(&imports, &exe_elf, &merged_lib_syms)?;
 
     for u in &units {
         info!(
@@ -193,8 +195,16 @@ fn run() -> Result<()> {
         load_address = format_args!("0x{:016x}", plan.load_address),
         got_patches = plan.got_patches.len(),
         trampolines = plan.trampoline_stubs.len(),
+        new_externals = plan.new_externals.len(),
         "Merge plan"
     );
+    for ext in &plan.new_externals {
+        info!(
+            symbol = ext.name,
+            got_vaddr = format_args!("0x{:x}", ext.got_vaddr),
+            "New external symbol (injected into .dynsym)"
+        );
+    }
     for t in &plan.trampoline_stubs {
         info!(
             symbol = t.symbol_name,

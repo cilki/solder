@@ -52,6 +52,11 @@ struct ExtractionState {
     next_id: u32,
     /// Symbols that stay external (glibc etc.). Maps name → known.
     external_syms: HashSet<String>,
+    /// Symbols exported by any merged library, mapped to the library that
+    /// defines them. Used to redirect cross-library PLT calls (e.g. libssl
+    /// calling into libcore) to direct merged-unit references instead of
+    /// leaving the original library-relative PLT offset in place.
+    cross_lib_syms: HashMap<String, PathBuf>,
     /// Libraries we've already extracted init/fini arrays from.
     processed_libs: HashSet<PathBuf>,
     /// Accumulated init/fini entries from all processed libraries.
@@ -74,6 +79,7 @@ impl ExtractionState {
 pub fn extract_units(
     seeds: &[crate::types::ImportedSymbol],
     exe_elf: &object::read::elf::ElfFile64<'_>,
+    merged_lib_syms: &HashMap<String, PathBuf>,
 ) -> Result<(Vec<ExtractedUnit>, InitFiniArrays)> {
     // Collect symbol names from the executable's .dynsym that merged library code
     // can reference. This includes both defined symbols (callable directly) and
@@ -90,6 +96,7 @@ pub fn extract_units(
         pending: Vec::new(),
         next_id: 0,
         external_syms: exe_defined_syms,
+        cross_lib_syms: merged_lib_syms.clone(),
         processed_libs: HashSet::new(),
         init_fini: InitFiniArrays::default(),
         data_blobs: HashMap::new(),
@@ -275,8 +282,21 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
         let target = if let Some(ts) = target_sym {
             let ts_name = ts.name().unwrap_or("").to_owned();
             if ts.is_undefined() || ts_name.is_empty() {
-                // External symbol.
-                if !state.external_syms.contains(&ts_name) && !ts_name.is_empty() {
+                // External symbol — resolved against (1) executable's exports, then
+                // (2) other merged libraries. Anything else is fatal.
+                if state.external_syms.contains(&ts_name) || ts_name.is_empty() {
+                    RelocTarget::External(ts_name)
+                } else if let Some(other_lib) = state.cross_lib_syms.get(&ts_name).cloned() {
+                    let dep_key = UnitKey {
+                        lib: other_lib,
+                        sym: ts_name,
+                    };
+                    if !new_deps.iter().any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib) {
+                        new_deps.push(dep_key.clone());
+                    }
+                    pending_relocs.push((relocations.len(), dep_key));
+                    RelocTarget::MergedUnit(UnitId(u32::MAX))
+                } else {
                     bail!(
                         "symbol '{}' in {}: references external symbol '{}' which is not \
                          exported by the executable — cannot merge this library",
@@ -285,7 +305,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         ts_name
                     );
                 }
-                RelocTarget::External(ts_name)
             } else {
                 // Internal to the library (or another merged lib).
                 // Check if this is a data symbol - if so, try to use data blob offset
@@ -361,8 +380,13 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
             if rip_ref.is_code_ref {
                 // First check if this is a PLT call (call to external symbol)
                 if let Some(ext_name) = find_plt_target(elf64, target_addr, &lib_bytes) {
-                    // This is a call to an external symbol via PLT
-                    // Check if the executable exports this symbol
+                    // PLT call resolution order:
+                    //   1. Executable exports the symbol → trampoline through exe's GOT.
+                    //   2. Another merged library defines the symbol → extract from
+                    //      that library and create a direct merged-unit reference.
+                    //   3. Otherwise unresolvable; leaving the original library
+                    //      offset in place will crash if this path runs. Warn so
+                    //      it's at least visible.
                     if state.external_syms.contains(&ext_name) {
                         relocations.push(ExtractedReloc {
                             offset_within_unit: rip_ref.offset as u64,
@@ -372,9 +396,38 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             addend: -4,
                             target: RelocTarget::External(ext_name),
                         });
+                    } else if let Some(other_lib) = state.cross_lib_syms.get(&ext_name).cloned() {
+                        let dep_key = UnitKey {
+                            lib: other_lib,
+                            sym: ext_name,
+                        };
+                        if !new_deps.iter().any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib) {
+                            new_deps.push(dep_key.clone());
+                        }
+                        pending_relocs.push((relocations.len(), dep_key));
+                        relocations.push(ExtractedReloc {
+                            offset_within_unit: rip_ref.offset as u64,
+                            kind: object::RelocationKind::Relative,
+                            encoding: object::RelocationEncoding::Generic,
+                            size: 32,
+                            addend: -4,
+                            target: RelocTarget::MergedUnit(UnitId(u32::MAX)),
+                        });
+                    } else {
+                        // Not in exe and not in merged libs: a libc/runtime
+                        // symbol the executable doesn't already import. Emit
+                        // an External reloc; the writer will inject a new
+                        // .dynsym entry and a GLOB_DAT relocation so ld.so
+                        // resolves it at load time.
+                        relocations.push(ExtractedReloc {
+                            offset_within_unit: rip_ref.offset as u64,
+                            kind: object::RelocationKind::Relative,
+                            encoding: object::RelocationEncoding::Generic,
+                            size: 32,
+                            addend: -4,
+                            target: RelocTarget::External(ext_name),
+                        });
                     }
-                    // If not in external_syms, the call will be left as-is
-                    // (will likely crash, but that's the expected behavior for unsupported externals)
                 } else if let Some(target_name) = find_symbol_at_address(elf64, target_addr) {
                     // Code reference (call/jmp) to internal symbol
                     if find_symbol(elf64, &target_name).is_ok() {
@@ -911,17 +964,29 @@ fn ensure_data_blob_extracted(
             let target = if let Some(ts) = target_sym {
                 let ts_name = ts.name().unwrap_or("").to_owned();
                 if ts.is_undefined() || ts_name.is_empty() {
-                    // External symbol
-                    if !state.external_syms.contains(&ts_name) && !ts_name.is_empty() {
+                    // External symbol — same resolution as the code path: exe exports,
+                    // then cross-library merged symbols, then bail.
+                    if state.external_syms.contains(&ts_name) || ts_name.is_empty() {
+                        RelocTarget::External(ts_name)
+                    } else if let Some(other_lib) = state.cross_lib_syms.get(&ts_name).cloned() {
+                        let dep_key = UnitKey {
+                            lib: other_lib,
+                            sym: ts_name,
+                        };
+                        if !new_deps.iter().any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib) {
+                            new_deps.push(dep_key.clone());
+                        }
+                        pending_relocs.push((relocations.len(), dep_key));
+                        RelocTarget::MergedUnit(UnitId(u32::MAX))
+                    } else {
                         bail!(
                             "data section '{}' in {}: references external symbol '{}' which is not \
-                         exported by the executable — cannot merge this library",
+                             exported by the executable — cannot merge this library",
                             sec_name,
                             lib.display(),
                             ts_name
                         );
                     }
-                    RelocTarget::External(ts_name)
                 } else {
                     // Internal to the library
                     let dep_key = UnitKey {

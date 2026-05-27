@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 
+use crate::elf_reader::va_to_file_offset;
 use crate::layout::align_up;
 use crate::types::{MergePlan, RelativeReloc};
 
@@ -31,34 +32,33 @@ pub fn build_merged_segment(plan: &mut MergePlan) -> Result<Vec<u8>> {
 
     for stub in &plan.trampoline_stubs {
         let off = (stub.vaddr - plan.load_address) as usize;
-        // Write: FF 25 00 00 00 00  (jmp [rip+0])
-        //        <8 bytes: target GOT VA>
-        // At runtime: [rip+0] = the 8 bytes immediately after this instruction.
-        // The RIP after the instruction = stub.vaddr + 6, so:
-        //   [rip + 0] = *(stub.vaddr + 6) = target_got_vaddr
-        // But this is an *indirect* jump — it reads a 64-bit address from
-        // stub.vaddr+6 and jumps to that address.  We store the target GOT *VA*
-        // directly (the GOT slot holds the resolved function pointer at runtime).
-        //
-        // Actually: FF 25 imm32 means jmp QWORD PTR [rip + imm32].
-        // The imm32 encodes the offset from (rip after this 6-byte instruction)
-        // to the 8-byte target slot.  We place the target slot immediately after
-        // the instruction, so imm32 = 0.
+        // Real PLT stub encoding: `FF 25 <imm32>` = `jmp qword ptr [rip + imm32]`.
+        // The CPU computes effective address (rip_after + imm32), reads the
+        // 8-byte function pointer the loader wrote into that GOT slot, and
+        // jumps there. We use a RIP-relative offset so the loader's load-base
+        // offset doesn't matter (PIE and non-PIE both work without extra
+        // RELATIVE relocs).
         if off + 14 > seg.len() {
             bail!("trampoline for '{}' overflows segment", stub.symbol_name);
         }
+        let rip_after = stub.vaddr + 6;
+        let rel = (stub.target_got_vaddr as i64) - (rip_after as i64);
+        if !(i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
+            bail!(
+                "trampoline for '{}': GOT slot offset 0x{:x} does not fit in i32 \
+                 (stub at 0x{:x}, target at 0x{:x})",
+                stub.symbol_name,
+                rel,
+                stub.vaddr,
+                stub.target_got_vaddr
+            );
+        }
         seg[off] = 0xFF;
         seg[off + 1] = 0x25;
-        seg[off + 2..off + 6].copy_from_slice(&0u32.to_le_bytes()); // RIP+0
-        seg[off + 6..off + 14].copy_from_slice(&stub.target_got_vaddr.to_le_bytes());
-
-        // For PIE: the 8-byte GOT address at offset+6 needs runtime fixup
-        if plan.is_pie {
-            plan.relative_relocs.push(RelativeReloc {
-                vaddr: stub.vaddr + 6,
-                addend: stub.target_got_vaddr as i64,
-            });
-        }
+        seg[off + 2..off + 6].copy_from_slice(&(rel as i32).to_le_bytes());
+        // The remaining 8 bytes of the reserved 14-byte slot are unused; leave
+        // them zeroed. (Kept at 14 bytes total so the layout calculation that
+        // reserves 14-byte trampolines stays correct.)
     }
 
     // Write init/fini arrays if present
@@ -141,18 +141,15 @@ pub fn write_output(
     // Page-align the offset (required by the kernel for PT_LOAD).
     let seg_file_offset = align_up(seg_file_offset, 0x1000);
 
-    // Build the extended merged segment: original segment + rela.dyn data (if PIE).
-    // We need to include rela.dyn in the segment so it's mapped by PT_LOAD.
-    let (extended_seg, rela_info) = if plan.is_pie && !plan.relative_relocs.is_empty() {
-        build_extended_segment_with_rela(
-            patched_exe,
-            merged_seg,
-            plan,
-            &dynamic_info,
-            seg_file_offset,
-        )?
+    // Build the extended merged segment: original segment + any sections we
+    // need to grow (.dynstr/.dynsym/.gnu.version when injecting new external
+    // symbols; .rela.dyn whenever PIE relocs or new GLOB_DATs are added).
+    let needs_rela_extension = plan.is_pie && !plan.relative_relocs.is_empty();
+    let needs_symbol_extension = !plan.new_externals.is_empty();
+    let (extended_seg, ext_info) = if needs_rela_extension || needs_symbol_extension {
+        build_extended_segment(patched_exe, merged_seg, plan, &dynamic_info, &exe)?
     } else {
-        (merged_seg.to_vec(), None)
+        (merged_seg.to_vec(), ExtensionInfo::default())
     };
 
     // Calculate sizes for embedding PHT within the new PT_LOAD segment.
@@ -217,22 +214,10 @@ pub fn write_output(
     write_u64_le(&mut out, 32, pht_file_offset);
     write_u16_le(&mut out, 56, new_phnum as u16);
 
-    // Update .dynamic entries for rela.dyn if we extended it
-    if let Some((rela_va, rela_size, rela_count)) = rela_info {
-        let dyn_section_offset = dynamic_info.section_offset as usize;
-        if let Some(idx) = dynamic_info.dt_rela_idx {
-            let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-            write_u64_le(&mut out, entry_offset + 8, rela_va);
-        }
-        if let Some(idx) = dynamic_info.dt_relasz_idx {
-            let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-            write_u64_le(&mut out, entry_offset + 8, rela_size);
-        }
-        if let Some(idx) = dynamic_info.dt_relacount_idx {
-            let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-            write_u64_le(&mut out, entry_offset + 8, rela_count);
-        }
-    }
+    // Update .dynamic entries for any sections we relocated into the merged
+    // segment. Each update writes only the d_val field (offset +8 from the
+    // entry start); d_tag is untouched.
+    apply_extension_info(&mut out, &dynamic_info, &ext_info)?;
 
     // Update DT_INIT_ARRAY and DT_FINI_ARRAY to point to our combined arrays
     if plan.init_fini.is_some() {
@@ -272,10 +257,6 @@ fn write_u16_le(buf: &mut [u8], offset: usize, val: u16) {
     buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
 }
 
-fn write_i64_le(buf: &mut [u8], offset: usize, val: i64) {
-    buf[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
-}
-
 /// R_X86_64_RELATIVE relocation type
 const R_X86_64_RELATIVE: u32 = 8;
 
@@ -301,7 +282,28 @@ struct DynamicInfo {
     dt_init_arraysz_idx: Option<usize>,
     dt_fini_array_idx: Option<usize>,
     dt_fini_arraysz_idx: Option<usize>,
+    dt_strtab_idx: Option<usize>,
+    dt_strtab_val: Option<u64>,
+    dt_strsz_idx: Option<usize>,
+    dt_strsz_val: Option<u64>,
+    dt_symtab_idx: Option<usize>,
+    dt_symtab_val: Option<u64>,
+    dt_versym_idx: Option<usize>,
+    dt_versym_val: Option<u64>,
     dt_null_indices: Vec<usize>,
+}
+
+/// Summary of which sections were rebuilt in the merged segment and the new
+/// VAs / sizes that need to land in .dynamic.
+#[derive(Debug, Default)]
+struct ExtensionInfo {
+    rela_va: Option<u64>,
+    rela_size: Option<u64>,
+    rela_count: Option<u64>,
+    strtab_va: Option<u64>,
+    strtab_size: Option<u64>,
+    symtab_va: Option<u64>,
+    versym_va: Option<u64>,
 }
 
 /// Parse .dynamic section info from an unmodified ELF.
@@ -360,6 +362,23 @@ fn parse_dynamic_info(bytes: &[u8]) -> Result<DynamicInfo> {
                 goblin::elf::dynamic::DT_FINI_ARRAYSZ => {
                     info.dt_fini_arraysz_idx = Some(i);
                 }
+                goblin::elf::dynamic::DT_STRTAB => {
+                    info.dt_strtab_idx = Some(i);
+                    info.dt_strtab_val = Some(entry.d_val);
+                }
+                goblin::elf::dynamic::DT_STRSZ => {
+                    info.dt_strsz_idx = Some(i);
+                    info.dt_strsz_val = Some(entry.d_val);
+                }
+                goblin::elf::dynamic::DT_SYMTAB => {
+                    info.dt_symtab_idx = Some(i);
+                    info.dt_symtab_val = Some(entry.d_val);
+                }
+                t if t == 0x6ffffff0u64 => {
+                    // DT_VERSYM
+                    info.dt_versym_idx = Some(i);
+                    info.dt_versym_val = Some(entry.d_val);
+                }
                 goblin::elf::dynamic::DT_NULL => {
                     info.dt_null_indices.push(i);
                 }
@@ -371,76 +390,298 @@ fn parse_dynamic_info(bytes: &[u8]) -> Result<DynamicInfo> {
     Ok(info)
 }
 
-/// Build the merged segment with rela.dyn data appended.
-/// Returns (extended_segment, Some((rela_va, rela_size, rela_count))) or (segment, None).
+/// R_X86_64_GLOB_DAT relocation type.
+const R_X86_64_GLOB_DAT: u32 = 6;
+/// Size of an Elf64_Sym entry.
+const SYM_ENTRY_SIZE: usize = 24;
+/// STB_GLOBAL | STT_FUNC — for the new undefined function symbols we inject.
+const ST_INFO_GLOBAL_FUNC: u8 = (1 << 4) | 2;
+/// VER_NDX_GLOBAL — accept any version of the symbol.
+const VER_NDX_GLOBAL: u16 = 1;
+
+/// Build the merged segment with any extended sections appended. The result
+/// always covers the existing PIE-rela extension; when `plan.new_externals` is
+/// non-empty it also rebuilds `.dynstr`, `.dynsym`, and `.gnu.version` (placed
+/// in the merged segment) and stitches new GLOB_DAT relocs into the rebuilt
+/// `.rela.dyn`.
 ///
-/// The rela.dyn section has a specific layout: R_X86_64_RELATIVE entries come first
-/// (DT_RELACOUNT specifies how many), followed by other relocation types (R_X86_64_64,
-/// R_X86_64_GLOB_DAT, etc.). We must insert our new RELATIVE entries after the existing
-/// RELATIVE entries but before the non-RELATIVE entries to maintain this invariant.
-#[allow(clippy::type_complexity)]
-fn build_extended_segment_with_rela(
+/// The original `.rela.dyn` layout requires that R_X86_64_RELATIVE entries come
+/// first (DT_RELACOUNT bytes' worth), followed by everything else. We preserve
+/// that ordering: existing RELATIVE → new RELATIVE → existing non-RELATIVE →
+/// new GLOB_DAT.
+fn build_extended_segment(
     patched_exe: &[u8],
     merged_seg: &[u8],
     plan: &MergePlan,
     dyn_info: &DynamicInfo,
-    _seg_file_offset: u64,
-) -> Result<(Vec<u8>, Option<(u64, u64, u64)>)> {
-    let old_rela_va = dyn_info
+    exe: &object::read::elf::ElfFile64<'_, object::Endianness>,
+) -> Result<(Vec<u8>, ExtensionInfo)> {
+    let mut extended = Vec::from(merged_seg);
+    let mut info = ExtensionInfo::default();
+
+    // ---- 1. Inject new external symbols (extends .dynstr / .dynsym / .gnu.version)
+    //
+    // We do this first so we know the final symbol indices before writing the
+    // GLOB_DAT relocations into the rebuilt .rela.dyn. The new sections are
+    // placed back-to-back at the end of the segment; existing strings/syms
+    // are copied verbatim so that all pre-existing offsets and indices stay
+    // valid for unchanged consumers (hash tables, verneed entries, etc.).
+
+    let mut new_sym_idx_base: usize = 0;
+
+    if !plan.new_externals.is_empty() {
+        let (old_dynstr, old_dynsym, old_versym) = read_dynsym_tables(patched_exe, exe, dyn_info)?;
+        let old_num_syms = old_dynsym.len() / SYM_ENTRY_SIZE;
+        new_sym_idx_base = old_num_syms;
+
+        // .dynstr: copy existing bytes (preserves all existing offsets), then
+        // append a NUL-terminated name per new symbol. Track the byte offset
+        // each name lands at so we can wire st_name correctly.
+        pad_to(&mut extended, 8);
+        let dynstr_offset_in_seg = extended.len();
+        extended.extend_from_slice(&old_dynstr);
+        let mut new_name_offsets: Vec<u32> = Vec::with_capacity(plan.new_externals.len());
+        for ext in &plan.new_externals {
+            new_name_offsets.push(extended.len() as u32 - dynstr_offset_in_seg as u32);
+            extended.extend_from_slice(ext.name.as_bytes());
+            extended.push(0);
+        }
+        let dynstr_size = extended.len() - dynstr_offset_in_seg;
+
+        // .dynsym: copy existing entries (preserves all existing indices), then
+        // append one undefined STB_GLOBAL/STT_FUNC entry per new symbol.
+        pad_to(&mut extended, 8);
+        let dynsym_offset_in_seg = extended.len();
+        extended.extend_from_slice(&old_dynsym);
+        for name_off in &new_name_offsets {
+            let mut sym = [0u8; SYM_ENTRY_SIZE];
+            sym[0..4].copy_from_slice(&name_off.to_le_bytes()); // st_name
+            sym[4] = ST_INFO_GLOBAL_FUNC; // st_info
+            sym[5] = 0; // st_other = STV_DEFAULT
+            sym[6..8].copy_from_slice(&0u16.to_le_bytes()); // st_shndx = SHN_UNDEF
+            // st_value (8 bytes) and st_size (8 bytes) stay zero
+            extended.extend_from_slice(&sym);
+        }
+
+        // .gnu.version: copy existing u16-per-symbol array, then append one
+        // VER_NDX_GLOBAL entry per new symbol. This array must stay parallel
+        // to .dynsym, so its length tracks the new symbol count.
+        pad_to(&mut extended, 2);
+        let versym_offset_in_seg = extended.len();
+        extended.extend_from_slice(&old_versym);
+        for _ in &plan.new_externals {
+            extended.extend_from_slice(&VER_NDX_GLOBAL.to_le_bytes());
+        }
+
+        info.strtab_va = Some(plan.load_address + dynstr_offset_in_seg as u64);
+        info.strtab_size = Some(dynstr_size as u64);
+        info.symtab_va = Some(plan.load_address + dynsym_offset_in_seg as u64);
+        info.versym_va = Some(plan.load_address + versym_offset_in_seg as u64);
+    }
+
+    // ---- 2. Rebuild .rela.dyn (always when there's anything new to write).
+
+    let need_new_rela = !plan.relative_relocs.is_empty() || !plan.new_externals.is_empty();
+    if need_new_rela {
+        let (existing_relative, existing_non_relative, old_relacount) =
+            read_existing_rela_dyn(patched_exe, exe, dyn_info)?;
+
+        // New RELATIVE entries for PIE (trampolines, GOT patches, init/fini).
+        let mut new_relative = Vec::with_capacity(plan.relative_relocs.len() * RELA_ENTRY_SIZE);
+        for reloc in &plan.relative_relocs {
+            let mut entry = [0u8; RELA_ENTRY_SIZE];
+            entry[0..8].copy_from_slice(&reloc.vaddr.to_le_bytes());
+            entry[8..16].copy_from_slice(&(R_X86_64_RELATIVE as u64).to_le_bytes());
+            entry[16..24].copy_from_slice(&reloc.addend.to_le_bytes());
+            new_relative.extend_from_slice(&entry);
+        }
+
+        // New GLOB_DAT entries for the freshly injected externals. r_info packs
+        // the symbol index (which lives at the end of the rebuilt .dynsym) and
+        // the relocation type.
+        let mut new_glob_dat = Vec::with_capacity(plan.new_externals.len() * RELA_ENTRY_SIZE);
+        for (i, ext) in plan.new_externals.iter().enumerate() {
+            let sym_idx = new_sym_idx_base + i;
+            let r_info: u64 = ((sym_idx as u64) << 32) | (R_X86_64_GLOB_DAT as u64);
+            let mut entry = [0u8; RELA_ENTRY_SIZE];
+            entry[0..8].copy_from_slice(&ext.got_vaddr.to_le_bytes());
+            entry[8..16].copy_from_slice(&r_info.to_le_bytes());
+            // r_addend stays zero
+            new_glob_dat.extend_from_slice(&entry);
+        }
+
+        pad_to(&mut extended, 8);
+        let rela_offset_in_seg = extended.len();
+        extended.extend_from_slice(&existing_relative);
+        extended.extend_from_slice(&new_relative);
+        extended.extend_from_slice(&existing_non_relative);
+        extended.extend_from_slice(&new_glob_dat);
+
+        let total_size = existing_relative.len()
+            + new_relative.len()
+            + existing_non_relative.len()
+            + new_glob_dat.len();
+        let new_count = old_relacount + (plan.relative_relocs.len() as u64);
+
+        info.rela_va = Some(plan.load_address + rela_offset_in_seg as u64);
+        info.rela_size = Some(total_size as u64);
+        info.rela_count = Some(new_count);
+    }
+
+    Ok((extended, info))
+}
+
+/// Read .dynstr, .dynsym, and .gnu.version contents from the patched exe.
+/// The DT_STRTAB/DT_SYMTAB/DT_VERSYM VAs are resolved to file offsets via the
+/// existing PT_LOAD segments, so this works for both ET_EXEC and PIE.
+fn read_dynsym_tables(
+    patched_exe: &[u8],
+    exe: &object::read::elf::ElfFile64<'_, object::Endianness>,
+    dyn_info: &DynamicInfo,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let strtab_va = dyn_info
+        .dt_strtab_val
+        .context("executable missing DT_STRTAB")?;
+    let strsz = dyn_info
+        .dt_strsz_val
+        .context("executable missing DT_STRSZ")? as usize;
+    let symtab_va = dyn_info
+        .dt_symtab_val
+        .context("executable missing DT_SYMTAB")?;
+    let versym_va = dyn_info
+        .dt_versym_val
+        .context("executable missing DT_VERSYM")?;
+
+    let strtab_off = va_to_file_offset(exe, strtab_va).context("DT_STRTAB not in any PT_LOAD")?
+        as usize;
+
+    // .dynsym size has to come from the section header — DT_SYMENT only gives
+    // the per-entry width, and there is no DT_SYMSZ.
+    let goblin_elf =
+        goblin::elf::Elf::parse(patched_exe).context("goblin parse for dynsym/versym sizes")?;
+    let mut dynsym_size: Option<usize> = None;
+    let mut versym_size: Option<usize> = None;
+    for sh in &goblin_elf.section_headers {
+        match goblin_elf.shdr_strtab.get_at(sh.sh_name) {
+            Some(".dynsym") => dynsym_size = Some(sh.sh_size as usize),
+            Some(".gnu.version") => versym_size = Some(sh.sh_size as usize),
+            _ => {}
+        }
+    }
+    let dynsym_size = dynsym_size.context(".dynsym section header not found")?;
+    let versym_size = versym_size.context(".gnu.version section header not found")?;
+
+    let symtab_off = va_to_file_offset(exe, symtab_va).context("DT_SYMTAB not in any PT_LOAD")?
+        as usize;
+    let versym_off = va_to_file_offset(exe, versym_va).context("DT_VERSYM not in any PT_LOAD")?
+        as usize;
+
+    if strtab_off + strsz > patched_exe.len() {
+        bail!(".dynstr extends past end of file");
+    }
+    if symtab_off + dynsym_size > patched_exe.len() {
+        bail!(".dynsym extends past end of file");
+    }
+    if versym_off + versym_size > patched_exe.len() {
+        bail!(".gnu.version extends past end of file");
+    }
+
+    Ok((
+        patched_exe[strtab_off..strtab_off + strsz].to_vec(),
+        patched_exe[symtab_off..symtab_off + dynsym_size].to_vec(),
+        patched_exe[versym_off..versym_off + versym_size].to_vec(),
+    ))
+}
+
+/// Slice the existing .rela.dyn into its RELATIVE prefix and everything else,
+/// returning the two halves plus the original RELATIVE count.
+fn read_existing_rela_dyn(
+    patched_exe: &[u8],
+    exe: &object::read::elf::ElfFile64<'_, object::Endianness>,
+    dyn_info: &DynamicInfo,
+) -> Result<(Vec<u8>, Vec<u8>, u64)> {
+    let rela_va = dyn_info
         .dt_rela_val
-        .context("PIE executable missing DT_RELA")?;
-    let old_relasz = dyn_info
+        .context("executable missing DT_RELA")?;
+    let relasz = dyn_info
         .dt_relasz_val
-        .context("PIE executable missing DT_RELASZ")?;
-    let old_relacount = dyn_info.dt_relacount_val.unwrap_or(0);
+        .context("executable missing DT_RELASZ")? as usize;
+    let relacount = dyn_info.dt_relacount_val.unwrap_or(0);
 
-    // Read existing .rela.dyn entries from the original exe
-    // For PIE, VA == file offset when loaded at base 0.
-    let start = old_rela_va as usize;
-    let end = start + old_relasz as usize;
-    if end > patched_exe.len() {
-        bail!("existing .rela.dyn extends past end of file");
+    let rela_off = va_to_file_offset(exe, rela_va).context("DT_RELA not in any PT_LOAD")? as usize;
+    if rela_off + relasz > patched_exe.len() {
+        bail!(".rela.dyn extends past end of file");
     }
 
-    // Split existing rela into RELATIVE entries (first `old_relacount`) and non-RELATIVE entries
-    let relative_end = start + (old_relacount as usize * RELA_ENTRY_SIZE);
-    let existing_relative = &patched_exe[start..relative_end];
-    let existing_non_relative = &patched_exe[relative_end..end];
+    let relative_end = rela_off + (relacount as usize) * RELA_ENTRY_SIZE;
+    if relative_end > rela_off + relasz {
+        bail!(
+            "DT_RELACOUNT ({relacount}) implies more bytes than DT_RELASZ ({relasz}) — \
+             corrupted .rela.dyn"
+        );
+    }
+    Ok((
+        patched_exe[rela_off..relative_end].to_vec(),
+        patched_exe[relative_end..rela_off + relasz].to_vec(),
+        relacount,
+    ))
+}
 
-    // Build new RELATIVE entries
-    let num_new = plan.relative_relocs.len();
-    let new_entries_size = num_new * RELA_ENTRY_SIZE;
-    let mut new_rela = vec![0u8; new_entries_size];
+fn pad_to(buf: &mut Vec<u8>, alignment: usize) {
+    while buf.len() % alignment != 0 {
+        buf.push(0);
+    }
+}
 
-    for (i, reloc) in plan.relative_relocs.iter().enumerate() {
-        let off = i * RELA_ENTRY_SIZE;
-        write_u64_le(&mut new_rela, off, reloc.vaddr);
-        write_u64_le(&mut new_rela, off + 8, R_X86_64_RELATIVE as u64);
-        write_i64_le(&mut new_rela, off + 16, reloc.addend);
+/// Write any updated DT_* d_val fields back into the in-memory .dynamic image.
+fn apply_extension_info(
+    out: &mut [u8],
+    dyn_info: &DynamicInfo,
+    ext: &ExtensionInfo,
+) -> Result<()> {
+    let dyn_section_offset = dyn_info.section_offset as usize;
+    let write_val = |out: &mut [u8], idx: usize, val: u64| {
+        let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
+        write_u64_le(out, entry_offset + 8, val);
+    };
+
+    if let Some(va) = ext.rela_va
+        && let Some(idx) = dyn_info.dt_rela_idx
+    {
+        write_val(out, idx, va);
+    }
+    if let Some(sz) = ext.rela_size
+        && let Some(idx) = dyn_info.dt_relasz_idx
+    {
+        write_val(out, idx, sz);
+    }
+    if let Some(c) = ext.rela_count
+        && let Some(idx) = dyn_info.dt_relacount_idx
+    {
+        write_val(out, idx, c);
+    }
+    if let Some(va) = ext.strtab_va
+        && let Some(idx) = dyn_info.dt_strtab_idx
+    {
+        write_val(out, idx, va);
+    }
+    if let Some(sz) = ext.strtab_size
+        && let Some(idx) = dyn_info.dt_strsz_idx
+    {
+        write_val(out, idx, sz);
+    }
+    if let Some(va) = ext.symtab_va
+        && let Some(idx) = dyn_info.dt_symtab_idx
+    {
+        write_val(out, idx, va);
+    }
+    if let Some(va) = ext.versym_va
+        && let Some(idx) = dyn_info.dt_versym_idx
+    {
+        write_val(out, idx, va);
     }
 
-    // Build extended segment: merged_seg + [existing RELATIVE + new RELATIVE + existing non-RELATIVE]
-    let total_rela_size = existing_relative.len() + new_rela.len() + existing_non_relative.len();
-    let mut extended = Vec::with_capacity(merged_seg.len() + total_rela_size);
-    extended.extend_from_slice(merged_seg);
-
-    // Align to 8 bytes before rela data
-    while extended.len() % 8 != 0 {
-        extended.push(0);
-    }
-
-    let rela_offset_in_seg = extended.len();
-    // Order: existing RELATIVE, new RELATIVE, existing non-RELATIVE
-    extended.extend_from_slice(existing_relative);
-    extended.extend_from_slice(&new_rela);
-    extended.extend_from_slice(existing_non_relative);
-
-    // Calculate the VA of the rela section in the extended segment
-    let rela_va = plan.load_address + rela_offset_in_seg as u64;
-    let new_relasz = total_rela_size as u64;
-    let new_count = old_relacount + num_new as u64;
-
-    Ok((extended, Some((rela_va, new_relasz, new_count))))
+    Ok(())
 }
 
 /// Update DT_INIT_ARRAY/DT_INIT_ARRAYSZ and DT_FINI_ARRAY/DT_FINI_ARRAYSZ in .dynamic
