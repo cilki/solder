@@ -374,7 +374,7 @@ fn parse_dynamic_info(bytes: &[u8]) -> Result<DynamicInfo> {
                     info.dt_symtab_idx = Some(i);
                     info.dt_symtab_val = Some(entry.d_val);
                 }
-                t if t == 0x6ffffff0u64 => {
+                0x6ffffff0u64 => {
                     // DT_VERSYM
                     info.dt_versym_idx = Some(i);
                     info.dt_versym_val = Some(entry.d_val);
@@ -628,7 +628,7 @@ fn read_existing_rela_dyn(
 }
 
 fn pad_to(buf: &mut Vec<u8>, alignment: usize) {
-    while buf.len() % alignment != 0 {
+    while !buf.len().is_multiple_of(alignment) {
         buf.push(0);
     }
 }
