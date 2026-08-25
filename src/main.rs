@@ -46,11 +46,6 @@ struct Cli {
     /// Analyse and print the merge plan without writing any output
     #[arg(long)]
     dry_run: bool,
-
-    // TODO REMOVE
-    /// Override the base virtual address for the merged segment (hex, e.g. 0x800000)
-    #[arg(long, value_name = "HEX")]
-    merge_base: Option<String>,
 }
 
 fn main() {
@@ -70,18 +65,6 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-
-    let merge_base: Option<u64> = cli
-        .merge_base
-        .as_deref()
-        .map(|s| {
-            let s = s
-                .strip_prefix("0x")
-                .or_else(|| s.strip_prefix("0X"))
-                .unwrap_or(s);
-            u64::from_str_radix(s, 16).context("--merge-base must be a hex address")
-        })
-        .transpose()?;
 
     let merge_filter: Option<&[String]> = if cli.merge_libs.is_empty() {
         None
@@ -184,7 +167,6 @@ fn run() -> Result<()> {
         units,
         &exe_elf,
         &imports,
-        merge_base,
         is_pie,
         init_fini,
         exe_init_fini,
