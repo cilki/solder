@@ -281,9 +281,13 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
 
         let target = if let Some(ts) = target_sym {
             let ts_name = ts.name().unwrap_or("").to_owned();
-            if ts.is_undefined() || ts_name.is_empty() {
-                // External symbol — resolved against (1) executable's exports, then
-                // (2) other merged libraries. Anything else is fatal.
+            let ts_in_section = matches!(ts.section(), object::SymbolSection::Section(_));
+            if ts.is_undefined() || ts_name.is_empty() || !ts_in_section {
+                // Undefined, unnamed, or absolute (e.g. a GNU version-node
+                // pseudo-symbol like NCURSESW6_*, which is SHN_ABS with value 0).
+                // None of these are extractable units, so route them through the
+                // same resolution as externals: (1) executable's exports, then
+                // (2) other merged libraries; anything else is fatal.
                 if state.external_syms.contains(&ts_name) || ts_name.is_empty() {
                     RelocTarget::External(ts_name)
                 } else if let Some(other_lib) = state.cross_lib_syms.get(&ts_name).cloned() {
@@ -739,11 +743,16 @@ fn find_symbol(elf: &object::read::elf::ElfFile64<'_>, name: &str) -> Result<Sym
 
 /// Find a symbol by virtual address in an ELF's .symtab (including local symbols).
 /// Returns the symbol name if found, or None if no symbol starts at that address.
+///
+/// Only symbols that live in a real section are eligible: GNU version-node
+/// pseudo-symbols (e.g. `NCURSESW6_5.8.20110226`) are `SHN_ABS` with value 0, so
+/// a scanned reference that resolves to address 0 would otherwise match one of
+/// them and then fail extraction with "not in a regular section".
 fn find_symbol_at_address(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> Option<String> {
     // First check .symtab (has local symbols like .cold functions)
     for sym in elf.symbols() {
         if sym.address() == addr
-            && !sym.is_undefined()
+            && matches!(sym.section(), object::SymbolSection::Section(_))
             && let Ok(name) = sym.name()
             && !name.is_empty()
         {
@@ -753,7 +762,7 @@ fn find_symbol_at_address(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> 
     // Fall back to .dynsym
     for sym in elf.dynamic_symbols() {
         if sym.address() == addr
-            && !sym.is_undefined()
+            && matches!(sym.section(), object::SymbolSection::Section(_))
             && let Ok(name) = sym.name()
             && !name.is_empty()
         {
