@@ -279,12 +279,14 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     const VERNEED_SIZE: usize = 16;
 
     // Collect info we need before mutating bytes
-    let (verneed_offset, verneednum_dyn_idx, dyn_section_offset, entries_to_remove): (
-        u64,
-        Option<usize>,
-        u64,
-        Vec<u64>,
-    ) = {
+    let (
+        verneed_offset,
+        verneed_va,
+        verneed_dyn_idx,
+        verneednum_dyn_idx,
+        dyn_section_offset,
+        entries_to_remove,
+    ): (u64, u64, Option<usize>, Option<usize>, u64, Vec<u64>) = {
         let goblin_elf =
             goblin::elf::Elf::parse(bytes).context("goblin parse for verneed removal")?;
 
@@ -295,12 +297,14 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
 
         // Find DT_VERNEED value (VA of .gnu.version_r) and DT_VERNEEDNUM index
         let mut verneed_va: Option<u64> = None;
+        let mut verneed_idx: Option<usize> = None;
         let mut verneednum_idx: Option<usize> = None;
 
         for (i, entry) in dynamic.dyns.iter().enumerate() {
             match entry.d_tag {
                 goblin::elf::dynamic::DT_VERNEED => {
                     verneed_va = Some(entry.d_val);
+                    verneed_idx = Some(i);
                 }
                 goblin::elf::dynamic::DT_VERNEEDNUM => {
                     verneednum_idx = Some(i);
@@ -309,7 +313,7 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
             }
         }
 
-        let _verneed_va = match verneed_va {
+        let verneed_va = match verneed_va {
             Some(va) => va,
             None => return Ok(()), // No version requirements section
         };
@@ -349,6 +353,8 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
 
         (
             verneed_file_offset,
+            verneed_va,
+            verneed_idx,
             verneednum_idx,
             dyn_offset,
             entries_to_remove,
@@ -359,82 +365,175 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
         return Ok(());
     }
 
-    // Now perform the linked list surgery
-    // We need to update vn_next pointers of entries that precede removed entries
-    // to skip over them.
+    // Now perform the linked list surgery.
+    //
+    // glibc's `_dl_check_map_versions` calls `find_needed(vn_file)` for *every*
+    // Verneed entry and asserts the result is non-NULL *before* it ever looks at
+    // `vn_cnt`.  So a removed library's entry cannot merely be zeroed in place —
+    // it must be unlinked from the list entirely, including when it is the head
+    // (in which case DT_VERNEED itself must be advanced to the next entry).
+    let removed: std::collections::HashSet<usize> =
+        entries_to_remove.iter().map(|&o| o as usize).collect();
 
-    let mut offset = verneed_offset as usize;
-    let mut prev_offset: Option<usize> = None;
-    let mut removed_count = 0u64;
+    let (new_head, kept_count) = relink_verneed_list(bytes, verneed_offset as usize, &removed);
 
-    loop {
-        if offset + VERNEED_SIZE > bytes.len() {
-            break;
-        }
-
-        let vn_next = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap());
-        let is_last = vn_next == 0;
-        let next_offset = if is_last {
-            None
-        } else {
-            Some(offset + vn_next as usize)
-        };
-
-        if entries_to_remove.contains(&(offset as u64)) {
-            // This entry should be removed
-            removed_count += 1;
-
-            if let Some(prev) = prev_offset {
-                // Update previous entry's vn_next to skip this entry
-                if let Some(next) = next_offset {
-                    // Point to next entry: calculate relative offset from prev to next
-                    let new_vn_next = (next - prev) as u32;
-                    bytes[prev + 12..prev + 16].copy_from_slice(&new_vn_next.to_le_bytes());
-                } else {
-                    // This was the last entry, make prev the new last
-                    bytes[prev + 12..prev + 16].copy_from_slice(&0u32.to_le_bytes());
-                }
+    // If the head entry was removed, point DT_VERNEED at the first kept entry.
+    // (Its VA tracks the file offset since the section is contiguous.)
+    if kept_count > 0 {
+        if new_head as u64 != verneed_offset
+            && let Some(idx) = verneed_dyn_idx
+        {
+            let new_va = verneed_va + (new_head as u64 - verneed_offset);
+            let entry_offset = dyn_section_offset as usize + idx * 16 + 8; // d_val at +8
+            if entry_offset + 8 <= bytes.len() {
+                bytes[entry_offset..entry_offset + 8].copy_from_slice(&new_va.to_le_bytes());
             }
-            // If prev_offset is None, this is the first entry - we handle this by
-            // keeping the first entry in place but zeroing it, or we'd need to update
-            // DT_VERNEED which is more complex. For now, zero the entry's vn_cnt.
-            if prev_offset.is_none() && next_offset.is_some() {
-                // First entry being removed but there are more entries after.
-                // We can't easily move the section start, so we'll zero vn_cnt
-                // to make this entry have no version requirements.
-                bytes[offset + 2..offset + 4].copy_from_slice(&0u16.to_le_bytes());
-                // Keep vn_next intact so the list continues
-                // Don't count this as fully removed since we still traverse it
-                removed_count -= 1;
-            } else if prev_offset.is_none() && next_offset.is_none() {
-                // Only entry, just zero it
-                bytes[offset + 2..offset + 4].copy_from_slice(&0u16.to_le_bytes());
+        }
+    } else {
+        // No requirements remain at all. Drop DT_VERNEED so ld.so doesn't walk a
+        // now-empty section (rare: only if every needed library was merged).
+        if let Some(idx) = verneed_dyn_idx {
+            let entry_offset = dyn_section_offset as usize + idx * 16;
+            if entry_offset + 16 <= bytes.len() {
+                // Rewrite tag to a runtime no-op (DT_DEBUG is ignored by ld.so).
+                let dt_debug = goblin::elf::dynamic::DT_DEBUG.to_le_bytes();
+                bytes[entry_offset..entry_offset + 8].copy_from_slice(&dt_debug);
+                bytes[entry_offset + 8..entry_offset + 16].copy_from_slice(&0u64.to_le_bytes());
             }
-
-            // Don't update prev_offset for removed entries
-        } else {
-            // Keep this entry, it becomes the new "previous"
-            prev_offset = Some(offset);
         }
-
-        if is_last {
-            break;
-        }
-        offset = next_offset.unwrap();
     }
 
-    // Update DT_VERNEEDNUM in .dynamic
-    if removed_count > 0
-        && let Some(idx) = verneednum_dyn_idx
-    {
+    // Update DT_VERNEEDNUM to the number of surviving entries.
+    if let Some(idx) = verneednum_dyn_idx {
         let entry_offset = dyn_section_offset as usize + idx * 16 + 8; // d_val is at offset 8
         if entry_offset + 8 <= bytes.len() {
-            let current =
-                u64::from_le_bytes(bytes[entry_offset..entry_offset + 8].try_into().unwrap());
-            let new_count = current.saturating_sub(removed_count);
-            bytes[entry_offset..entry_offset + 8].copy_from_slice(&new_count.to_le_bytes());
+            bytes[entry_offset..entry_offset + 8]
+                .copy_from_slice(&(kept_count as u64).to_le_bytes());
         }
     }
 
     Ok(())
+}
+
+/// Rewrite the Verneed linked list in `bytes` starting at `verneed_offset`,
+/// unlinking every entry whose file offset is contained in `removed`.
+///
+/// Each Verneed entry's `vn_next` (at byte offset +12) is a *relative* byte
+/// offset to the next entry, or 0 to terminate the list. This walks the chain,
+/// drops the removed offsets, and rewrites `vn_next` across the survivors so the
+/// removed entries are skipped. Returns `(new_head_offset, surviving_count)`;
+/// `new_head_offset` equals `verneed_offset` unless the original head was removed.
+fn relink_verneed_list(
+    bytes: &mut [u8],
+    verneed_offset: usize,
+    removed: &std::collections::HashSet<usize>,
+) -> (usize, usize) {
+    const VERNEED_SIZE: usize = 16;
+
+    // Pass 1: collect every entry offset in list order.
+    let mut all_offsets: Vec<usize> = Vec::new();
+    let mut offset = verneed_offset;
+    loop {
+        if offset + VERNEED_SIZE > bytes.len() {
+            break;
+        }
+        all_offsets.push(offset);
+        let vn_next = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap());
+        if vn_next == 0 {
+            break;
+        }
+        offset += vn_next as usize;
+    }
+
+    let kept: Vec<usize> = all_offsets
+        .into_iter()
+        .filter(|o| !removed.contains(o))
+        .collect();
+
+    // Pass 2: rebuild the vn_next chain across the kept entries.
+    for (i, &off) in kept.iter().enumerate() {
+        let new_vn_next = match kept.get(i + 1) {
+            Some(&next) => (next - off) as u32,
+            None => 0, // last kept entry terminates the list
+        };
+        bytes[off + 12..off + 16].copy_from_slice(&new_vn_next.to_le_bytes());
+    }
+
+    (kept.first().copied().unwrap_or(verneed_offset), kept.len())
+}
+
+#[cfg(test)]
+mod verneed_tests {
+    use super::relink_verneed_list;
+    use std::collections::HashSet;
+
+    /// Build `n` consecutive 16-byte Verneed entries. `vn_file` (byte +4) is set
+    /// to the entry index so entries are distinguishable; `vn_next` chains them.
+    fn make_list(n: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; n * 16];
+        for i in 0..n {
+            let off = i * 16;
+            bytes[off + 4..off + 8].copy_from_slice(&(i as u32).to_le_bytes());
+            let vn_next: u32 = if i + 1 < n { 16 } else { 0 };
+            bytes[off + 12..off + 16].copy_from_slice(&vn_next.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn walk(bytes: &[u8], head: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut off = head;
+        loop {
+            out.push(u32::from_le_bytes(
+                bytes[off + 4..off + 8].try_into().unwrap(),
+            ));
+            let nn = u32::from_le_bytes(bytes[off + 12..off + 16].try_into().unwrap());
+            if nn == 0 {
+                break;
+            }
+            off += nn as usize;
+        }
+        out
+    }
+
+    #[test]
+    fn remove_head_advances_to_next() {
+        // This is the case that crashed ld.so: the merged library was the first
+        // Verneed entry, so DT_VERNEED must move to the second entry.
+        let mut bytes = make_list(3);
+        let (head, count) = relink_verneed_list(&mut bytes, 0, &HashSet::from([0]));
+        assert_eq!((head, count), (16, 2));
+        assert_eq!(walk(&bytes, head), vec![1, 2]);
+    }
+
+    #[test]
+    fn remove_middle_relinks_around() {
+        let mut bytes = make_list(3);
+        let (head, count) = relink_verneed_list(&mut bytes, 0, &HashSet::from([16]));
+        assert_eq!((head, count), (0, 2));
+        assert_eq!(walk(&bytes, head), vec![0, 2]);
+    }
+
+    #[test]
+    fn remove_tail_terminates_list() {
+        let mut bytes = make_list(3);
+        let (head, count) = relink_verneed_list(&mut bytes, 0, &HashSet::from([32]));
+        assert_eq!((head, count), (0, 2));
+        assert_eq!(walk(&bytes, head), vec![0, 1]);
+    }
+
+    #[test]
+    fn remove_head_and_middle() {
+        let mut bytes = make_list(4);
+        let (head, count) = relink_verneed_list(&mut bytes, 0, &HashSet::from([0, 32]));
+        assert_eq!((head, count), (16, 2));
+        assert_eq!(walk(&bytes, head), vec![1, 3]);
+    }
+
+    #[test]
+    fn remove_all_reports_empty() {
+        let mut bytes = make_list(2);
+        let (_head, count) = relink_verneed_list(&mut bytes, 0, &HashSet::from([0, 16]));
+        assert_eq!(count, 0);
+    }
 }
