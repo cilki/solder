@@ -281,3 +281,102 @@ pub fn find_jump_slot_reloc_offsets(
 
     Ok(offsets)
 }
+
+/// Find the file offsets of R_X86_64_COPY relocations in `.rela.dyn` whose symbol
+/// is provided by a fully-merged library. Returns the offset of each entry's
+/// `r_info` field so the patcher can zero the entry (turning it into
+/// R_X86_64_NONE). Copy relocations import an initial data value from a shared
+/// object at load time; once that object is merged away, ld.so can no longer
+/// find the symbol and aborts with "undefined symbol". The executable already
+/// reserves the storage in its own `.bss`, so neutralizing the relocation is
+/// sufficient for the common case where the source value is zero-initialized.
+pub fn find_copy_reloc_offsets(
+    elf: &ElfFile64<'_>,
+    removed_provided_syms: &std::collections::HashSet<String>,
+) -> Result<Vec<(u64, String)>> {
+    use goblin::elf64::reloc::R_X86_64_COPY;
+
+    let bytes = elf.data();
+    let goblin_exe = goblin::elf::Elf::parse(bytes).context("goblin parse")?;
+
+    let dynidx_to_name: std::collections::HashMap<usize, String> = goblin_exe
+        .dynsyms
+        .iter()
+        .enumerate()
+        .filter_map(|(i, sym)| {
+            goblin_exe
+                .dynstrtab
+                .get_at(sym.st_name)
+                .map(|n| (i, n.to_owned()))
+        })
+        .collect();
+
+    let mut found = Vec::new();
+
+    for section in elf.sections() {
+        if section.name() != Ok(".rela.dyn") {
+            continue;
+        }
+        let sh_offset = section.file_range().map(|(off, _)| off).unwrap_or(0);
+        let data = section.data().context(".rela.dyn data")?;
+        let n = data.len() / 24;
+
+        for i in 0..n {
+            let entry = &data[i * 24..(i + 1) * 24];
+            let r_info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+            let r_type = (r_info & 0xffffffff) as u32;
+
+            if r_type != R_X86_64_COPY {
+                continue;
+            }
+
+            let sym_idx = (r_info >> 32) as usize;
+            let name = match dynidx_to_name.get(&sym_idx) {
+                Some(n) => n,
+                None => continue,
+            };
+            if removed_provided_syms.contains(name) {
+                found.push((sh_offset + (i as u64) * 24 + 8, name.clone()));
+            }
+        }
+        break;
+    }
+
+    Ok(found)
+}
+
+/// Whether the named defined symbol in `lib_path` is zero-initialized — either
+/// it lives in a NOBITS section (.bss) or its backing bytes are all zero. Used
+/// to confirm a copy relocation can be safely neutralized without preserving an
+/// initial value (the executable's own .bss copy is already zero).
+pub fn symbol_is_zero_initialized(lib_path: &std::path::Path, name: &str) -> Result<bool> {
+    use object::{Object, ObjectSection, ObjectSymbol};
+
+    let bytes =
+        std::fs::read(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
+    let file = object::File::parse(bytes.as_slice())
+        .with_context(|| format!("parsing {}", lib_path.display()))?;
+
+    for sym in file.dynamic_symbols() {
+        if sym.name().ok() != Some(name) || sym.is_undefined() {
+            continue;
+        }
+        let object::SymbolSection::Section(idx) = sym.section() else {
+            // Absolute/other: no backing data to preserve.
+            return Ok(true);
+        };
+        let section = file.section_by_index(idx)?;
+        if section.kind() == object::SectionKind::UninitializedData {
+            return Ok(true); // .bss — implicitly zero
+        }
+        let data = section.data().unwrap_or(&[]);
+        let start = (sym.address() - section.address()) as usize;
+        let end = start + sym.size() as usize;
+        return Ok(data
+            .get(start..end)
+            .is_none_or(|b| b.iter().all(|&x| x == 0)));
+    }
+
+    // Symbol not found as a definition — nothing to preserve.
+    Ok(true)
+}

@@ -179,6 +179,7 @@ pub fn plan_layout(
         trampoline_stubs,
         got_patches,
         jump_slot_reloc_offsets: Vec::new(),
+        copy_reloc_offsets: Vec::new(),
         remove_needed,
         relative_relocs: Vec::new(),
         new_externals,

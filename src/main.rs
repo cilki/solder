@@ -230,6 +230,39 @@ fn run() -> Result<()> {
         symbol_analysis::find_jump_slot_reloc_offsets(&exe_elf, &merged_names)
             .context("finding JUMP_SLOT reloc offsets")?;
 
+    // Neutralize copy relocations for data symbols exported by a library we are
+    // removing (e.g. ncurses' UP/PC/BC). Only symbols whose providing library's
+    // soname is in remove_needed are eligible, so a partially-merged library's
+    // copy relocations are left untouched.
+    let removed_provided_syms: HashSet<String> = merged_lib_syms
+        .iter()
+        .filter(|(_, lib)| {
+            lib.file_name()
+                .and_then(|n| n.to_str())
+                .map(|base| {
+                    plan.remove_needed
+                        .iter()
+                        .any(|soname| base.starts_with(soname.as_str()) || soname.starts_with(base))
+                })
+                .unwrap_or(false)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let copy_relocs = symbol_analysis::find_copy_reloc_offsets(&exe_elf, &removed_provided_syms)
+        .context("finding COPY reloc offsets")?;
+    for (off, name) in copy_relocs {
+        if let Some(lib) = merged_lib_syms.get(&name)
+            && !symbol_analysis::symbol_is_zero_initialized(lib, &name)?
+        {
+            anyhow::bail!(
+                "copy-relocated symbol '{name}' from {} has a non-zero initializer; \
+                 preserving copy-relocation initial values is not yet supported",
+                lib.display()
+            );
+        }
+        plan.copy_reloc_offsets.push(off);
+    }
+
     let mut patched_exe = exe_mapped.bytes().to_vec();
     patcher::apply_patches(&mut patched_exe, &mut plan)?;
 

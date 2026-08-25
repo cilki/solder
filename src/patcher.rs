@@ -15,6 +15,7 @@ use crate::types::{MergePlan, RelativeReloc};
 pub fn apply_patches(exe_bytes: &mut [u8], plan: &mut MergePlan) -> Result<()> {
     patch_got(exe_bytes, plan)?;
     zero_jump_slot_relocs(exe_bytes, plan)?;
+    zero_copy_relocs(exe_bytes, plan)?;
     remove_dt_needed(exe_bytes, plan)?;
     remove_verneed_entries(exe_bytes, plan)?;
     ensure_bind_now(exe_bytes)?;
@@ -55,6 +56,21 @@ fn zero_jump_slot_relocs(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
         let off = off as usize;
         if off + 16 > bytes.len() {
             bail!("JUMP_SLOT reloc offset 0x{:x} out of bounds", off);
+        }
+        bytes[off..off + 16].fill(0);
+    }
+    Ok(())
+}
+
+/// Zero out r_info and r_addend for R_X86_64_COPY relocations whose symbol was
+/// provided by a merged-away library, turning each into R_X86_64_NONE so ld.so
+/// skips it instead of failing to resolve the now-absent symbol. Each offset
+/// points to the entry's r_info field.
+fn zero_copy_relocs(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
+    for &off in &plan.copy_reloc_offsets {
+        let off = off as usize;
+        if off + 16 > bytes.len() {
+            bail!("COPY reloc offset 0x{:x} out of bounds", off);
         }
         bytes[off..off + 16].fill(0);
     }

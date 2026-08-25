@@ -181,6 +181,10 @@ pub struct MergePlan {
     pub got_patches: Vec<GotPatch>,
     /// JUMP_SLOT relocation file offsets to zero out (r_info + r_addend fields).
     pub jump_slot_reloc_offsets: Vec<u64>,
+    /// R_X86_64_COPY relocation file offsets to zero out. Copy relocations for
+    /// data symbols provided by a fully-merged library (e.g. ncurses' UP/PC/BC)
+    /// must be neutralized, or ld.so fails to resolve the now-absent symbol.
+    pub copy_reloc_offsets: Vec<u64>,
     /// DT_NEEDED string values to remove from the dynamic section.
     pub remove_needed: Vec<String>,
     /// R_X86_64_RELATIVE relocations to add for PIE executables.
