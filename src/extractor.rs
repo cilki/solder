@@ -291,7 +291,10 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         lib: other_lib,
                         sym: ts_name,
                     };
-                    if !new_deps.iter().any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib) {
+                    if !new_deps
+                        .iter()
+                        .any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib)
+                    {
                         new_deps.push(dep_key.clone());
                     }
                     pending_relocs.push((relocations.len(), dep_key));
@@ -401,7 +404,10 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             lib: other_lib,
                             sym: ext_name,
                         };
-                        if !new_deps.iter().any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib) {
+                        if !new_deps
+                            .iter()
+                            .any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib)
+                        {
                             new_deps.push(dep_key.clone());
                         }
                         pending_relocs.push((relocations.len(), dep_key));
@@ -428,9 +434,22 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             target: RelocTarget::External(ext_name),
                         });
                     }
-                } else if let Some(target_name) = find_symbol_at_address(elf64, target_addr) {
-                    // Code reference (call/jmp) to internal symbol
-                    if find_symbol(elf64, &target_name).is_ok() {
+                } else {
+                    // Direct call/jmp to an internal address. Prefer a named
+                    // symbol; otherwise synthesize an anonymous unit for a
+                    // symbol-less local helper. Stripped libraries routinely
+                    // reach such helpers via a plain `call` with no symbol of
+                    // their own — e.g. OpenSSL's md5_block_asm_data_order, which
+                    // MD5_Update/MD5_Final call directly. Without this, the call
+                    // bytes were copied verbatim and the stale displacement
+                    // pointed into unmapped memory, crashing at runtime.
+                    let dep_name = find_symbol_at_address(elf64, target_addr)
+                        .filter(|n| find_symbol(elf64, n).is_ok())
+                        .or_else(|| {
+                            anon_target_is_extractable(elf64, target_addr)
+                                .then(|| anon_unit_name(target_addr))
+                        });
+                    if let Some(target_name) = dep_name {
                         let dep_key = UnitKey {
                             lib: key.lib.clone(),
                             sym: target_name,
@@ -449,6 +468,14 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             addend: -4, // Standard PC-relative addend
                             target: RelocTarget::MergedUnit(UnitId(u32::MAX)),
                         });
+                    } else {
+                        warn!(
+                            symbol = key.sym,
+                            offset = format_args!("{:#x}", rip_ref.offset),
+                            target = format_args!("{:#x}", target_addr),
+                            "direct code ref to an unresolved internal target; \
+                             merged binary may crash if this path executes"
+                        );
                     }
                 }
             } else {
@@ -657,6 +684,28 @@ struct SymInfo {
 
 /// Find a symbol by name in an ELF's .symtab, falling back to .dynsym.
 fn find_symbol(elf: &object::read::elf::ElfFile64<'_>, name: &str) -> Result<SymInfo> {
+    // Synthetic anonymous unit: resolve the address encoded in the name to the
+    // executable section that contains it. Size is left at 0 so the caller
+    // infers it from the next symbol boundary.
+    if let Some(hex) = name.strip_prefix(ANON_UNIT_PREFIX) {
+        let addr = u64::from_str_radix(hex.trim_start_matches("0x"), 16)
+            .with_context(|| format!("malformed anonymous unit name '{name}'"))?;
+        for section in elf.sections() {
+            let sec_addr = section.address();
+            if addr >= sec_addr
+                && addr < sec_addr + section.size()
+                && section.kind() == ObjSectionKind::Text
+            {
+                return Ok(SymInfo {
+                    vaddr: addr,
+                    size: 0,
+                    section: section.index(),
+                });
+            }
+        }
+        bail!("anonymous unit address {addr:#x} not in any executable section");
+    }
+
     // Prefer .symtab (has sizes + section indices).
     for sym in elf.symbols() {
         if sym.name().ok() == Some(name) && !sym.is_undefined() {
@@ -712,6 +761,32 @@ fn find_symbol_at_address(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> 
         }
     }
     None
+}
+
+/// Reserved synthetic-name prefix for anonymous (symbol-less) code units. A
+/// stripped library may reach a local helper function through a direct `call`
+/// while exporting no symbol for it. We give that helper a synthetic name with
+/// its address encoded so `find_symbol` can resolve it back to a location and
+/// `infer_symbol_size` can bound it by the next symbol.
+const ANON_UNIT_PREFIX: &str = ".solder.anon.";
+
+fn anon_unit_name(addr: u64) -> String {
+    format!("{ANON_UNIT_PREFIX}{addr:#x}")
+}
+
+/// Whether `addr` points into executable code we can extract as an anonymous
+/// unit. Excludes PLT sections (those are resolved via `find_plt_target`) so we
+/// never mistake a PLT stub for a mergeable function.
+fn anon_target_is_extractable(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> bool {
+    for section in elf.sections() {
+        let sec_addr = section.address();
+        if addr >= sec_addr && addr < sec_addr + section.size() {
+            let name = section.name().unwrap_or("");
+            let is_plt = matches!(name, ".plt" | ".plt.got" | ".plt.sec");
+            return section.kind() == ObjSectionKind::Text && !is_plt;
+        }
+    }
+    false
 }
 
 /// A RIP-relative reference found in machine code.
@@ -973,7 +1048,10 @@ fn ensure_data_blob_extracted(
                             lib: other_lib,
                             sym: ts_name,
                         };
-                        if !new_deps.iter().any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib) {
+                        if !new_deps
+                            .iter()
+                            .any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib)
+                        {
                             new_deps.push(dep_key.clone());
                         }
                         pending_relocs.push((relocations.len(), dep_key));
