@@ -14,8 +14,6 @@ pub struct JumpTable {
     pub num_entries: usize,
     /// Target virtual addresses for each table entry
     pub targets: Vec<u64>,
-    /// Section name where table resides (usually .rodata)
-    pub _section_name: String,
 }
 
 /// Abstract value tracked per register during symbolic execution.
@@ -374,8 +372,6 @@ pub fn identify_table_bounds(
         })
         .context("Could not find section containing jump table")?;
 
-    let section_name = section.name().unwrap_or("<unknown>").to_string();
-
     let section_data = section.data().context("Could not read section data")?;
 
     let section_addr = section.address();
@@ -457,13 +453,11 @@ pub fn identify_table_bounds(
         table_vaddr: table_base,
         num_entries: targets.len(),
         targets,
-        _section_name: section_name,
     })
 }
 
 /// Find the symbol name at a given virtual address, if any exists.
 /// Checks if address falls within the symbol's range (address to address+size).
-#[allow(dead_code)]
 pub fn find_symbol_at_address(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> Option<String> {
     // First check .symtab (has local symbols)
     for sym in elf.symbols() {
