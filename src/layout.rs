@@ -7,8 +7,8 @@ use tracing::{debug, trace};
 use crate::elf_reader::file_offset_to_va;
 use crate::elf_reader::next_free_va;
 use crate::types::{
-    AssignedUnit, ExeInitFiniInfo, ExtractedUnit, GotPatch, InitFiniArrays, InitFiniPlan,
-    MergePlan, NewExternalSym, RelocTarget, SectionKind, TrampolineStub,
+    AssignedUnit, ExeInitFiniInfo, ExtractedUnit, GotPatch, InitFiniPlan, MergePlan,
+    NewExternalSym, RelocTarget, SectionKind, TrampolineStub,
 };
 
 /// Plan the virtual address layout of all extracted units and trampolines,
@@ -18,7 +18,6 @@ pub fn plan_layout(
     exe_elf: &object::read::elf::ElfFile64<'_>,
     imports: &[crate::types::ImportedSymbol],
     is_pie: bool,
-    init_fini: InitFiniArrays,
     exe_init_fini: ExeInitFiniInfo,
     lib_order: &[PathBuf],
 ) -> Result<MergePlan> {
@@ -157,7 +156,6 @@ pub fn plan_layout(
     // Plan init/fini arrays if there are any entries to merge
     let init_fini_plan = plan_init_fini_arrays(
         exe_elf,
-        &init_fini,
         &exe_init_fini,
         lib_order,
         &unit_vaddr_by_name,
@@ -262,7 +260,6 @@ fn build_exe_got_map(elf: &object::read::elf::ElfFile64<'_>) -> Result<HashMap<S
 #[allow(clippy::too_many_arguments)]
 fn plan_init_fini_arrays(
     exe_elf: &object::read::elf::ElfFile64<'_>,
-    init_fini: &InitFiniArrays,
     exe_init_fini: &ExeInitFiniInfo,
     lib_order: &[PathBuf],
     unit_vaddr_by_name: &HashMap<String, u64>,
@@ -287,7 +284,7 @@ fn plan_init_fini_arrays(
     let exe_bytes = exe_elf.data();
 
     // Silence unused variable warnings for parameters we're not using currently
-    let _ = (init_fini, lib_order, unit_vaddr_by_name, trampoline_stubs);
+    let _ = (lib_order, unit_vaddr_by_name, trampoline_stubs);
 
     // Build combined init_array entries
     let mut combined_init_entries: Vec<u64> = Vec::new();

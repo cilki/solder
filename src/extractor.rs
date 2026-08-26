@@ -5,9 +5,7 @@ use anyhow::{Context, Result, bail};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
-use crate::types::{
-    ExtractedReloc, ExtractedUnit, InitFiniArrays, InitFiniEntry, RelocTarget, SectionKind, UnitId,
-};
+use crate::types::{ExtractedReloc, ExtractedUnit, RelocTarget, SectionKind, UnitId};
 
 /// Relocation type names we explicitly reject with a helpful error.
 fn describe_reloc(
@@ -57,10 +55,6 @@ struct ExtractionState {
     /// calling into libcore) to direct merged-unit references instead of
     /// leaving the original library-relative PLT offset in place.
     cross_lib_syms: HashMap<String, PathBuf>,
-    /// Libraries we've already extracted init/fini arrays from.
-    processed_libs: HashSet<PathBuf>,
-    /// Accumulated init/fini entries from all processed libraries.
-    init_fini: InitFiniArrays,
     /// Extracted data section blobs: maps (lib, section_name) → blob info
     data_blobs: HashMap<DataBlobKey, DataBlobInfo>,
 }
@@ -74,13 +68,12 @@ impl ExtractionState {
 }
 
 /// Extract all symbols transitively reachable from `seeds` (direct imports).
-/// Returns the list of extracted units with placeholder RelocTargets resolved,
-/// along with init/fini array entries from all processed libraries.
+/// Returns the list of extracted units with placeholder RelocTargets resolved.
 pub fn extract_units(
     seeds: &[crate::types::ImportedSymbol],
     exe_elf: &object::read::elf::ElfFile64<'_>,
     merged_lib_syms: &HashMap<String, PathBuf>,
-) -> Result<(Vec<ExtractedUnit>, InitFiniArrays)> {
+) -> Result<Vec<ExtractedUnit>> {
     // Collect symbol names from the executable's .dynsym that merged library code
     // can reference. This includes both defined symbols (callable directly) and
     // undefined/imported symbols (callable through the executable's PLT).
@@ -97,8 +90,6 @@ pub fn extract_units(
         next_id: 0,
         external_syms: exe_defined_syms,
         cross_lib_syms: merged_lib_syms.clone(),
-        processed_libs: HashSet::new(),
-        init_fini: InitFiniArrays::default(),
         data_blobs: HashMap::new(),
     };
 
@@ -160,7 +151,7 @@ pub fn extract_units(
         unit.relocations.remove(*reloc_idx);
     }
 
-    Ok((state.units, state.init_fini))
+    Ok(state.units)
 }
 
 /// Process a single symbol: extract its bytes, parse its relocations, and
@@ -168,20 +159,6 @@ pub fn extract_units(
 fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<UnitKey>> {
     let lib_bytes =
         std::fs::read(&key.lib).with_context(|| format!("reading {}", key.lib.display()))?;
-
-    // Extract init/fini arrays from this library if we haven't already
-    if !state.processed_libs.contains(&key.lib) {
-        state.processed_libs.insert(key.lib.clone());
-        let lib_init_fini = extract_init_fini_arrays(&lib_bytes, &key.lib)?;
-        state
-            .init_fini
-            .init_entries
-            .extend(lib_init_fini.init_entries);
-        state
-            .init_fini
-            .fini_entries
-            .extend(lib_init_fini.fini_entries);
-    }
 
     let object_file = object::File::parse(lib_bytes.as_slice())
         .with_context(|| format!("object parse {}", key.lib.display()))?;
@@ -1219,79 +1196,4 @@ fn infer_symbol_size(elf: &object::read::elf::ElfFile64<'_>, sym: &SymInfo) -> R
         return Ok(0);
     }
     Ok((limit - sym_vaddr) as usize)
-}
-
-/// Extract init/fini array entries from a library.
-///
-/// Reads .init_array and .fini_array sections, extracting 8-byte function pointers.
-/// Sentinel values (0 or -1) are skipped.
-fn extract_init_fini_arrays(
-    lib_bytes: &[u8],
-    lib_path: &std::path::Path,
-) -> Result<InitFiniArrays> {
-    let goblin_lib = goblin::elf::Elf::parse(lib_bytes)
-        .with_context(|| format!("goblin parse {}", lib_path.display()))?;
-
-    let mut result = InitFiniArrays::default();
-
-    for sh in &goblin_lib.section_headers {
-        let sname = goblin_lib.shdr_strtab.get_at(sh.sh_name).unwrap_or("");
-
-        let is_init = sname == ".init_array";
-        let is_fini = sname == ".fini_array";
-
-        if !is_init && !is_fini {
-            continue;
-        }
-
-        if sh.sh_size == 0 {
-            continue;
-        }
-
-        // Read function pointers from the section
-        let start = sh.sh_offset as usize;
-        let end = start + sh.sh_size as usize;
-
-        if end > lib_bytes.len() {
-            bail!(
-                "{}: {} section extends past end of file",
-                lib_path.display(),
-                sname
-            );
-        }
-
-        let section_data = &lib_bytes[start..end];
-        let num_entries = sh.sh_size as usize / 8;
-
-        for i in 0..num_entries {
-            let offset = i * 8;
-            if offset + 8 > section_data.len() {
-                break;
-            }
-
-            let func_vaddr = u64::from_le_bytes(
-                section_data[offset..offset + 8]
-                    .try_into()
-                    .expect("8 bytes"),
-            );
-
-            // Skip sentinel values (0 or -1)
-            if func_vaddr == 0 || func_vaddr == u64::MAX {
-                continue;
-            }
-
-            let entry = InitFiniEntry {
-                _source_lib: lib_path.to_path_buf(),
-                _func_vaddr: func_vaddr,
-            };
-
-            if is_init {
-                result.init_entries.push(entry);
-            } else {
-                result.fini_entries.push(entry);
-            }
-        }
-    }
-
-    Ok(result)
 }

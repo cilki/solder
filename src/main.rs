@@ -123,7 +123,7 @@ fn run() -> Result<()> {
     }
 
     // ── Step 2: transitive closure extraction ────────────────────────────────
-    let (units, init_fini) = extractor::extract_units(&imports, &exe_elf, &merged_lib_syms)?;
+    let units = extractor::extract_units(&imports, &exe_elf, &merged_lib_syms)?;
 
     for u in &units {
         info!(
@@ -142,14 +142,6 @@ fn run() -> Result<()> {
         "Extraction complete"
     );
 
-    if !init_fini.init_entries.is_empty() || !init_fini.fini_entries.is_empty() {
-        info!(
-            init_entries = init_fini.init_entries.len(),
-            fini_entries = init_fini.fini_entries.len(),
-            "Init/fini arrays"
-        );
-    }
-
     // ── Step 2.5: topological ordering of merged libraries ────────────────────
     let merged_libs: Vec<PathBuf> = imports
         .iter()
@@ -163,15 +155,8 @@ fn run() -> Result<()> {
     let exe_init_fini = parse_exe_init_fini(&exe_elf)?;
 
     // ── Step 3: layout planning ───────────────────────────────────────────────
-    let mut plan = layout::plan_layout(
-        units,
-        &exe_elf,
-        &imports,
-        is_pie,
-        init_fini,
-        exe_init_fini,
-        &lib_order,
-    )?;
+    let mut plan =
+        layout::plan_layout(units, &exe_elf, &imports, is_pie, exe_init_fini, &lib_order)?;
 
     info!(
         load_address = format_args!("0x{:016x}", plan.load_address),

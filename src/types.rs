@@ -1,21 +1,5 @@
 use std::path::PathBuf;
 
-/// A constructor/destructor function pointer from a library's init/fini array.
-#[derive(Debug, Clone)]
-pub struct InitFiniEntry {
-    /// Path to the library this entry came from.
-    pub _source_lib: PathBuf,
-    /// Original virtual address of the function in the library.
-    pub _func_vaddr: u64,
-}
-
-/// Extracted init/fini arrays from merged libraries.
-#[derive(Debug, Clone, Default)]
-pub struct InitFiniArrays {
-    pub init_entries: Vec<InitFiniEntry>,
-    pub fini_entries: Vec<InitFiniEntry>,
-}
-
 /// Info about the executable's existing init/fini arrays.
 #[derive(Debug, Clone, Default)]
 pub struct ExeInitFiniInfo {
