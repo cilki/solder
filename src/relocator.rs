@@ -1,9 +1,15 @@
 use anyhow::{Context, Result, bail};
 
-use crate::types::{AssignedUnit, MergePlan, RelocTarget};
+use crate::types::{AssignedUnit, MergePlan, RelativeReloc, RelocTarget};
 
 /// Apply all relocations to all units in the merge plan.
 /// This modifies `unit.bytes` in-place.
+///
+/// For PIE executables, every absolute 64-bit patch site also gets an
+/// R_X86_64_RELATIVE relocation added to the plan: the written value is a
+/// link-time VA inside the output image, so ld.so must rebase it at load time
+/// (e.g. function pointers in copied GOT/data sections, which constructors
+/// pass to __cxa_atexit).
 pub fn apply_all_relocations(plan: &mut MergePlan) -> Result<()> {
     // Collect the lookup tables we need before borrowing plan mutably for iteration.
     // (unit_id → vaddr, trampoline_name → vaddr)
@@ -18,10 +24,13 @@ pub fn apply_all_relocations(plan: &mut MergePlan) -> Result<()> {
         .map(|t| (t.symbol_name.clone(), t.vaddr))
         .collect();
 
+    let is_pie = plan.is_pie;
+    let mut new_relative: Vec<RelativeReloc> = Vec::new();
     for au in plan.all_units_mut() {
-        apply_unit_relocations(au, &id_to_vaddr, &tramp_to_vaddr)
+        apply_unit_relocations(au, &id_to_vaddr, &tramp_to_vaddr, is_pie, &mut new_relative)
             .with_context(|| format!("applying relocations to '{}'", au.unit.name))?;
     }
+    plan.relative_relocs.extend(new_relative);
     Ok(())
 }
 
@@ -29,6 +38,8 @@ fn apply_unit_relocations(
     au: &mut AssignedUnit,
     id_to_vaddr: &std::collections::HashMap<crate::types::UnitId, u64>,
     tramp_to_vaddr: &std::collections::HashMap<String, u64>,
+    is_pie: bool,
+    new_relative: &mut Vec<RelativeReloc>,
 ) -> Result<()> {
     for reloc in &au.unit.relocations {
         // P = patch site VA
@@ -69,6 +80,21 @@ fn apply_unit_relocations(
                 off, reloc.kind, reloc.size
             )
         })?;
+
+        // Absolute 64-bit sites hold image VAs and must be rebased under PIE.
+        // (Unknown covers GLOB_DAT/RELATIVE entries lifted from the library's
+        // .rela.dyn, which apply_one_reloc treats as absolute.)
+        let is_abs64 = reloc.size == 64
+            && matches!(
+                reloc.kind,
+                object::RelocationKind::Absolute | object::RelocationKind::Unknown
+            );
+        if is_pie && is_abs64 {
+            new_relative.push(RelativeReloc {
+                vaddr: p,
+                addend: s.wrapping_add(a as u64) as i64,
+            });
+        }
     }
     Ok(())
 }
@@ -115,6 +141,22 @@ pub fn apply_one_reloc(
             let v = (s as i128) + (a as i128);
             if v < i32::MIN as i128 || v > i32::MAX as i128 {
                 bail!("R_X86_64_32S overflow: value 0x{:x} does not fit in i32", v);
+            }
+            v
+        }
+        // Short (rel8) branch displacement: S + A - P must fit in i8. These
+        // come from `jmp`/`jcc` short encodings the RIP scanner found; the
+        // 1-byte field cannot be widened in place, so if the layout put the
+        // target too far away the merge cannot be completed.
+        object::RelocationKind::Relative if size == 8 => {
+            let v = (s as i128) + (a as i128) - (p as i128);
+            if v < i8::MIN as i128 || v > i8::MAX as i128 {
+                bail!(
+                    "rel8 branch displacement 0x{:x} does not fit in i8 \
+                     (S=0x{s:x}, A={a}, P=0x{p:x}); target was laid out too far \
+                     from a short jump",
+                    v
+                );
             }
             v
         }

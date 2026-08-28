@@ -21,6 +21,7 @@ pub fn plan_layout(
     init_fini: InitFiniArrays,
     exe_init_fini: ExeInitFiniInfo,
     lib_order: &[PathBuf],
+    got_slot_fixups: Vec<crate::types::GotSlotFixup>,
 ) -> Result<MergePlan> {
     let load_address = next_free_va(exe_elf);
 
@@ -154,17 +155,47 @@ pub fn plan_layout(
             .collect()
     };
 
+    // Map (library, unit name) → assigned VA so init/fini entries can be
+    // resolved unambiguously even if two libraries define same-named locals.
+    let unit_vaddr_by_lib_name: HashMap<(&PathBuf, &str), u64> = text_units
+        .iter()
+        .chain(&rodata_units)
+        .chain(&data_units)
+        .map(|au| ((&au.unit.source_lib, au.unit.name.as_str()), au.assigned_vaddr))
+        .collect();
+
     // Plan init/fini arrays if there are any entries to merge
     let init_fini_plan = plan_init_fini_arrays(
         exe_elf,
         &init_fini,
         &exe_init_fini,
         lib_order,
-        &unit_vaddr_by_name,
-        &trampoline_stubs,
+        &unit_vaddr_by_lib_name,
         load_address,
         &mut offset,
     )?;
+
+    // Resolve copied-GOT-slot fixups now that every unit has an assigned VA.
+    let unit_vaddr_by_id: HashMap<crate::types::UnitId, u64> = text_units
+        .iter()
+        .chain(&rodata_units)
+        .chain(&data_units)
+        .map(|au| (au.unit.id, au.assigned_vaddr))
+        .collect();
+    let mut got_imports = Vec::with_capacity(got_slot_fixups.len());
+    for fixup in got_slot_fixups {
+        let base = unit_vaddr_by_id.get(&fixup.unit).with_context(|| {
+            format!(
+                "GOT slot fixup for '{}' references UnitId({}) not in plan",
+                fixup.name, fixup.unit.0
+            )
+        })?;
+        got_imports.push(crate::types::GotSlotImport {
+            got_vaddr: base + fixup.offset,
+            name: fixup.name,
+            weak: fixup.weak,
+        });
+    }
 
     // Jump-slot reloc offsets are populated by the caller (patcher.rs), so leave empty here.
     // Relative relocs are populated during segment building (trampolines) and patching (GOT).
@@ -181,6 +212,7 @@ pub fn plan_layout(
         remove_needed,
         relative_relocs: Vec::new(),
         new_externals,
+        got_imports,
         init_fini: init_fini_plan,
     })
 }
@@ -255,117 +287,127 @@ fn build_exe_got_map(elf: &object::read::elf::ElfFile64<'_>) -> Result<HashMap<S
     Ok(map)
 }
 
-/// Plan the combined init/fini arrays for the merged segment.
-///
-/// For init_array: exe entries first, then merged entries in dependency order.
-/// For fini_array: merged entries in reverse dependency order, then exe entries.
-#[allow(clippy::too_many_arguments)]
+/// Plan the preinit array (merged constructors) and combined fini array for
+/// the merged segment. See `InitFiniPlan` for why constructors go into
+/// DT_PREINIT_ARRAY rather than the executable's init_array: both run library
+/// constructors before the executable's own, but only the preinit phase runs
+/// before `_dl_fini` is registered with `__cxa_atexit`, which is what keeps
+/// `__cxa_atexit`-registered C++ static destructors in the dynamic-linking
+/// exit order.
 fn plan_init_fini_arrays(
     exe_elf: &object::read::elf::ElfFile64<'_>,
     init_fini: &InitFiniArrays,
     exe_init_fini: &ExeInitFiniInfo,
     lib_order: &[PathBuf],
-    unit_vaddr_by_name: &HashMap<String, u64>,
-    trampoline_stubs: &[TrampolineStub],
+    unit_vaddrs: &HashMap<(&PathBuf, &str), u64>,
     load_address: u64,
     offset: &mut u64,
 ) -> Result<Option<InitFiniPlan>> {
-    // Check if the executable has init/fini arrays that we need to relocate
-    let has_exe_init =
-        exe_init_fini.init_array_vaddr.is_some() && exe_init_fini.init_array_size > 0;
-    let has_exe_fini =
-        exe_init_fini.fini_array_vaddr.is_some() && exe_init_fini.fini_array_size > 0;
+    let exe_bytes = exe_elf.data();
 
-    // We only need to create a plan if the exe has init/fini arrays and we're
-    // relocating them to the merged segment. Note: we don't add merged library
-    // init/fini entries because we only extracted specific symbols, not the
-    // constructor/destructor functions.
-    if !has_exe_init && !has_exe_fini {
+    // Copy the executable's existing entries verbatim — their functions stay
+    // at their original addresses.
+    let read_exe_entries = |array_vaddr: Option<u64>, array_size: u64| -> Result<Vec<u64>> {
+        let mut entries = Vec::new();
+        let Some(va) = array_vaddr else {
+            return Ok(entries);
+        };
+        if array_size == 0 {
+            return Ok(entries);
+        }
+        let file_offset = crate::elf_reader::va_to_file_offset(exe_elf, va)
+            .context("exe init/fini array VA not in any PT_LOAD segment")?;
+        for i in 0..(array_size / 8) as usize {
+            let entry_offset = file_offset as usize + i * 8;
+            if entry_offset + 8 > exe_bytes.len() {
+                break;
+            }
+            let func_va = u64::from_le_bytes(
+                exe_bytes[entry_offset..entry_offset + 8]
+                    .try_into()
+                    .expect("8 bytes"),
+            );
+            // Skip sentinel values
+            if func_va != 0 && func_va != u64::MAX {
+                entries.push(func_va);
+            }
+        }
+        Ok(entries)
+    };
+
+    // Resolve merged library entries to their assigned VAs, grouped by
+    // dependency order. A library that stays in DT_NEEDED (not fully merged,
+    // so absent from lib_order) keeps running its constructors dynamically —
+    // duplicating them here would run them twice, so those are skipped.
+    let collect_lib_entries = |entries: &[crate::types::InitFiniEntry]| -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        for lib in lib_order {
+            for entry in entries.iter().filter(|e| &e.source_lib == lib) {
+                let va = unit_vaddrs
+                    .get(&(lib, entry.unit_name.as_str()))
+                    .with_context(|| {
+                        format!(
+                            "init/fini entry '{}' from {} was not extracted — internal error",
+                            entry.unit_name,
+                            lib.display()
+                        )
+                    })?;
+                out.push(*va);
+            }
+        }
+        for entry in entries {
+            if !lib_order.contains(&entry.source_lib) {
+                debug!(
+                    lib = %entry.source_lib.display(),
+                    entry = entry.unit_name,
+                    "Library stays in DT_NEEDED; its constructors run dynamically"
+                );
+            }
+        }
+        Ok(out)
+    };
+
+    let lib_init_entries = collect_lib_entries(&init_fini.init_entries)?;
+    let lib_fini_entries = collect_lib_entries(&init_fini.fini_entries)?;
+
+    if lib_init_entries.is_empty() && lib_fini_entries.is_empty() {
         return Ok(None);
     }
 
-    let exe_bytes = exe_elf.data();
-
-    // Silence unused variable warnings for parameters we're not using currently
-    let _ = (init_fini, lib_order, unit_vaddr_by_name, trampoline_stubs);
-
-    // Build combined init_array entries
-    let mut combined_init_entries: Vec<u64> = Vec::new();
-
-    // First, copy existing exe init_array entries
-    if has_exe_init {
-        let init_va = exe_init_fini.init_array_vaddr.unwrap();
-        let init_file_offset = crate::elf_reader::va_to_file_offset(exe_elf, init_va)
-            .context("exe init_array VA not in any PT_LOAD segment")?;
-        let num_entries = (exe_init_fini.init_array_size / 8) as usize;
-
-        for i in 0..num_entries {
-            let entry_offset = init_file_offset as usize + i * 8;
-            if entry_offset + 8 > exe_bytes.len() {
-                break;
-            }
-            let func_va = u64::from_le_bytes(
-                exe_bytes[entry_offset..entry_offset + 8]
-                    .try_into()
-                    .expect("8 bytes"),
-            );
-            // Skip sentinel values
-            if func_va != 0 && func_va != u64::MAX {
-                combined_init_entries.push(func_va);
-            }
-        }
+    // Preinit: the exe's existing preinit entries keep running first (matching
+    // _dl_init's order: exe preinit, then library constructors).
+    let mut preinit_entries = Vec::new();
+    if !lib_init_entries.is_empty() {
+        preinit_entries = read_exe_entries(
+            exe_init_fini.preinit_array_vaddr,
+            exe_init_fini.preinit_array_size,
+        )?;
+        preinit_entries.extend(lib_init_entries);
     }
 
-    // NOTE: We skip adding merged library init entries because we only extracted
-    // specific symbols from the library, not the constructor/destructor functions
-    // that the init_array/fini_array point to. Those functions (like frame_dummy,
-    // __do_global_dtors_aux) are runtime support code that we don't merge.
-    // If we ever support full library merging, we would need to extract and
-    // relocate those functions too.
-
-    // Build combined fini_array entries
-    let mut combined_fini_entries: Vec<u64> = Vec::new();
-
-    // NOTE: We skip merged library fini entries for the same reason as init entries.
-    // See comment above.
-
-    // Copy existing exe fini_array entries
-    if has_exe_fini {
-        let fini_va = exe_init_fini.fini_array_vaddr.unwrap();
-        let fini_file_offset = crate::elf_reader::va_to_file_offset(exe_elf, fini_va)
-            .context("exe fini_array VA not in any segment")?;
-        let num_entries = (exe_init_fini.fini_array_size / 8) as usize;
-
-        for i in 0..num_entries {
-            let entry_offset = fini_file_offset as usize + i * 8;
-            if entry_offset + 8 > exe_bytes.len() {
-                break;
-            }
-            let func_va = u64::from_le_bytes(
-                exe_bytes[entry_offset..entry_offset + 8]
-                    .try_into()
-                    .expect("8 bytes"),
-            );
-            // Skip sentinel values
-            if func_va != 0 && func_va != u64::MAX {
-                combined_fini_entries.push(func_va);
-            }
-        }
+    // Fini: merged entries first, exe entries last; ld.so runs the array
+    // backward, so the exe's destructors still run first at exit.
+    let mut combined_fini_entries = lib_fini_entries;
+    if !combined_fini_entries.is_empty() {
+        combined_fini_entries.extend(read_exe_entries(
+            exe_init_fini.fini_array_vaddr,
+            exe_init_fini.fini_array_size,
+        )?);
     }
 
-    // Allocate space for the combined arrays in the merged segment
+    // Allocate space for the arrays in the merged segment
     // Align to 8 bytes (pointer size)
     *offset = align_up(*offset, 8);
-    let combined_init_vaddr = load_address + *offset;
-    *offset += (combined_init_entries.len() * 8) as u64;
+    let preinit_vaddr = load_address + *offset;
+    *offset += (preinit_entries.len() * 8) as u64;
 
     *offset = align_up(*offset, 8);
     let combined_fini_vaddr = load_address + *offset;
     *offset += (combined_fini_entries.len() * 8) as u64;
 
     Ok(Some(InitFiniPlan {
-        combined_init_vaddr,
-        combined_init_entries,
+        preinit_vaddr,
+        preinit_entries,
         combined_fini_vaddr,
         combined_fini_entries,
     }))

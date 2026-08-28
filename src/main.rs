@@ -123,7 +123,8 @@ fn run() -> Result<()> {
     }
 
     // ── Step 2: transitive closure extraction ────────────────────────────────
-    let (units, init_fini) = extractor::extract_units(&imports, &exe_elf, &merged_lib_syms)?;
+    let (units, init_fini, got_slot_fixups) =
+        extractor::extract_units(&imports, &exe_elf, &merged_lib_syms)?;
 
     for u in &units {
         info!(
@@ -171,6 +172,7 @@ fn run() -> Result<()> {
         init_fini,
         exe_init_fini,
         &lib_order,
+        got_slot_fixups,
     )?;
 
     info!(
@@ -281,11 +283,11 @@ fn parse_exe_init_fini(
     if let Some(dynamic) = &goblin.dynamic {
         for entry in &dynamic.dyns {
             match entry.d_tag {
-                goblin::elf::dynamic::DT_INIT_ARRAY => {
-                    info.init_array_vaddr = Some(entry.d_val);
+                goblin::elf::dynamic::DT_PREINIT_ARRAY => {
+                    info.preinit_array_vaddr = Some(entry.d_val);
                 }
-                goblin::elf::dynamic::DT_INIT_ARRAYSZ => {
-                    info.init_array_size = entry.d_val;
+                goblin::elf::dynamic::DT_PREINIT_ARRAYSZ => {
+                    info.preinit_array_size = entry.d_val;
                 }
                 goblin::elf::dynamic::DT_FINI_ARRAY => {
                     info.fini_array_vaddr = Some(entry.d_val);

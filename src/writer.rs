@@ -61,22 +61,22 @@ pub fn build_merged_segment(plan: &mut MergePlan) -> Result<Vec<u8>> {
         // reserves 14-byte trampolines stays correct.)
     }
 
-    // Write init/fini arrays if present
+    // Write preinit/fini arrays if present
     if let Some(ref init_fini) = plan.init_fini {
-        // Write init_array entries
-        if !init_fini.combined_init_entries.is_empty() {
-            let base_off = (init_fini.combined_init_vaddr - plan.load_address) as usize;
-            for (i, &func_va) in init_fini.combined_init_entries.iter().enumerate() {
+        // Write preinit array entries
+        if !init_fini.preinit_entries.is_empty() {
+            let base_off = (init_fini.preinit_vaddr - plan.load_address) as usize;
+            for (i, &func_va) in init_fini.preinit_entries.iter().enumerate() {
                 let off = base_off + i * 8;
                 if off + 8 > seg.len() {
-                    bail!("init_array entry {} overflows segment", i);
+                    bail!("preinit array entry {} overflows segment", i);
                 }
                 seg[off..off + 8].copy_from_slice(&func_va.to_le_bytes());
 
                 // For PIE: each function pointer needs an R_X86_64_RELATIVE relocation
                 if plan.is_pie {
                     plan.relative_relocs.push(RelativeReloc {
-                        vaddr: init_fini.combined_init_vaddr + (i * 8) as u64,
+                        vaddr: init_fini.preinit_vaddr + (i * 8) as u64,
                         addend: func_va as i64,
                     });
                 }
@@ -145,7 +145,7 @@ pub fn write_output(
     // need to grow (.dynstr/.dynsym/.gnu.version when injecting new external
     // symbols; .rela.dyn whenever PIE relocs or new GLOB_DATs are added).
     let needs_rela_extension = plan.is_pie && !plan.relative_relocs.is_empty();
-    let needs_symbol_extension = !plan.new_externals.is_empty();
+    let needs_symbol_extension = !plan.new_externals.is_empty() || !plan.got_imports.is_empty();
     let (extended_seg, ext_info) = if needs_rela_extension || needs_symbol_extension {
         build_extended_segment(patched_exe, merged_seg, plan, &dynamic_info, &exe)?
     } else {
@@ -219,7 +219,7 @@ pub fn write_output(
     // entry start); d_tag is untouched.
     apply_extension_info(&mut out, &dynamic_info, &ext_info)?;
 
-    // Update DT_INIT_ARRAY and DT_FINI_ARRAY to point to our combined arrays
+    // Update DT_PREINIT_ARRAY and DT_FINI_ARRAY to point to our arrays
     if plan.init_fini.is_some() {
         update_dynamic_init_fini(&mut out, plan, &dynamic_info)?;
     }
@@ -278,8 +278,8 @@ struct DynamicInfo {
     dt_relasz_val: Option<u64>,
     dt_relacount_idx: Option<usize>,
     dt_relacount_val: Option<u64>,
-    dt_init_array_idx: Option<usize>,
-    dt_init_arraysz_idx: Option<usize>,
+    dt_preinit_array_idx: Option<usize>,
+    dt_preinit_arraysz_idx: Option<usize>,
     dt_fini_array_idx: Option<usize>,
     dt_fini_arraysz_idx: Option<usize>,
     dt_strtab_idx: Option<usize>,
@@ -290,7 +290,10 @@ struct DynamicInfo {
     dt_symtab_val: Option<u64>,
     dt_versym_idx: Option<usize>,
     dt_versym_val: Option<u64>,
-    dt_null_indices: Vec<usize>,
+    /// Number of entries before the DT_NULL terminator.
+    used_entries: usize,
+    /// Total 16-byte slots in the .dynamic section.
+    capacity: usize,
 }
 
 /// Summary of which sections were rebuilt in the merged segment and the new
@@ -312,10 +315,12 @@ fn parse_dynamic_info(bytes: &[u8]) -> Result<DynamicInfo> {
 
     let mut info = DynamicInfo::default();
 
-    // Find .dynamic section offset
+    // Find .dynamic section offset and size
+    let mut section_size: u64 = 0;
     for sh in &goblin_elf.section_headers {
         if goblin_elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynamic") {
             info.section_offset = sh.sh_offset;
+            section_size = sh.sh_size;
             break;
         }
     }
@@ -325,6 +330,7 @@ fn parse_dynamic_info(bytes: &[u8]) -> Result<DynamicInfo> {
         for ph in &goblin_elf.program_headers {
             if ph.p_type == goblin::elf::program_header::PT_DYNAMIC {
                 info.section_offset = ph.p_offset;
+                section_size = ph.p_filesz;
                 break;
             }
         }
@@ -332,6 +338,22 @@ fn parse_dynamic_info(bytes: &[u8]) -> Result<DynamicInfo> {
 
     if info.section_offset == 0 {
         bail!(".dynamic section not found");
+    }
+
+    // How many 16-byte slots the section holds, and how many precede the
+    // DT_NULL terminator. New entries are appended at the terminator (pushing
+    // it down into spare capacity) — slots after the terminator are invisible
+    // to ld.so, so they can't be written directly.
+    info.capacity = (section_size / DYN_ENTRY_SIZE as u64) as usize;
+    info.used_entries = info.capacity; // assume full unless a terminator is found
+    for i in 0..info.capacity {
+        let off = info.section_offset as usize + i * DYN_ENTRY_SIZE;
+        if off + DYN_ENTRY_SIZE <= bytes.len()
+            && u64::from_le_bytes(bytes[off..off + 8].try_into().expect("8 bytes")) == 0
+        {
+            info.used_entries = i;
+            break;
+        }
     }
 
     // Parse dynamic entries
@@ -350,11 +372,11 @@ fn parse_dynamic_info(bytes: &[u8]) -> Result<DynamicInfo> {
                     info.dt_relacount_idx = Some(i);
                     info.dt_relacount_val = Some(entry.d_val);
                 }
-                goblin::elf::dynamic::DT_INIT_ARRAY => {
-                    info.dt_init_array_idx = Some(i);
+                goblin::elf::dynamic::DT_PREINIT_ARRAY => {
+                    info.dt_preinit_array_idx = Some(i);
                 }
-                goblin::elf::dynamic::DT_INIT_ARRAYSZ => {
-                    info.dt_init_arraysz_idx = Some(i);
+                goblin::elf::dynamic::DT_PREINIT_ARRAYSZ => {
+                    info.dt_preinit_arraysz_idx = Some(i);
                 }
                 goblin::elf::dynamic::DT_FINI_ARRAY => {
                     info.dt_fini_array_idx = Some(i);
@@ -379,9 +401,6 @@ fn parse_dynamic_info(bytes: &[u8]) -> Result<DynamicInfo> {
                     info.dt_versym_idx = Some(i);
                     info.dt_versym_val = Some(entry.d_val);
                 }
-                goblin::elf::dynamic::DT_NULL => {
-                    info.dt_null_indices.push(i);
-                }
                 _ => {}
             }
         }
@@ -396,6 +415,9 @@ const R_X86_64_GLOB_DAT: u32 = 6;
 const SYM_ENTRY_SIZE: usize = 24;
 /// STB_GLOBAL | STT_FUNC — for the new undefined function symbols we inject.
 const ST_INFO_GLOBAL_FUNC: u8 = (1 << 4) | 2;
+/// STB_WEAK | STT_FUNC — for injected symbols that may legitimately stay
+/// unresolved (their GOT slots then hold 0, which the code null-checks).
+const ST_INFO_WEAK_FUNC: u8 = (2 << 4) | 2;
 /// VER_NDX_GLOBAL — accept any version of the symbol.
 const VER_NDX_GLOBAL: u16 = 1;
 
@@ -428,60 +450,108 @@ fn build_extended_segment(
     // valid for unchanged consumers (hash tables, verneed entries, etc.).
 
     let mut new_sym_idx_base: usize = 0;
+    // Existing .dynsym name → index, for GLOB_DATs against already-present symbols.
+    let mut existing_sym_idx: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    // Symbols to inject: (name, weak). new_externals first (strong), then any
+    // got_imports whose symbol is in neither the exe's .dynsym nor this list.
+    let mut injects: Vec<(String, bool)> = Vec::new();
 
-    if !plan.new_externals.is_empty() {
+    if !plan.new_externals.is_empty() || !plan.got_imports.is_empty() {
         let (old_dynstr, old_dynsym, old_versym) = read_dynsym_tables(patched_exe, exe, dyn_info)?;
         let old_num_syms = old_dynsym.len() / SYM_ENTRY_SIZE;
         new_sym_idx_base = old_num_syms;
 
-        // .dynstr: copy existing bytes (preserves all existing offsets), then
-        // append a NUL-terminated name per new symbol. Track the byte offset
-        // each name lands at so we can wire st_name correctly.
-        pad_to(&mut extended, 8);
-        let dynstr_offset_in_seg = extended.len();
-        extended.extend_from_slice(&old_dynstr);
-        let mut new_name_offsets: Vec<u32> = Vec::with_capacity(plan.new_externals.len());
+        for i in 0..old_num_syms {
+            let st_name =
+                u32::from_le_bytes(old_dynsym[i * SYM_ENTRY_SIZE..i * SYM_ENTRY_SIZE + 4].try_into()?)
+                    as usize;
+            if st_name < old_dynstr.len()
+                && let Some(end) = old_dynstr[st_name..].iter().position(|&b| b == 0)
+                && end > 0
+                && let Ok(name) = std::str::from_utf8(&old_dynstr[st_name..st_name + end])
+            {
+                existing_sym_idx.entry(name.to_owned()).or_insert(i);
+            }
+        }
+
         for ext in &plan.new_externals {
-            new_name_offsets.push(extended.len() as u32 - dynstr_offset_in_seg as u32);
-            extended.extend_from_slice(ext.name.as_bytes());
-            extended.push(0);
+            injects.push((ext.name.clone(), false));
         }
-        let dynstr_size = extended.len() - dynstr_offset_in_seg;
-
-        // .dynsym: copy existing entries (preserves all existing indices), then
-        // append one undefined STB_GLOBAL/STT_FUNC entry per new symbol.
-        pad_to(&mut extended, 8);
-        let dynsym_offset_in_seg = extended.len();
-        extended.extend_from_slice(&old_dynsym);
-        for name_off in &new_name_offsets {
-            let mut sym = [0u8; SYM_ENTRY_SIZE];
-            sym[0..4].copy_from_slice(&name_off.to_le_bytes()); // st_name
-            sym[4] = ST_INFO_GLOBAL_FUNC; // st_info
-            sym[5] = 0; // st_other = STV_DEFAULT
-            sym[6..8].copy_from_slice(&0u16.to_le_bytes()); // st_shndx = SHN_UNDEF
-            // st_value (8 bytes) and st_size (8 bytes) stay zero
-            extended.extend_from_slice(&sym);
+        for gi in &plan.got_imports {
+            if !existing_sym_idx.contains_key(&gi.name)
+                && !injects.iter().any(|(n, _)| n == &gi.name)
+            {
+                injects.push((gi.name.clone(), gi.weak));
+            }
         }
 
-        // .gnu.version: copy existing u16-per-symbol array, then append one
-        // VER_NDX_GLOBAL entry per new symbol. This array must stay parallel
-        // to .dynsym, so its length tracks the new symbol count.
-        pad_to(&mut extended, 2);
-        let versym_offset_in_seg = extended.len();
-        extended.extend_from_slice(&old_versym);
-        for _ in &plan.new_externals {
-            extended.extend_from_slice(&VER_NDX_GLOBAL.to_le_bytes());
-        }
+        if !injects.is_empty() {
+            // .dynstr: copy existing bytes (preserves all existing offsets), then
+            // append a NUL-terminated name per new symbol. Track the byte offset
+            // each name lands at so we can wire st_name correctly.
+            pad_to(&mut extended, 8);
+            let dynstr_offset_in_seg = extended.len();
+            extended.extend_from_slice(&old_dynstr);
+            let mut new_name_offsets: Vec<u32> = Vec::with_capacity(injects.len());
+            for (name, _) in &injects {
+                new_name_offsets.push(extended.len() as u32 - dynstr_offset_in_seg as u32);
+                extended.extend_from_slice(name.as_bytes());
+                extended.push(0);
+            }
+            let dynstr_size = extended.len() - dynstr_offset_in_seg;
 
-        info.strtab_va = Some(plan.load_address + dynstr_offset_in_seg as u64);
-        info.strtab_size = Some(dynstr_size as u64);
-        info.symtab_va = Some(plan.load_address + dynsym_offset_in_seg as u64);
-        info.versym_va = Some(plan.load_address + versym_offset_in_seg as u64);
+            // .dynsym: copy existing entries (preserves all existing indices), then
+            // append one undefined function entry per new symbol.
+            pad_to(&mut extended, 8);
+            let dynsym_offset_in_seg = extended.len();
+            extended.extend_from_slice(&old_dynsym);
+            for (name_off, (_, weak)) in new_name_offsets.iter().zip(&injects) {
+                let mut sym = [0u8; SYM_ENTRY_SIZE];
+                sym[0..4].copy_from_slice(&name_off.to_le_bytes()); // st_name
+                sym[4] = if *weak {
+                    ST_INFO_WEAK_FUNC
+                } else {
+                    ST_INFO_GLOBAL_FUNC
+                }; // st_info
+                sym[5] = 0; // st_other = STV_DEFAULT
+                sym[6..8].copy_from_slice(&0u16.to_le_bytes()); // st_shndx = SHN_UNDEF
+                // st_value (8 bytes) and st_size (8 bytes) stay zero
+                extended.extend_from_slice(&sym);
+            }
+
+            // .gnu.version: copy existing u16-per-symbol array, then append one
+            // VER_NDX_GLOBAL entry per new symbol. This array must stay parallel
+            // to .dynsym, so its length tracks the new symbol count.
+            pad_to(&mut extended, 2);
+            let versym_offset_in_seg = extended.len();
+            extended.extend_from_slice(&old_versym);
+            for _ in &injects {
+                extended.extend_from_slice(&VER_NDX_GLOBAL.to_le_bytes());
+            }
+
+            info.strtab_va = Some(plan.load_address + dynstr_offset_in_seg as u64);
+            info.strtab_size = Some(dynstr_size as u64);
+            info.symtab_va = Some(plan.load_address + dynsym_offset_in_seg as u64);
+            info.versym_va = Some(plan.load_address + versym_offset_in_seg as u64);
+        }
     }
+
+    // Final symbol index for `name`, whether pre-existing or injected.
+    let sym_index_of = |name: &str| -> Option<usize> {
+        existing_sym_idx.get(name).copied().or_else(|| {
+            injects
+                .iter()
+                .position(|(n, _)| n == name)
+                .map(|i| new_sym_idx_base + i)
+        })
+    };
 
     // ---- 2. Rebuild .rela.dyn (always when there's anything new to write).
 
-    let need_new_rela = !plan.relative_relocs.is_empty() || !plan.new_externals.is_empty();
+    let need_new_rela = !plan.relative_relocs.is_empty()
+        || !plan.new_externals.is_empty()
+        || !plan.got_imports.is_empty();
     if need_new_rela {
         let (existing_relative, existing_non_relative, old_relacount) =
             read_existing_rela_dyn(patched_exe, exe, dyn_info)?;
@@ -496,15 +566,25 @@ fn build_extended_segment(
             new_relative.extend_from_slice(&entry);
         }
 
-        // New GLOB_DAT entries for the freshly injected externals. r_info packs
-        // the symbol index (which lives at the end of the rebuilt .dynsym) and
-        // the relocation type.
-        let mut new_glob_dat = Vec::with_capacity(plan.new_externals.len() * RELA_ENTRY_SIZE);
-        for (i, ext) in plan.new_externals.iter().enumerate() {
-            let sym_idx = new_sym_idx_base + i;
+        // New GLOB_DAT entries: one per freshly injected external's GOT slot,
+        // plus one per copied GOT slot that ld.so must re-resolve. r_info packs
+        // the symbol index and the relocation type.
+        let glob_dat_slots = plan
+            .new_externals
+            .iter()
+            .map(|ext| (ext.got_vaddr, ext.name.as_str()))
+            .chain(
+                plan.got_imports
+                    .iter()
+                    .map(|gi| (gi.got_vaddr, gi.name.as_str())),
+            );
+        let mut new_glob_dat = Vec::new();
+        for (got_vaddr, name) in glob_dat_slots {
+            let sym_idx = sym_index_of(name)
+                .with_context(|| format!("no .dynsym index for GLOB_DAT symbol '{name}'"))?;
             let r_info: u64 = ((sym_idx as u64) << 32) | (R_X86_64_GLOB_DAT as u64);
             let mut entry = [0u8; RELA_ENTRY_SIZE];
-            entry[0..8].copy_from_slice(&ext.got_vaddr.to_le_bytes());
+            entry[0..8].copy_from_slice(&got_vaddr.to_le_bytes());
             entry[8..16].copy_from_slice(&r_info.to_le_bytes());
             // r_addend stays zero
             new_glob_dat.extend_from_slice(&entry);
@@ -684,7 +764,7 @@ fn apply_extension_info(
     Ok(())
 }
 
-/// Update DT_INIT_ARRAY/DT_INIT_ARRAYSZ and DT_FINI_ARRAY/DT_FINI_ARRAYSZ in .dynamic
+/// Update DT_PREINIT_ARRAY/DT_PREINIT_ARRAYSZ and DT_FINI_ARRAY/DT_FINI_ARRAYSZ in .dynamic
 /// to point to our combined init/fini arrays in the merged segment.
 fn update_dynamic_init_fini(
     out: &mut [u8],
@@ -698,8 +778,9 @@ fn update_dynamic_init_fini(
 
     let dyn_section_offset = dyn_info.section_offset as usize;
 
-    // We need a mutable copy of the null indices since we consume them
-    let mut dt_null_indices = dyn_info.dt_null_indices.clone();
+    // New entries are appended at the DT_NULL terminator, pushing it down.
+    // The last slot must stay DT_NULL so ld.so's scan terminates.
+    let mut next_free = dyn_info.used_entries;
 
     // Helper to write a dynamic entry
     let write_dyn_entry = |out: &mut [u8], idx: usize, tag: u64, val: u64| {
@@ -708,82 +789,60 @@ fn update_dynamic_init_fini(
         write_u64_le(out, entry_offset + 8, val);
     };
 
-    // Update or create DT_INIT_ARRAY entries
-    if !init_fini.combined_init_entries.is_empty() {
-        let init_array_size = (init_fini.combined_init_entries.len() * 8) as u64;
+    // Update the existing entry for `tag`, or append a new one at the terminator.
+    let mut set_dyn_entry =
+        |out: &mut [u8], existing_idx: Option<usize>, tag: u64, val: u64| -> Result<()> {
+            if let Some(idx) = existing_idx {
+                let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
+                write_u64_le(out, entry_offset + 8, val);
+            } else if next_free + 1 < dyn_info.capacity {
+                write_dyn_entry(out, next_free, tag, val);
+                next_free += 1;
+                // Re-terminate (slots after the old terminator may be garbage).
+                write_dyn_entry(out, next_free, 0, 0);
+            } else {
+                bail!(
+                    ".dynamic has no spare capacity to append dynamic tag {tag:#x} \
+                     ({} slots, {} used)",
+                    dyn_info.capacity,
+                    dyn_info.used_entries
+                );
+            }
+            Ok(())
+        };
 
-        if let Some(idx) = dyn_info.dt_init_array_idx {
-            // Update existing DT_INIT_ARRAY
-            let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-            write_u64_le(out, entry_offset + 8, init_fini.combined_init_vaddr);
-        } else if !dt_null_indices.is_empty() {
-            // Use a DT_NULL slot
-            let idx = dt_null_indices.remove(0);
-            write_dyn_entry(
-                out,
-                idx,
-                goblin::elf::dynamic::DT_INIT_ARRAY,
-                init_fini.combined_init_vaddr,
-            );
-        } else {
-            bail!("no DT_INIT_ARRAY entry and no DT_NULL slots available in .dynamic");
-        }
-
-        if let Some(idx) = dyn_info.dt_init_arraysz_idx {
-            // Update existing DT_INIT_ARRAYSZ
-            let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-            write_u64_le(out, entry_offset + 8, init_array_size);
-        } else if !dt_null_indices.is_empty() {
-            // Use a DT_NULL slot
-            let idx = dt_null_indices.remove(0);
-            write_dyn_entry(
-                out,
-                idx,
-                goblin::elf::dynamic::DT_INIT_ARRAYSZ,
-                init_array_size,
-            );
-        } else {
-            bail!("no DT_INIT_ARRAYSZ entry and no DT_NULL slots available in .dynamic");
-        }
+    // Update or create DT_PREINIT_ARRAY entries for merged constructors
+    if !init_fini.preinit_entries.is_empty() {
+        let preinit_array_size = (init_fini.preinit_entries.len() * 8) as u64;
+        set_dyn_entry(
+            out,
+            dyn_info.dt_preinit_array_idx,
+            goblin::elf::dynamic::DT_PREINIT_ARRAY,
+            init_fini.preinit_vaddr,
+        )?;
+        set_dyn_entry(
+            out,
+            dyn_info.dt_preinit_arraysz_idx,
+            goblin::elf::dynamic::DT_PREINIT_ARRAYSZ,
+            preinit_array_size,
+        )?;
     }
 
     // Update or create DT_FINI_ARRAY entries
     if !init_fini.combined_fini_entries.is_empty() {
         let fini_array_size = (init_fini.combined_fini_entries.len() * 8) as u64;
-
-        if let Some(idx) = dyn_info.dt_fini_array_idx {
-            // Update existing DT_FINI_ARRAY
-            let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-            write_u64_le(out, entry_offset + 8, init_fini.combined_fini_vaddr);
-        } else if !dt_null_indices.is_empty() {
-            // Use a DT_NULL slot
-            let idx = dt_null_indices.remove(0);
-            write_dyn_entry(
-                out,
-                idx,
-                goblin::elf::dynamic::DT_FINI_ARRAY,
-                init_fini.combined_fini_vaddr,
-            );
-        } else {
-            bail!("no DT_FINI_ARRAY entry and no DT_NULL slots available in .dynamic");
-        }
-
-        if let Some(idx) = dyn_info.dt_fini_arraysz_idx {
-            // Update existing DT_FINI_ARRAYSZ
-            let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-            write_u64_le(out, entry_offset + 8, fini_array_size);
-        } else if !dt_null_indices.is_empty() {
-            // Use a DT_NULL slot
-            let idx = dt_null_indices.remove(0);
-            write_dyn_entry(
-                out,
-                idx,
-                goblin::elf::dynamic::DT_FINI_ARRAYSZ,
-                fini_array_size,
-            );
-        } else {
-            bail!("no DT_FINI_ARRAYSZ entry and no DT_NULL slots available in .dynamic");
-        }
+        set_dyn_entry(
+            out,
+            dyn_info.dt_fini_array_idx,
+            goblin::elf::dynamic::DT_FINI_ARRAY,
+            init_fini.combined_fini_vaddr,
+        )?;
+        set_dyn_entry(
+            out,
+            dyn_info.dt_fini_arraysz_idx,
+            goblin::elf::dynamic::DT_FINI_ARRAYSZ,
+            fini_array_size,
+        )?;
     }
 
     Ok(())

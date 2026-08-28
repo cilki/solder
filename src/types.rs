@@ -4,9 +4,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct InitFiniEntry {
     /// Path to the library this entry came from.
-    pub _source_lib: PathBuf,
-    /// Original virtual address of the function in the library.
-    pub _func_vaddr: u64,
+    pub source_lib: PathBuf,
+    /// Name of the extracted unit holding the constructor/destructor function.
+    pub unit_name: String,
 }
 
 /// Extracted init/fini arrays from merged libraries.
@@ -19,22 +19,40 @@ pub struct InitFiniArrays {
 /// Info about the executable's existing init/fini arrays.
 #[derive(Debug, Clone, Default)]
 pub struct ExeInitFiniInfo {
-    pub init_array_vaddr: Option<u64>,
-    pub init_array_size: u64,
+    pub preinit_array_vaddr: Option<u64>,
+    pub preinit_array_size: u64,
     pub fini_array_vaddr: Option<u64>,
     pub fini_array_size: u64,
 }
 
-/// Plan for init/fini array extension.
+/// Plan for running merged library constructors/destructors.
+///
+/// Constructor timing is subtle: glibc runs shared library constructors in
+/// `_dl_init`, then `__libc_start_main` registers `_dl_fini` with
+/// `__cxa_atexit`, and only then runs the executable's own init_array. C++
+/// static destructors are registered via `__cxa_atexit` *by the constructors*,
+/// so their position relative to `_dl_fini` in the exit-handler LIFO depends
+/// on which phase the constructor ran in. Merged library constructors
+/// therefore go into DT_PREINIT_ARRAY — which `_dl_init` processes before
+/// `_dl_fini` is registered — reproducing the dynamic-linking destructor
+/// order exactly. The executable's own init_array is left untouched.
+///
+/// Merged destructors are appended in front of the executable's fini_array
+/// entries (ld.so runs DT_FINI_ARRAY backward, so the executable's entries
+/// still run first, then each merged library's, dependents before
+/// dependencies).
 #[derive(Debug, Clone)]
 pub struct InitFiniPlan {
-    /// VA of the new combined init_array in the merged segment.
-    pub combined_init_vaddr: u64,
-    /// Function VAs to write (exe entries first, then merged entries in dependency order).
-    pub combined_init_entries: Vec<u64>,
-    /// VA of the new combined fini_array in the merged segment.
+    /// VA of the preinit array in the merged segment. Entries: the exe's
+    /// existing preinit entries first, then merged library constructors in
+    /// dependency order. Empty when no library constructors are merged.
+    pub preinit_vaddr: u64,
+    pub preinit_entries: Vec<u64>,
+    /// VA of the new combined fini_array in the merged segment. Entries:
+    /// merged library destructors in dependency order (original array order
+    /// within each library), then the exe's original entries. Empty when no
+    /// library destructors are merged.
     pub combined_fini_vaddr: u64,
-    /// Function VAs (merged entries in reverse dependency order, then exe entries).
     pub combined_fini_entries: Vec<u64>,
 }
 
@@ -63,6 +81,34 @@ pub struct NewExternalSym {
 /// Stable identifier for an extracted unit across pipeline stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UnitId(pub u32);
+
+/// A GOT slot copied into the merged segment (inside a data blob) whose value
+/// must be resolved by the dynamic loader at startup, exactly as it was for
+/// the original library: the resolved symbol address, or 0 for an unresolved
+/// weak symbol. Trampoline addresses are NOT a substitute — code null-checks
+/// these slots (e.g. `register_tm_clones` testing `_ITM_registerTMCloneTable`).
+///
+/// Recorded during extraction as (unit, offset); layout converts it to a
+/// `GotSlotImport` once the blob has an assigned VA.
+#[derive(Debug, Clone)]
+pub struct GotSlotFixup {
+    pub unit: UnitId,
+    pub offset: u64,
+    pub name: String,
+    /// Whether the symbol is weak in the source library. Preserved on the
+    /// injected .dynsym entry so ld.so tolerates it staying unresolved.
+    pub weak: bool,
+}
+
+/// A resolved `GotSlotFixup`: the writer emits an R_X86_64_GLOB_DAT at
+/// `got_vaddr` against `name` (reusing the executable's .dynsym entry when one
+/// exists, otherwise injecting one).
+#[derive(Debug, Clone)]
+pub struct GotSlotImport {
+    pub got_vaddr: u64,
+    pub name: String,
+    pub weak: bool,
+}
 
 /// How a symbol is imported into the executable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +239,8 @@ pub struct MergePlan {
     /// Each gets a new `.dynsym` entry, a fresh GOT slot in the merged segment,
     /// and a `GLOB_DAT` relocation so the dynamic loader resolves it at startup.
     pub new_externals: Vec<NewExternalSym>,
+    /// Copied GOT slots that must be re-resolved by ld.so at startup.
+    pub got_imports: Vec<GotSlotImport>,
     /// Plan for extending init/fini arrays with merged library constructors/destructors.
     pub init_fini: Option<InitFiniPlan>,
 }
@@ -221,9 +269,9 @@ impl MergePlan {
         }
         // Init/fini arrays come after trampolines, each entry is 8 bytes
         if let Some(ref init_fini) = self.init_fini {
-            if !init_fini.combined_init_entries.is_empty() {
-                let end = (init_fini.combined_init_vaddr - self.load_address) as usize
-                    + init_fini.combined_init_entries.len() * 8;
+            if !init_fini.preinit_entries.is_empty() {
+                let end = (init_fini.preinit_vaddr - self.load_address) as usize
+                    + init_fini.preinit_entries.len() * 8;
                 if end > sz {
                     sz = end;
                 }
