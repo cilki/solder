@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
@@ -69,6 +70,16 @@ struct ExtractionState {
     data_blobs: HashMap<DataBlobKey, DataBlobInfo>,
     /// Copied GOT slots that need a GLOB_DAT in the output (see GotSlotFixup).
     got_slot_fixups: Vec<GotSlotFixup>,
+    /// Cache of raw library bytes keyed by path. `process_symbol` runs once per
+    /// extracted symbol, and a large library (e.g. libcrypto.so.3 at ~6MB) can
+    /// yield thousands of symbols; re-reading the whole file from disk each time
+    /// dominated the runtime. The parse itself is lazy and cheap, so only the
+    /// bytes need caching.
+    lib_bytes_cache: HashMap<PathBuf, Rc<Vec<u8>>>,
+    /// Precomputed symbol lookups per library (see `LibIndex`).
+    lib_index_cache: HashMap<PathBuf, Rc<LibIndex>>,
+    /// Precomputed PLT stub → external symbol maps per library (see `PltMap`).
+    plt_map_cache: HashMap<PathBuf, Rc<PltMap>>,
 }
 
 impl ExtractionState {
@@ -76,6 +87,39 @@ impl ExtractionState {
         let id = UnitId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Return the raw bytes of `lib`, reading and caching them on first use.
+    fn lib_bytes(&mut self, lib: &Path) -> Result<Rc<Vec<u8>>> {
+        if let Some(bytes) = self.lib_bytes_cache.get(lib) {
+            return Ok(Rc::clone(bytes));
+        }
+        let bytes =
+            Rc::new(std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?);
+        self.lib_bytes_cache
+            .insert(lib.to_path_buf(), Rc::clone(&bytes));
+        Ok(bytes)
+    }
+
+    /// Return the symbol index for `lib`, building and caching it on first use.
+    fn lib_index(&mut self, lib: &Path, elf: &object::read::elf::ElfFile64<'_>) -> Rc<LibIndex> {
+        if let Some(idx) = self.lib_index_cache.get(lib) {
+            return Rc::clone(idx);
+        }
+        let idx = Rc::new(LibIndex::build(elf));
+        self.lib_index_cache
+            .insert(lib.to_path_buf(), Rc::clone(&idx));
+        idx
+    }
+
+    /// Return the PLT map for `lib`, building and caching it on first use.
+    fn plt_map(&mut self, lib: &Path, lib_bytes: &[u8]) -> Rc<PltMap> {
+        if let Some(m) = self.plt_map_cache.get(lib) {
+            return Rc::clone(m);
+        }
+        let m = Rc::new(PltMap::build(lib_bytes));
+        self.plt_map_cache.insert(lib.to_path_buf(), Rc::clone(&m));
+        m
     }
 }
 
@@ -115,6 +159,9 @@ pub fn extract_units(
         init_fini: InitFiniArrays::default(),
         data_blobs: HashMap::new(),
         got_slot_fixups: Vec::new(),
+        lib_bytes_cache: HashMap::new(),
+        lib_index_cache: HashMap::new(),
+        plt_map_cache: HashMap::new(),
     };
 
     let mut worklist: VecDeque<UnitKey> = VecDeque::new();
@@ -181,8 +228,7 @@ pub fn extract_units(
 /// Process a single symbol: extract its bytes, parse its relocations, and
 /// return new symbols to enqueue.
 fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<UnitKey>> {
-    let lib_bytes =
-        std::fs::read(&key.lib).with_context(|| format!("reading {}", key.lib.display()))?;
+    let lib_bytes = state.lib_bytes(&key.lib)?;
 
     let object_file = object::File::parse(lib_bytes.as_slice())
         .with_context(|| format!("object parse {}", key.lib.display()))?;
@@ -190,6 +236,8 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
     let object::File::Elf64(elf64) = &object_file else {
         bail!("{}: not a 64-bit ELF shared library", key.lib.display());
     };
+
+    let lib_index = state.lib_index(&key.lib, elf64);
 
     let mut new_deps: Vec<UnitKey> = Vec::new();
 
@@ -201,7 +249,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
     // extract_init_fini_arrays.
     if !state.processed_libs.contains(&key.lib) {
         state.processed_libs.insert(key.lib.clone());
-        let lib_init_fini = extract_init_fini_arrays(elf64, &key.lib)?;
+        let lib_init_fini = extract_init_fini_arrays(elf64, &lib_index, &key.lib)?;
         for entry in lib_init_fini
             .init_entries
             .iter()
@@ -226,7 +274,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
     }
 
     // Find the symbol in .symtab first, fall back to .dynsym.
-    let sym = find_symbol(elf64, &key.sym)
+    let sym = find_symbol(elf64, &lib_index, &key.sym)
         .with_context(|| format!("symbol '{}' in {}", key.sym, key.lib.display()))?;
 
     // Determine symbol size.
@@ -234,7 +282,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
         sym.size as usize
     } else {
         // Infer from the next symbol in the same section by address.
-        infer_symbol_size(elf64, &sym)?
+        infer_symbol_size(elf64, &lib_index, &sym)?
     };
 
     if sym_size == 0 {
@@ -358,7 +406,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                     // Try to extract this data section containing the symbol
                     // This will populate state.data_blobs if it's a data section
                     let extract_result =
-                        ensure_data_blob_extracted(elf64, ts_vaddr, &key.lib, state);
+                        ensure_data_blob_extracted(elf64, &lib_index, ts_vaddr, &key.lib, state);
                     if let Ok(Some((blob_id, blob_base, blob_deps))) = extract_result {
                         let offset_in_blob = ts_vaddr - blob_base;
                         for dep in blob_deps {
@@ -405,6 +453,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
     if section_kind != SectionKind::Text {
         collect_dynamic_range_relocs(
             elf64,
+            &lib_index,
             &key.lib,
             &key.sym,
             sym_vaddr,
@@ -420,6 +469,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
     // Scan for RIP-relative references (calls, jumps, and data accesses).
     // Create synthetic relocations for each reference so they get patched correctly.
     if section_kind == SectionKind::Text {
+        let plt_map = state.plt_map(&key.lib, lib_bytes.as_slice());
         let rip_refs = scan_rip_relative_refs(&bytes, sym_vaddr);
         for rip_ref in rip_refs {
             let target_addr = rip_ref.target_vaddr;
@@ -443,7 +493,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                 let reloc_size: u8 = if rip_ref.disp_size == 1 { 8 } else { 32 };
                 let reloc_addend = rip_ref.addend;
                 // First check if this is a PLT call (call to external symbol)
-                if let Some(ext_name) = find_plt_target(elf64, target_addr, &lib_bytes) {
+                if let Some(ext_name) = plt_map.target(target_addr) {
                     // PLT call resolution order:
                     //   1. Executable exports the symbol → trampoline through exe's GOT.
                     //   2. Another merged library defines the symbol → extract from
@@ -504,8 +554,8 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                     // MD5_Update/MD5_Final call directly. Without this, the call
                     // bytes were copied verbatim and the stale displacement
                     // pointed into unmapped memory, crashing at runtime.
-                    let dep_name = find_symbol_at_address(elf64, target_addr)
-                        .filter(|n| find_symbol(elf64, n).is_ok())
+                    let dep_name = find_symbol_at_address(&lib_index, target_addr)
+                        .filter(|n| find_symbol(elf64, &lib_index, n).is_ok())
                         .or_else(|| {
                             anon_target_is_extractable(elf64, target_addr)
                                 .then(|| anon_unit_name(target_addr))
@@ -545,13 +595,13 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                 // Zero-size boundary markers (e.g. __TMC_END__, which sits at the
                 // exact end of .data with nothing after it) are not extractable
                 // units — let those fall through to the blob path.
-                let named_unit = find_symbol_at_address(elf64, target_addr).filter(|n| {
-                    find_symbol(elf64, n)
+                let named_unit = find_symbol_at_address(&lib_index, target_addr).filter(|n| {
+                    find_symbol(elf64, &lib_index, n)
                         .and_then(|s| {
                             if s.size > 0 {
                                 Ok(s.size as usize)
                             } else {
-                                infer_symbol_size(elf64, &s)
+                                infer_symbol_size(elf64, &lib_index, &s)
                             }
                         })
                         .map(|sz| sz > 0)
@@ -578,7 +628,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                 }
                 // Otherwise try to extract the data section
                 if let Some((blob_id, blob_base, blob_deps)) =
-                    ensure_data_blob_extracted(elf64, target_addr, &key.lib, state)?
+                    ensure_data_blob_extracted(elf64, &lib_index, target_addr, &key.lib, state)?
                 {
                     let offset_in_blob = target_addr - blob_base;
                     for dep in blob_deps {
@@ -609,8 +659,13 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
 
     // Jump table detection via symbolic execution
     if section_kind == SectionKind::Text
-        && let Ok(jump_tables) =
-            crate::jump_table::detect_jump_tables(&bytes, sym_vaddr, &key.sym, elf64, &lib_bytes)
+        && let Ok(jump_tables) = crate::jump_table::detect_jump_tables(
+            &bytes,
+            sym_vaddr,
+            &key.sym,
+            elf64,
+            lib_bytes.as_slice(),
+        )
     {
         if !jump_tables.is_empty() {
             debug!(
@@ -623,7 +678,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
         for table in jump_tables {
             // 1. Ensure .rodata blob containing table is extracted
             if let Some((blob_id, blob_base, blob_deps)) =
-                ensure_data_blob_extracted(elf64, table.table_vaddr, &key.lib, state)?
+                ensure_data_blob_extracted(elf64, &lib_index, table.table_vaddr, &key.lib, state)?
             {
                 for dep in blob_deps {
                     if !new_deps.iter().any(|k| k.sym == dep.sym) {
@@ -659,7 +714,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         sym_vaddr
                     } else {
                         // Find the symbol that contains this address
-                        find_symbol(elf64, &target_name)
+                        find_symbol(elf64, &lib_index, &target_name)
                             .map(|s| s.vaddr)
                             .unwrap_or(*target_addr)
                     };
@@ -711,7 +766,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         // For internal jumps, we don't need to add as a new dependency
                         // since we're already extracting it
                         if !is_internal
-                            && find_symbol(elf64, &target_name).is_ok()
+                            && find_symbol(elf64, &lib_index, &target_name).is_ok()
                             && !new_deps.iter().any(|k| k.sym == dep_key.sym)
                         {
                             new_deps.push(dep_key.clone());
@@ -801,14 +856,91 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
 }
 
 /// Lightweight snapshot of a symbol we care about.
+#[derive(Clone)]
 struct SymInfo {
     vaddr: u64,
     size: u64,
     section: object::SectionIndex,
 }
 
-/// Find a symbol by name in an ELF's .symtab, falling back to .dynsym.
-fn find_symbol(elf: &object::read::elf::ElfFile64<'_>, name: &str) -> Result<SymInfo> {
+/// Precomputed per-library symbol lookups.
+///
+/// `process_symbol` runs once per extracted symbol, and each run performs many
+/// name/address lookups (`find_symbol`, `find_symbol_at_address`,
+/// `infer_symbol_size`). Done naively each of those linearly scans both the
+/// full `.symtab` and `.dynsym` — an O(symbols) cost paid per lookup, which for
+/// a large library like libcrypto.so.3 (tens of thousands of symbols, an
+/// enormous extraction closure) turns the whole run quadratic. Building these
+/// maps once per library collapses each lookup to O(1)/O(log n).
+struct LibIndex {
+    /// Defined symbols by name, preferring `.symtab` over `.dynsym` (the order
+    /// the linear `find_symbol` used). Only symbols in a real section.
+    by_name: HashMap<String, SymInfo>,
+    /// First defined symbol name at a given address, `.symtab` before `.dynsym`.
+    addr_to_name: HashMap<u64, String>,
+    /// Every defined symbol address paired with its section index (as a plain
+    /// `usize`, since `SectionIndex` isn't `Ord`), sorted by address, for
+    /// `infer_symbol_size`'s "next symbol boundary" search.
+    addrs_by_section: Vec<(u64, usize)>,
+}
+
+impl LibIndex {
+    fn build(elf: &object::read::elf::ElfFile64<'_>) -> Self {
+        let mut by_name: HashMap<String, SymInfo> = HashMap::new();
+        let mut addr_to_name: HashMap<u64, String> = HashMap::new();
+        let mut addrs_by_section: Vec<(u64, usize)> = Vec::new();
+
+        // Iterate .symtab first, then .dynsym, so first-writer-wins matches the
+        // ".symtab preferred" order of the original linear scans.
+        for sym in elf.symbols().chain(elf.dynamic_symbols()) {
+            let object::SymbolSection::Section(si) = sym.section() else {
+                continue;
+            };
+            let addr = sym.address();
+            addrs_by_section.push((addr, si.0));
+
+            let Ok(name) = sym.name() else { continue };
+            if name.is_empty() {
+                continue;
+            }
+
+            if !sym.is_undefined() {
+                by_name.entry(name.to_string()).or_insert(SymInfo {
+                    vaddr: addr,
+                    size: sym.size(),
+                    section: si,
+                });
+            }
+            addr_to_name.entry(addr).or_insert_with(|| name.to_string());
+        }
+
+        addrs_by_section.sort_unstable();
+        addrs_by_section.dedup();
+
+        LibIndex {
+            by_name,
+            addr_to_name,
+            addrs_by_section,
+        }
+    }
+
+    /// Smallest defined-symbol address greater than `addr` within `section`.
+    fn next_addr_in_section(&self, addr: u64, section: object::SectionIndex) -> Option<u64> {
+        let start = self.addrs_by_section.partition_point(|&(a, _)| a <= addr);
+        self.addrs_by_section[start..]
+            .iter()
+            .find(|&&(_, s)| s == section.0)
+            .map(|&(a, _)| a)
+    }
+}
+
+/// Find a symbol by name using the precomputed library index, falling back to
+/// the ELF only for synthetic anonymous-unit names.
+fn find_symbol(
+    elf: &object::read::elf::ElfFile64<'_>,
+    index: &LibIndex,
+    name: &str,
+) -> Result<SymInfo> {
     // Synthetic anonymous unit: resolve the address encoded in the name to the
     // executable section that contains it. Size is left at 0 so the caller
     // infers it from the next symbol boundary.
@@ -831,35 +963,11 @@ fn find_symbol(elf: &object::read::elf::ElfFile64<'_>, name: &str) -> Result<Sym
         bail!("anonymous unit address {addr:#x} not in any executable section");
     }
 
-    // Prefer .symtab (has sizes + section indices).
-    for sym in elf.symbols() {
-        if sym.name().ok() == Some(name) && !sym.is_undefined() {
-            let section = match sym.section() {
-                object::SymbolSection::Section(si) => si,
-                _ => bail!("symbol '{name}' is not in a regular section"),
-            };
-            return Ok(SymInfo {
-                vaddr: sym.address(),
-                size: sym.size(),
-                section,
-            });
-        }
-    }
-    // Fall back to .dynsym.
-    for sym in elf.dynamic_symbols() {
-        if sym.name().ok() == Some(name) && !sym.is_undefined() {
-            let section = match sym.section() {
-                object::SymbolSection::Section(si) => si,
-                _ => bail!("symbol '{name}' is not in a regular section"),
-            };
-            return Ok(SymInfo {
-                vaddr: sym.address(),
-                size: sym.size(),
-                section,
-            });
-        }
-    }
-    bail!("symbol '{name}' not found in .symtab or .dynsym")
+    index
+        .by_name
+        .get(name)
+        .cloned()
+        .with_context(|| format!("symbol '{name}' not found in .symtab or .dynsym"))
 }
 
 /// Look up a symbol by index in the dynamic symbol table. Symbol indices in
@@ -880,28 +988,8 @@ fn dynamic_symbol_by_index<'data, 'file>(
 /// pseudo-symbols (e.g. `NCURSESW6_5.8.20110226`) are `SHN_ABS` with value 0, so
 /// a scanned reference that resolves to address 0 would otherwise match one of
 /// them and then fail extraction with "not in a regular section".
-fn find_symbol_at_address(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> Option<String> {
-    // First check .symtab (has local symbols like .cold functions)
-    for sym in elf.symbols() {
-        if sym.address() == addr
-            && matches!(sym.section(), object::SymbolSection::Section(_))
-            && let Ok(name) = sym.name()
-            && !name.is_empty()
-        {
-            return Some(name.to_string());
-        }
-    }
-    // Fall back to .dynsym
-    for sym in elf.dynamic_symbols() {
-        if sym.address() == addr
-            && matches!(sym.section(), object::SymbolSection::Section(_))
-            && let Ok(name) = sym.name()
-            && !name.is_empty()
-        {
-            return Some(name.to_string());
-        }
-    }
-    None
+fn find_symbol_at_address(index: &LibIndex, addr: u64) -> Option<String> {
+    index.addr_to_name.get(&addr).cloned()
 }
 
 /// Reserved synthetic-name prefix for anonymous (symbol-less) code units. A
@@ -1000,8 +1088,7 @@ fn scan_rip_relative_refs(bytes: &[u8], base_vaddr: u64) -> Vec<RipRelativeRef> 
                         && i32::try_from(rel)
                             .is_ok_and(|r| instr_bytes[instr.len() - 4..] == r.to_le_bytes());
                     let is_rel8 = !is_rel32
-                        && i8::try_from(rel)
-                            .is_ok_and(|r| instr_bytes[instr.len() - 1] == r as u8);
+                        && i8::try_from(rel).is_ok_and(|r| instr_bytes[instr.len() - 1] == r as u8);
                     if is_rel32 || is_rel8 {
                         let disp_size: u8 = if is_rel32 { 4 } else { 1 };
                         refs.push(RipRelativeRef {
@@ -1045,40 +1132,100 @@ fn scan_rip_relative_refs(bytes: &[u8], base_vaddr: u64) -> Vec<RipRelativeRef> 
     refs
 }
 
-/// Check if an address is in the PLT section and return the external symbol name if so.
-/// PLT entries follow a pattern: jmp *GOT_OFFSET(%rip) or push index; jmp resolver
-fn find_plt_target(
-    elf: &object::read::elf::ElfFile64<'_>,
-    addr: u64,
-    lib_bytes: &[u8],
-) -> Option<String> {
-    // Find the .plt section
-    for section in elf.sections() {
-        let name = match section.name() {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        if name != ".plt" && name != ".plt.got" && name != ".plt.sec" {
-            continue;
-        }
-        let sec_addr = section.address();
-        let sec_size = section.size();
-        if addr < sec_addr || addr >= sec_addr + sec_size {
-            continue;
+/// Precomputed PLT-resolution data for a library. `find_plt_target` is called
+/// for every code reference into a PLT stub during extraction; parsing the whole
+/// library with goblin each time (as the original did) was a major quadratic
+/// cost. This captures the small amount that lookup actually needs so it can be
+/// built once per library.
+struct PltMap {
+    /// Byte ranges of the library's PLT sections (start_va, end_va).
+    plt_ranges: Vec<(u64, u64)>,
+    /// GOT slot VA → external symbol name, from JUMP_SLOT/GLOB_DAT relocations.
+    got_to_name: HashMap<u64, String>,
+    /// Symbol address → name (dynsym), for the fallback path.
+    addr_to_name: HashMap<u64, String>,
+    /// Raw library bytes (needed to read a stub's disp32 at lookup time).
+    bytes: Vec<u8>,
+    /// Copy of each PLT section's (start_va, file_offset, size) so a stub's
+    /// bytes can be located without reparsing.
+    plt_file_spans: Vec<(u64, u64, u64)>,
+}
+
+impl PltMap {
+    fn build(lib_bytes: &[u8]) -> Self {
+        let mut plt_ranges = Vec::new();
+        let mut plt_file_spans = Vec::new();
+        let mut got_to_name = HashMap::new();
+        let mut addr_to_name = HashMap::new();
+
+        if let Ok(g) = goblin::elf::Elf::parse(lib_bytes) {
+            for sh in &g.section_headers {
+                let Some(name) = g.shdr_strtab.get_at(sh.sh_name) else {
+                    continue;
+                };
+                if name == ".plt" || name == ".plt.got" || name == ".plt.sec" {
+                    plt_ranges.push((sh.sh_addr, sh.sh_addr + sh.sh_size));
+                    plt_file_spans.push((sh.sh_addr, sh.sh_offset, sh.sh_size));
+                }
+            }
+
+            for rela in g.pltrelocs.iter().chain(g.dynrelas.iter()) {
+                if let Some(sym) = g.dynsyms.get(rela.r_sym)
+                    && let Some(name) = g.dynstrtab.get_at(sym.st_name)
+                    && !name.is_empty()
+                {
+                    got_to_name
+                        .entry(rela.r_offset)
+                        .or_insert_with(|| name.to_string());
+                }
+            }
+
+            for sym in g.dynsyms.iter() {
+                if let Some(name) = g.dynstrtab.get_at(sym.st_name)
+                    && !name.is_empty()
+                {
+                    addr_to_name
+                        .entry(sym.st_value)
+                        .or_insert_with(|| name.to_string());
+                }
+            }
         }
 
-        // This address is in a PLT section. Decode the stub itself instead of
-        // guessing by entry index: every flavor (.plt, .plt.got, .plt.sec)
-        // starts with an optional endbr64 and/or bnd prefix followed by
-        // `ff 25 <disp32>` (jmp [rip+disp32]) through its GOT slot. The slot's
-        // dynamic relocation — JUMP_SLOT for classic PLT entries, GLOB_DAT for
-        // .plt.got-style stubs like __cxa_finalize@plt — names the symbol.
-        let goblin_lib = match goblin::elf::Elf::parse(lib_bytes) {
-            Ok(g) => g,
-            Err(_) => return None,
-        };
+        PltMap {
+            plt_ranges,
+            got_to_name,
+            addr_to_name,
+            bytes: lib_bytes.to_vec(),
+            plt_file_spans,
+        }
+    }
 
-        let sec_data = section.data().ok()?;
+    /// If `addr` lands in a PLT stub, return the external symbol it resolves to.
+    fn target(&self, addr: u64) -> Option<String> {
+        let in_plt = self
+            .plt_ranges
+            .iter()
+            .any(|&(start, end)| addr >= start && addr < end);
+        if !in_plt {
+            return None;
+        }
+
+        // Locate the stub's bytes via the containing PLT section's file span.
+        let (sec_addr, sec_off, sec_size) = self
+            .plt_file_spans
+            .iter()
+            .copied()
+            .find(|&(start, _, size)| addr >= start && addr < start + size)?;
+        let sec_data = self
+            .bytes
+            .get(sec_off as usize..(sec_off + sec_size) as usize)?;
+
+        // Decode the stub itself instead of guessing by entry index: every
+        // flavor (.plt, .plt.got, .plt.sec) starts with an optional endbr64
+        // and/or bnd prefix followed by `ff 25 <disp32>` (jmp [rip+disp32])
+        // through its GOT slot. The slot's dynamic relocation — JUMP_SLOT for
+        // classic PLT entries, GLOB_DAT for .plt.got-style stubs like
+        // __cxa_finalize@plt — names the symbol.
         let mut off = (addr - sec_addr) as usize;
         if sec_data.len() >= off + 4 && sec_data[off..off + 4] == [0xf3, 0x0f, 0x1e, 0xfa] {
             off += 4; // endbr64
@@ -1092,26 +1239,12 @@ fn find_plt_target(
         let disp = i32::from_le_bytes(sec_data[off + 2..off + 6].try_into().expect("4 bytes"));
         let got_va = (sec_addr + off as u64 + 6).wrapping_add(disp as i64 as u64);
 
-        for rela in goblin_lib.pltrelocs.iter().chain(goblin_lib.dynrelas.iter()) {
-            if rela.r_offset == got_va
-                && let Some(sym) = goblin_lib.dynsyms.get(rela.r_sym)
-                && let Some(name) = goblin_lib.dynstrtab.get_at(sym.st_name)
-                && !name.is_empty()
-            {
-                return Some(name.to_string());
-            }
+        if let Some(name) = self.got_to_name.get(&got_va) {
+            return Some(name.clone());
         }
-
-        // Fallback: try to find symbol at this exact address
-        for sym in goblin_lib.dynsyms.iter() {
-            if sym.st_value == addr
-                && let Some(name) = goblin_lib.dynstrtab.get_at(sym.st_name)
-            {
-                return Some(name.to_string());
-            }
-        }
+        // Fallback: a symbol defined at this exact address.
+        self.addr_to_name.get(&addr).cloned()
     }
-    None
 }
 
 /// Check if a virtual address falls within an already-extracted data blob.
@@ -1169,6 +1302,7 @@ fn find_section_for_address(
 #[allow(clippy::ptr_arg)]
 fn collect_dynamic_range_relocs(
     elf64: &object::read::elf::ElfFile64<'_>,
+    index: &LibIndex,
     lib: &PathBuf,
     ctx: &str,
     range_start: u64,
@@ -1279,22 +1413,20 @@ fn collect_dynamic_range_relocs(
             if let Some((blob_id, blob_base)) = find_existing_data_blob(addend_va, state) {
                 let offset_in_blob = addend_va - blob_base;
                 RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
-            } else if let Some(target_name) =
-                find_symbol_at_address(elf64, addend_va).filter(|n| {
-                    // Only symbols with a determinable non-zero size can become
-                    // units; boundary markers like __TMC_END__ cannot.
-                    find_symbol(elf64, n)
-                        .and_then(|s| {
-                            if s.size > 0 {
-                                Ok(s.size as usize)
-                            } else {
-                                infer_symbol_size(elf64, &s)
-                            }
-                        })
-                        .map(|sz| sz > 0)
-                        .unwrap_or(false)
-                })
-            {
+            } else if let Some(target_name) = find_symbol_at_address(index, addend_va).filter(|n| {
+                // Only symbols with a determinable non-zero size can become
+                // units; boundary markers like __TMC_END__ cannot.
+                find_symbol(elf64, index, n)
+                    .and_then(|s| {
+                        if s.size > 0 {
+                            Ok(s.size as usize)
+                        } else {
+                            infer_symbol_size(elf64, index, &s)
+                        }
+                    })
+                    .map(|sz| sz > 0)
+                    .unwrap_or(false)
+            }) {
                 let dep_key = UnitKey {
                     lib: lib.clone(),
                     sym: target_name,
@@ -1340,6 +1472,7 @@ fn collect_dynamic_range_relocs(
 #[allow(clippy::ptr_arg)]
 fn ensure_data_blob_extracted(
     elf64: &object::read::elf::ElfFile64<'_>,
+    index: &LibIndex,
     target_addr: u64,
     lib: &PathBuf,
     state: &mut ExtractionState,
@@ -1375,6 +1508,7 @@ fn ensure_data_blob_extracted(
 
     collect_dynamic_range_relocs(
         elf64,
+        index,
         lib,
         &sec_name,
         sec_addr,
@@ -1447,23 +1581,15 @@ fn ensure_data_blob_extracted(
 }
 
 /// Infer symbol size from the next symbol in the same section by address.
-fn infer_symbol_size(elf: &object::read::elf::ElfFile64<'_>, sym: &SymInfo) -> Result<usize> {
+fn infer_symbol_size(
+    elf: &object::read::elf::ElfFile64<'_>,
+    index: &LibIndex,
+    sym: &SymInfo,
+) -> Result<usize> {
     let sym_vaddr = sym.vaddr;
     let sym_section = sym.section;
 
-    let mut next_addr: Option<u64> = None;
-    for other in elf.symbols().chain(elf.dynamic_symbols()) {
-        if other.address() > sym_vaddr
-            && let object::SymbolSection::Section(si) = other.section()
-            && si == sym_section
-        {
-            let candidate = other.address();
-            next_addr = Some(match next_addr {
-                Some(cur) if cur < candidate => cur,
-                _ => candidate,
-            });
-        }
-    }
+    let next_addr = index.next_addr_in_section(sym_vaddr, sym_section);
 
     let section = elf
         .section_by_index(sym_section)
@@ -1501,6 +1627,7 @@ fn is_crt_glue(name: &str) -> bool {
 /// Sentinel values (0 or -1) are skipped.
 fn extract_init_fini_arrays(
     elf64: &object::read::elf::ElfFile64<'_>,
+    index: &LibIndex,
     lib_path: &std::path::Path,
 ) -> Result<InitFiniArrays> {
     let mut result = InitFiniArrays::default();
@@ -1549,7 +1676,7 @@ fn extract_init_fini_arrays(
                 continue;
             }
 
-            let sym_name = find_symbol_at_address(elf64, func_vaddr);
+            let sym_name = find_symbol_at_address(index, func_vaddr);
             if let Some(ref name) = sym_name
                 && is_crt_glue(name)
             {
@@ -1562,7 +1689,7 @@ fn extract_init_fini_arrays(
             }
 
             let unit_name = sym_name
-                .filter(|n| find_symbol(elf64, n).is_ok())
+                .filter(|n| find_symbol(elf64, index, n).is_ok())
                 .or_else(|| {
                     anon_target_is_extractable(elf64, func_vaddr)
                         .then(|| anon_unit_name(func_vaddr))
