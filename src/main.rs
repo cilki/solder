@@ -1,4 +1,5 @@
 mod dep_graph;
+mod eh_frame;
 mod elf_reader;
 mod extractor;
 mod jump_table;

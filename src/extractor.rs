@@ -107,6 +107,12 @@ impl ExtractionState {
             return Rc::clone(idx);
         }
         let idx = Rc::new(LibIndex::build(elf));
+        debug!(
+            lib = %lib.display(),
+            symbols = idx.by_name.len(),
+            fdes = idx.fdes.fde_count(),
+            "Indexed library"
+        );
         self.lib_index_cache
             .insert(lib.to_path_buf(), Rc::clone(&idx));
         idx
@@ -554,13 +560,11 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                     // MD5_Update/MD5_Final call directly. Without this, the call
                     // bytes were copied verbatim and the stale displacement
                     // pointed into unmapped memory, crashing at runtime.
-                    let dep_name = find_symbol_at_address(&lib_index, target_addr)
-                        .filter(|n| find_symbol(elf64, &lib_index, n).is_ok())
-                        .or_else(|| {
-                            anon_target_is_extractable(elf64, target_addr)
-                                .then(|| anon_unit_name(target_addr))
-                        });
-                    if let Some(target_name) = dep_name {
+                    let dep = resolve_owning_unit(elf64, &lib_index, target_addr).or_else(|| {
+                        anon_target_is_extractable(elf64, target_addr)
+                            .then(|| (anon_unit_name(target_addr), 0))
+                    });
+                    if let Some((target_name, offset_in_target)) = dep {
                         let dep_key = UnitKey {
                             lib: key.lib.clone(),
                             sym: target_name,
@@ -570,13 +574,15 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         }
                         // Track for later resolution
                         pending_relocs.push((relocations.len(), dep_key));
-                        // Add synthetic PC-relative relocation
+                        // Add synthetic PC-relative relocation. The relocator
+                        // computes S + A - P against the unit's base, so an
+                        // interior target is reached through the addend.
                         relocations.push(ExtractedReloc {
                             offset_within_unit: rip_ref.offset as u64,
                             kind: object::RelocationKind::Relative,
                             encoding: object::RelocationEncoding::Generic,
                             size: reloc_size,
-                            addend: reloc_addend,
+                            addend: reloc_addend + offset_in_target as i64,
                             target: RelocTarget::MergedUnit(UnitId(u32::MAX)),
                         });
                     } else {
@@ -590,24 +596,14 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                     }
                 }
             } else {
-                // Data reference (LEA/MOV) — could be loading address of data or code
-                // First try as a code symbol (e.g. LEA loading a function pointer).
-                // Zero-size boundary markers (e.g. __TMC_END__, which sits at the
-                // exact end of .data with nothing after it) are not extractable
-                // units — let those fall through to the blob path.
-                let named_unit = find_symbol_at_address(&lib_index, target_addr).filter(|n| {
-                    find_symbol(elf64, &lib_index, n)
-                        .and_then(|s| {
-                            if s.size > 0 {
-                                Ok(s.size as usize)
-                            } else {
-                                infer_symbol_size(elf64, &lib_index, &s)
-                            }
-                        })
-                        .map(|sz| sz > 0)
-                        .unwrap_or(false)
-                });
-                if let Some(target_name) = named_unit {
+                // Data reference (LEA/MOV) — could be loading the address of
+                // data or of code (e.g. LEA of a function pointer, or of a
+                // label inside the function doing the load). Resolve it to an
+                // owning unit first; anything else falls through to the blob
+                // path below.
+                if let Some((target_name, offset_in_target)) =
+                    resolve_owning_unit(elf64, &lib_index, target_addr)
+                {
                     let dep_key = UnitKey {
                         lib: key.lib.clone(),
                         sym: target_name,
@@ -621,7 +617,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         kind: object::RelocationKind::Relative,
                         encoding: object::RelocationEncoding::Generic,
                         size: 32,
-                        addend: rip_ref.addend,
+                        addend: rip_ref.addend + offset_in_target as i64,
                         target: RelocTarget::MergedUnit(UnitId(u32::MAX)),
                     });
                     continue;
@@ -786,7 +782,10 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
         bytes[disp_off] = (veneer_off as i64 - (disp_off as i64 + 1)) as i8 as u8;
         reloc.offset_within_unit = veneer_off as u64 + 1;
         reloc.size = 32;
-        reloc.addend = -4;
+        // The addend of a scanned branch is -(displacement width) plus the
+        // target's offset into its unit. Only the width changes here, from the
+        // rel8 field to the veneer's rel32 one; the target offset must survive.
+        reloc.addend -= 3;
     }
 
     // Register this unit.
@@ -853,6 +852,9 @@ struct LibIndex {
     /// `usize`, since `SectionIndex` isn't `Ord`), sorted by address, for
     /// `infer_symbol_size`'s "next symbol boundary" search.
     addrs_by_section: Vec<(u64, usize)>,
+    /// Exact function bounds from `.eh_frame`, which cover code the symbol
+    /// tables say nothing about (see `resolve_owning_unit`).
+    fdes: crate::eh_frame::FdeTable,
 }
 
 impl LibIndex {
@@ -888,10 +890,17 @@ impl LibIndex {
         addrs_by_section.sort_unstable();
         addrs_by_section.dedup();
 
+        let fdes = elf
+            .section_by_name(".eh_frame")
+            .and_then(|s| s.data().ok().map(|d| (d, s.address())))
+            .map(|(data, vaddr)| crate::eh_frame::FdeTable::parse(data, vaddr))
+            .unwrap_or_default();
+
         LibIndex {
             by_name,
             addr_to_name,
             addrs_by_section,
+            fdes,
         }
     }
 
@@ -972,6 +981,61 @@ const ANON_UNIT_PREFIX: &str = ".solder.anon.";
 
 fn anon_unit_name(addr: u64) -> String {
     format!("{ANON_UNIT_PREFIX}{addr:#x}")
+}
+
+/// Resolve `addr` to the unit that owns it: the name to extract that unit
+/// under, and the offset of `addr` within it.
+///
+/// A reference does not have to land on a function entry: compilers branch to
+/// and take the address of interior labels all the time, and in a stripped
+/// library most branch targets have no symbol of their own. Resolving such an
+/// address to the function that contains it — plus an offset — keeps one unit
+/// per function instead of starting a fresh, over-extended unit at every
+/// address that happens to be referenced.
+///
+/// Returns `None` when nothing is known to own `addr`; the caller decides
+/// whether to fall back to an anonymous unit starting there.
+fn resolve_owning_unit(
+    elf: &object::read::elf::ElfFile64<'_>,
+    index: &LibIndex,
+    addr: u64,
+) -> Option<(String, u64)> {
+    // A symbol defined at exactly this address, as long as it has a usable
+    // size: zero-size boundary markers (e.g. `__TMC_END__`, which sits at the
+    // exact end of .data with nothing after it) own nothing.
+    if let Some(name) = find_symbol_at_address(index, addr)
+        && symbol_unit_size(elf, index, &name).is_some_and(|size| size > 0)
+    {
+        return Some((name, 0));
+    }
+
+    // Otherwise the function whose `.eh_frame` range covers the address. Prefer
+    // a named symbol at that function's entry so the interior reference shares
+    // the unit the function is already extracted as, instead of duplicating its
+    // tail under an anonymous name.
+    let (fde_start, _) = index.fdes.containing(addr)?;
+    let offset = addr - fde_start;
+    if let Some(name) = find_symbol_at_address(index, fde_start)
+        && symbol_unit_size(elf, index, &name).is_some_and(|size| size as u64 > offset)
+    {
+        return Some((name, offset));
+    }
+    anon_target_is_extractable(elf, fde_start).then(|| (anon_unit_name(fde_start), offset))
+}
+
+/// The size `process_symbol` would extract for `name`, or `None` if the symbol
+/// cannot be resolved at all.
+fn symbol_unit_size(
+    elf: &object::read::elf::ElfFile64<'_>,
+    index: &LibIndex,
+    name: &str,
+) -> Option<usize> {
+    let sym = find_symbol(elf, index, name).ok()?;
+    if sym.size > 0 {
+        Some(sym.size as usize)
+    } else {
+        infer_symbol_size(elf, index, &sym).ok()
+    }
 }
 
 /// Whether `addr` points into executable code we can extract as an anonymous
@@ -1322,7 +1386,10 @@ fn collect_dynamic_range_relocs(
             _ => None,
         };
 
-        let mut relative_addend_consumed = false;
+        // Set for relocations whose own addend was consumed while resolving the
+        // target (see the RELATIVE case below); holds the offset into the
+        // resolved unit, which is 0 unless the target is a unit interior.
+        let mut resolved_addend: Option<i64> = None;
         let target = if let Some(ts) = target_sym {
             let ts_name = ts.name().unwrap_or("").to_owned();
             if ts.is_undefined() || ts_name.is_empty() {
@@ -1375,29 +1442,21 @@ fn collect_dynamic_range_relocs(
             // For R_X86_64_RELATIVE: *(reloc_offset) = load_base + addend
             // The addend contains the original VA of the code/data being
             // pointed to. That VA is translated to a RelocTarget below, so
-            // the extracted relocation's addend must drop to 0 or the old
-            // VA would be added on top of the resolved new address.
-            relative_addend_consumed = true;
+            // the extracted relocation's addend must drop to the offset of the
+            // target within whatever unit ends up holding it — 0 unless the
+            // target is a unit interior — or the old VA would be added on top
+            // of the resolved new address.
+            resolved_addend = Some(0);
             let addend_va = reloc.addend() as u64;
 
             // Check if the target is within an already-extracted data blob
             if let Some((blob_id, blob_base)) = find_existing_data_blob(addend_va, state) {
                 let offset_in_blob = addend_va - blob_base;
                 RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
-            } else if let Some(target_name) = find_symbol_at_address(index, addend_va).filter(|n| {
-                // Only symbols with a determinable non-zero size can become
-                // units; boundary markers like __TMC_END__ cannot.
-                find_symbol(elf64, index, n)
-                    .and_then(|s| {
-                        if s.size > 0 {
-                            Ok(s.size as usize)
-                        } else {
-                            infer_symbol_size(elf64, index, &s)
-                        }
-                    })
-                    .map(|sz| sz > 0)
-                    .unwrap_or(false)
-            }) {
+            } else if let Some((target_name, offset_in_target)) =
+                resolve_owning_unit(elf64, index, addend_va)
+            {
+                resolved_addend = Some(offset_in_target as i64);
                 let dep_key = UnitKey {
                     lib: lib.clone(),
                     sym: target_name,
@@ -1427,11 +1486,7 @@ fn collect_dynamic_range_relocs(
             kind,
             encoding,
             size: reloc_size,
-            addend: if relative_addend_consumed {
-                0
-            } else {
-                reloc.addend()
-            },
+            addend: resolved_addend.unwrap_or_else(|| reloc.addend()),
             target,
         });
     }
@@ -1551,7 +1606,14 @@ fn ensure_data_blob_extracted(
     Ok(Some((id, sec_addr, new_deps)))
 }
 
-/// Infer symbol size from the next symbol in the same section by address.
+/// Infer the size of a symbol whose `st_size` is 0, by bounding it with the
+/// tightest safe end marker: the start of the next function with unwind info,
+/// the next symbol in the same section, or the end of the section.
+///
+/// The next symbol alone is a poor bound in a stripped library, where the run
+/// between two exported symbols can hold dozens of local functions: the whole
+/// run would be copied once for every one of them that gets referenced, and a
+/// unit that long also breaks short-branch veneering.
 fn infer_symbol_size(
     elf: &object::read::elf::ElfFile64<'_>,
     index: &LibIndex,
@@ -1566,7 +1628,24 @@ fn infer_symbol_size(
         .section_by_index(sym_section)
         .context("section lookup")?;
     let section_end = section.address() + section.size();
-    let limit = next_addr.unwrap_or(section_end);
+    let mut limit = next_addr.unwrap_or(section_end);
+
+    // The start of the next function with unwind info is a far tighter bound
+    // than the next symbol in a stripped library, where one run between two
+    // exported symbols can hold dozens of local functions.
+    //
+    // It is the *next* FDE's start rather than the containing FDE's end
+    // because the two are not always the same: hand-written assembly
+    // (OpenSSL's RC4_options, for one) carries unwind info for only part of
+    // the function, and cutting the unit at that FDE's end would drop real
+    // code. Padding between functions can be copied; missing instructions
+    // cannot. Unwind ranges only describe code, so this is consulted only for
+    // symbols in an executable section.
+    if section.kind() == ObjSectionKind::Text
+        && let Some(next_fde) = index.fdes.next_start_after(sym_vaddr)
+    {
+        limit = limit.min(next_fde);
+    }
 
     if limit <= sym_vaddr {
         return Ok(0);
