@@ -700,27 +700,9 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         continue;
                     }
 
-                    // 3. Find or extract target function
-                    let target_name =
-                        crate::jump_table::find_symbol_at_address(elf64, *target_addr)
-                            .unwrap_or_else(|| format!("jumptarget_{:x}", target_addr));
-
-                    // 4. Check if target is within our own function (intra-function jump)
-                    let is_internal =
-                        *target_addr >= sym_vaddr && *target_addr < sym_vaddr + bytes.len() as u64;
-
-                    // 5. Compute the target symbol's base address to calculate offset
-                    let target_sym_vaddr = if is_internal {
-                        sym_vaddr
-                    } else {
-                        // Find the symbol that contains this address
-                        find_symbol(elf64, &lib_index, &target_name)
-                            .map(|s| s.vaddr)
-                            .unwrap_or(*target_addr)
-                    };
-
-                    // Calculate offset within the target function
-                    let offset_in_target = (*target_addr - target_sym_vaddr) as i64;
+                    // 3. `detect_jump_tables` only keeps entries that branch into
+                    // this unit, so the target is always an offset into it.
+                    let offset_in_target = (*target_addr - sym_vaddr) as i64;
 
                     // Jump table entry format: target = table_base + *(i32*)entry
                     // Therefore: *(i32*)entry = target - table_base
@@ -737,7 +719,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                     // Therefore: A = offset_in_target + idx*4
                     let addend = offset_in_target + (idx * 4) as i64;
 
-                    // 6. Add jump table entry relocation to the data blob
+                    // 4. Add jump table entry relocation to the data blob
                     // Find the blob unit and add the relocation
                     if let Some(blob_unit) = state.units.iter_mut().find(|u| u.id == blob_id) {
                         let reloc_idx = blob_unit.relocations.len();
@@ -751,30 +733,19 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             target: RelocTarget::MergedUnit(UnitId(u32::MAX)), // Placeholder
                         });
 
-                        // Track for resolution
-                        let dep_key = UnitKey {
-                            lib: key.lib.clone(),
-                            sym: if is_internal {
-                                // Internal jump - target is the current function itself
-                                key.sym.clone()
-                            } else {
-                                target_name.clone()
+                        // The target is this very unit, which is already being
+                        // extracted, so there is no new dependency to enqueue —
+                        // only a pending resolution of the placeholder UnitId.
+                        // (Not `pending_relocs`: that one is for relocations of
+                        // the current unit, these belong to the blob.)
+                        state.pending.push((
+                            blob_id,
+                            reloc_idx,
+                            UnitKey {
+                                lib: key.lib.clone(),
+                                sym: key.sym.clone(),
                             },
-                        };
-
-                        // Only add as dependency if it's a real symbol we can extract
-                        // For internal jumps, we don't need to add as a new dependency
-                        // since we're already extracting it
-                        if !is_internal
-                            && find_symbol(elf64, &lib_index, &target_name).is_ok()
-                            && !new_deps.iter().any(|k| k.sym == dep_key.sym)
-                        {
-                            new_deps.push(dep_key.clone());
-                        }
-
-                        // Add to pending resolutions for this blob
-                        // (don't use pending_relocs which is for the current unit's relocations)
-                        state.pending.push((blob_id, reloc_idx, dep_key));
+                        ));
                     }
                 }
             }

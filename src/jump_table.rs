@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use object::{Object, ObjectSection, ObjectSymbol};
+use object::{Object, ObjectSection};
 use tracing::debug;
 
 /// A detected jump table in .rodata
@@ -352,14 +352,14 @@ fn is_rodata_address(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> bool 
 /// 2. Starting at table_base, read consecutive i32 values
 /// 3. For each i32 offset value:
 ///    - Compute target = table_base + i32_value
-///    - Validate target is valid code address
-///    - Check if target is "nearby" (within ±1MB of func_base)
-/// 4. Stop when we hit invalid target or sentinel value
+///    - Validate the target lands inside `func_base .. func_base + func_size`
+/// 4. Stop at the first entry that fails, at the next detected table, or at the
+///    end of the section
 pub fn identify_table_bounds(
     elf: &object::read::elf::ElfFile64<'_>,
     table_base: u64,
     func_base: u64,
-    _func_size: u64,
+    func_size: u64,
     next_table: Option<u64>,
 ) -> Result<JumpTable> {
     // Find section containing the table
@@ -374,73 +374,15 @@ pub fn identify_table_bounds(
 
     let section_data = section.data().context("Could not read section data")?;
 
-    let section_addr = section.address();
-
-    let offset_in_section = (table_base - section_addr) as usize;
-
-    if offset_in_section + 4 > section_data.len() {
-        bail!("Table base offset exceeds section bounds");
-    }
-
-    let mut targets = Vec::new();
-    let mut current_offset = offset_in_section;
-
-    // Maximum reasonable table size (256 entries for switch statements)
-    let max_entries = 256;
-
-    for entry_idx in 0..max_entries {
-        if current_offset + 4 > section_data.len() {
-            break;
-        }
-
-        // Stop before the next table starts (avoid overlapping relocations)
-        let entry_vaddr = table_base + (entry_idx * 4) as u64;
-        if let Some(next) = next_table
-            && entry_vaddr >= next
-        {
-            break;
-        }
-
-        // Read i32 offset
-        let offset_bytes = &section_data[current_offset..current_offset + 4];
-        let i32_offset = i32::from_le_bytes([
-            offset_bytes[0],
-            offset_bytes[1],
-            offset_bytes[2],
-            offset_bytes[3],
-        ]);
-
-        // Compute target address
-        // Formula: target = table_base + i32_value
-        // This matches the code pattern: lea base, [rip+table]; movsxd off, [base+idx*4]; add off, base; jmp off
-        let target = (table_base as i64 + i32_offset as i64) as u64;
-
-        // Validation: target should be nearby (within ±1MB) and in a code section
-        let distance = target.abs_diff(func_base);
-
-        if distance > 1024 * 1024 {
-            break;
-        }
-
-        // Validate target is in a text section
-        let in_text = elf.sections().any(|s| {
-            let addr = s.address();
-            let size = s.size();
-            let kind = s.kind();
-            matches!(kind, object::SectionKind::Text) && target >= addr && target < addr + size
-        });
-
-        if !in_text {
-            break;
-        }
-
-        targets.push(target);
-        current_offset += 4;
-    }
-
-    if targets.is_empty() {
-        bail!("No valid jump table entries found");
-    }
+    let targets = scan_table_entries(
+        section_data,
+        section.address(),
+        table_base,
+        func_base,
+        func_size,
+        next_table,
+    )
+    .context("Table base offset exceeds section bounds")?;
 
     if targets.len() < 2 {
         bail!(
@@ -456,34 +398,195 @@ pub fn identify_table_bounds(
     })
 }
 
-/// Find the symbol name at a given virtual address, if any exists.
-/// Checks if address falls within the symbol's range (address to address+size).
-pub fn find_symbol_at_address(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> Option<String> {
-    // First check .symtab (has local symbols)
-    for sym in elf.symbols() {
-        let sym_addr = sym.address();
-        let sym_size = sym.size();
-        if addr >= sym_addr
-            && addr < sym_addr + sym_size
-            && !sym.is_undefined()
-            && let Ok(name) = sym.name()
-            && !name.is_empty()
-        {
-            return Some(name.to_string());
-        }
+/// Tables with more entries than this are almost certainly a misdetection.
+const MAX_TABLE_ENTRIES: usize = 256;
+
+/// Read consecutive i32 entries starting at `table_base` and turn them into
+/// target addresses, stopping at the first entry that cannot belong to this
+/// table. Returns `None` if `table_base` isn't inside the section at all.
+fn scan_table_entries(
+    section_data: &[u8],
+    section_addr: u64,
+    table_base: u64,
+    func_base: u64,
+    func_size: u64,
+    next_table: Option<u64>,
+) -> Option<Vec<u64>> {
+    let offset_in_section = usize::try_from(table_base.checked_sub(section_addr)?).ok()?;
+    if offset_in_section + 4 > section_data.len() {
+        return None;
     }
-    // Fall back to .dynsym
-    for sym in elf.dynamic_symbols() {
-        let sym_addr = sym.address();
-        let sym_size = sym.size();
-        if addr >= sym_addr
-            && addr < sym_addr + sym_size
-            && !sym.is_undefined()
-            && let Ok(name) = sym.name()
-            && !name.is_empty()
-        {
-            return Some(name.to_string());
+
+    let mut targets = Vec::new();
+    for entry_idx in 0..MAX_TABLE_ENTRIES {
+        let entry_offset = offset_in_section + entry_idx * 4;
+        if entry_offset + 4 > section_data.len() {
+            break;
         }
+
+        // Stop before the next table starts (avoid overlapping relocations)
+        let entry_vaddr = table_base + (entry_idx * 4) as u64;
+        if next_table.is_some_and(|next| entry_vaddr >= next) {
+            break;
+        }
+
+        // target = table_base + i32_value, matching the code pattern:
+        //   lea base, [rip+table]; movsxd off, [base+idx*4]; add off, base; jmp off
+        let i32_offset = i32::from_le_bytes(
+            section_data[entry_offset..entry_offset + 4]
+                .try_into()
+                .expect("4-byte window"),
+        );
+        let target = (table_base as i64 + i32_offset as i64) as u64;
+
+        // A switch table only ever branches to blocks of the function that owns
+        // it, so that function's extent is the table's real end marker. The
+        // tables of consecutive functions sit back to back in .rodata, and the
+        // first entry of the next one still looks plausible on its own (a nearby
+        // address in some text section), so without this bound a table runs on
+        // into its neighbour and claims the neighbour's entries as its own.
+        // Those stolen entries get relocated against the wrong function, and the
+        // real owner's table is then dropped as a duplicate — leaving its
+        // dispatch to jump through offsets that only made sense in the original
+        // library.
+        if target < func_base || target >= func_base.saturating_add(func_size) {
+            break;
+        }
+
+        targets.push(target);
     }
-    None
+
+    Some(targets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_TABLE_ENTRIES, scan_table_entries};
+
+    const SECTION_ADDR: u64 = 0x7e000;
+    const FUNC_BASE: u64 = 0x3350;
+    const FUNC_SIZE: u64 = 0x100;
+
+    /// Build a section holding one table of `in_func` entries pointing into
+    /// `FUNC_BASE`, immediately followed by a second table belonging to a
+    /// function that starts at `other_func`.
+    fn section_with_two_tables(table_base: u64, in_func: usize, other_func: u64) -> Vec<u8> {
+        let mut data = vec![0u8; 0x1000];
+        let mut write = |idx: usize, target: u64| {
+            let off = (table_base - SECTION_ADDR) as usize + idx * 4;
+            let rel = (target as i64 - table_base as i64) as i32;
+            data[off..off + 4].copy_from_slice(&rel.to_le_bytes());
+        };
+        for idx in 0..in_func {
+            write(idx, FUNC_BASE + 0x10 + (idx as u64 % (FUNC_SIZE - 0x10)));
+        }
+        for idx in in_func..in_func + 32 {
+            write(idx, other_func + (idx - in_func) as u64 * 2);
+        }
+        data
+    }
+
+    #[test]
+    fn stops_at_the_end_of_the_owning_function() {
+        let table_base = SECTION_ADDR + 0x914;
+        let data = section_with_two_tables(table_base, 32, 0xd254);
+        let targets =
+            scan_table_entries(&data, SECTION_ADDR, table_base, FUNC_BASE, FUNC_SIZE, None)
+                .unwrap();
+        // Without the bound this would run on into the neighbouring function's
+        // table and report 64 entries.
+        assert_eq!(targets.len(), 32);
+        assert!(
+            targets
+                .iter()
+                .all(|&t| (FUNC_BASE..FUNC_BASE + FUNC_SIZE).contains(&t)),
+            "{targets:#x?}"
+        );
+    }
+
+    #[test]
+    fn a_table_owned_by_another_function_yields_nothing() {
+        // The same .rodata run, but scanned on behalf of the function that owns
+        // the *first* table: the second table's entries must not be claimed.
+        let table_base = SECTION_ADDR + 0x914;
+        let data = section_with_two_tables(table_base, 32, 0xd254);
+        let second = table_base + 32 * 4;
+        let targets =
+            scan_table_entries(&data, SECTION_ADDR, second, FUNC_BASE, FUNC_SIZE, None).unwrap();
+        assert!(targets.is_empty(), "{targets:#x?}");
+    }
+
+    #[test]
+    fn stops_at_the_next_detected_table() {
+        let table_base = SECTION_ADDR + 0x100;
+        let data = section_with_two_tables(table_base, 64, 0xd254);
+        let targets = scan_table_entries(
+            &data,
+            SECTION_ADDR,
+            table_base,
+            FUNC_BASE,
+            FUNC_SIZE,
+            Some(table_base + 10 * 4),
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 10);
+    }
+
+    #[test]
+    fn stops_at_the_end_of_the_section() {
+        // Table starts 12 bytes before the end of the section.
+        let mut data = vec![0u8; 0x100];
+        let table_base = SECTION_ADDR + 0xf4;
+        for idx in 0..3 {
+            let off = 0xf4 + idx * 4;
+            let rel = (FUNC_BASE as i64 - table_base as i64) as i32;
+            data[off..off + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        let targets =
+            scan_table_entries(&data, SECTION_ADDR, table_base, FUNC_BASE, FUNC_SIZE, None)
+                .unwrap();
+        assert_eq!(targets.len(), 3);
+    }
+
+    #[test]
+    fn caps_the_entry_count() {
+        // Every entry is in range, so only MAX_TABLE_ENTRIES stops the walk.
+        let table_base = SECTION_ADDR;
+        let mut data = Vec::new();
+        for _ in 0..MAX_TABLE_ENTRIES * 2 {
+            let rel = (FUNC_BASE as i64 - table_base as i64) as i32;
+            data.extend_from_slice(&rel.to_le_bytes());
+        }
+        let targets =
+            scan_table_entries(&data, SECTION_ADDR, table_base, FUNC_BASE, FUNC_SIZE, None)
+                .unwrap();
+        assert_eq!(targets.len(), MAX_TABLE_ENTRIES);
+    }
+
+    #[test]
+    fn rejects_a_table_base_outside_the_section() {
+        let data = vec![0u8; 0x100];
+        assert!(
+            scan_table_entries(
+                &data,
+                SECTION_ADDR,
+                SECTION_ADDR - 4,
+                FUNC_BASE,
+                FUNC_SIZE,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            scan_table_entries(
+                &data,
+                SECTION_ADDR,
+                SECTION_ADDR + 0xfe,
+                FUNC_BASE,
+                FUNC_SIZE,
+                None
+            )
+            .is_none()
+        );
+    }
 }
