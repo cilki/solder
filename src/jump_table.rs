@@ -70,31 +70,15 @@ pub fn detect_jump_tables(
     base_vaddr: u64,
     symbol_name: &str,
     elf: &object::read::elf::ElfFile64<'_>,
-    _lib_bytes: &[u8],
 ) -> Result<Vec<JumpTable>> {
     if code.len() < 16 {
-        return Ok(Vec::new());
-    }
-
-    // Quick check: does this function contain any indirect branches?
-    let mut decoder = Decoder::with_ip(64, code, base_vaddr, DecoderOptions::NONE);
-    let mut has_indirect = false;
-    let mut instr = Instruction::default();
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instr);
-        if instr.flow_control() == FlowControl::IndirectBranch {
-            has_indirect = true;
-            break;
-        }
-    }
-
-    if !has_indirect {
         return Ok(Vec::new());
     }
 
     debug!(symbol = symbol_name, "Scanning for jump tables");
 
     // Symbolic execution pass
+    let mut instr = Instruction::default();
     let mut regs: HashMap<Register, AbstractValue> = HashMap::new();
     let mut confirmed_bases: HashSet<u64> = HashSet::new();
 

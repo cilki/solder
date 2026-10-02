@@ -131,13 +131,13 @@ fn run() -> Result<()> {
         info!(
             section_kind=?u.section_kind,
             name=u.name,
-            size=u.size,
+            size=u.bytes.len(),
             relocations=u.relocations.len(),
             source=%u.source_lib.display(),
             "Extracted unit"
         );
     }
-    let total: usize = units.iter().map(|u| u.size).sum();
+    let total: usize = units.iter().map(|u| u.bytes.len()).sum();
     info!(
         total_bytes = total,
         units = units.len(),

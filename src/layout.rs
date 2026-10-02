@@ -231,11 +231,11 @@ fn assign_addresses(
             trace!(
                 name = unit.name,
                 unit_id = unit.id.0,
-                size = format_args!("{:#x}", unit.size),
+                size = format_args!("{:#x}", unit.bytes.len()),
                 vaddr = format_args!("{:#x}", assigned_vaddr),
                 "Assigned unit VA"
             );
-            *offset += unit.size as u64;
+            *offset += unit.bytes.len() as u64;
             AssignedUnit {
                 unit,
                 assigned_vaddr,
