@@ -1466,6 +1466,22 @@ fn collect_dynamic_range_relocs(
                 }
                 pending_relocs.push((relocations.len(), dep_key));
                 RelocTarget::MergedUnit(UnitId(u32::MAX))
+            } else if let Some((blob_id, blob_base, blob_deps)) =
+                ensure_data_blob_extracted(elf64, index, addend_va, lib, state)?
+            {
+                // No symbol and no unwind info describe the target, but it does
+                // live in a data section we can copy wholesale — most often a
+                // string or a struct in .rodata that a pointer table in
+                // .data.rel.ro points at (ncurses' `strnames` is a table of
+                // several hundred of these). Pulling that section in and
+                // retargeting the pointer at it is the only way the copied
+                // table keeps working once the library is gone.
+                for dep in blob_deps {
+                    if !new_deps.iter().any(|k| k.sym == dep.sym) {
+                        new_deps.push(dep);
+                    }
+                }
+                RelocTarget::DataBlobOffset(blob_id, addend_va - blob_base)
             } else {
                 warn!(
                     ctx,
@@ -1525,6 +1541,25 @@ fn ensure_data_blob_extracted(
         return Ok(Some((info.id, info.base_vaddr, Vec::new())));
     }
 
+    // Claim the blob's id and register it *before* collecting its relocations.
+    // Resolving those relocations can lead back to this same section — directly
+    // (a pointer in .data to the start of .data) or through another section
+    // whose own pointers come back here — and `find_existing_data_blob` has to
+    // be able to see the blob while that happens. Registering afterwards made
+    // such a target look unresolvable, and the copied bytes kept the library's
+    // own load-time VA, which points into unmapped memory once the library is
+    // dropped from DT_NEEDED. It also bounds the mutual recursion with
+    // `collect_dynamic_range_relocs` at one visit per section.
+    let id = state.alloc_id();
+    state.data_blobs.insert(
+        blob_key,
+        DataBlobInfo {
+            id,
+            base_vaddr: sec_addr,
+            size: sec_size,
+        },
+    );
+
     // Collect relocations that fall within this data section's byte range.
     let mut relocations: Vec<ExtractedReloc> = Vec::new();
     let mut new_deps: Vec<UnitKey> = Vec::new();
@@ -1545,9 +1580,6 @@ fn ensure_data_blob_extracted(
         &mut pending_relocs,
         &mut got_fixup_offsets,
     )?;
-
-    // Extract the entire section as a blob
-    let id = state.alloc_id();
 
     // Register pending relocations for this data blob
     for (reloc_idx, dep_key) in pending_relocs {
@@ -1594,14 +1626,6 @@ fn ensure_data_blob_extracted(
     };
 
     state.units.push(unit);
-    state.data_blobs.insert(
-        blob_key,
-        DataBlobInfo {
-            id,
-            base_vaddr: sec_addr,
-            size: sec_size,
-        },
-    );
 
     Ok(Some((id, sec_addr, new_deps)))
 }
@@ -1768,4 +1792,135 @@ fn extract_init_fini_arrays(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> ExtractionState {
+        ExtractionState {
+            extracted: HashMap::new(),
+            units: Vec::new(),
+            pending: Vec::new(),
+            next_id: 0,
+            external_syms: HashSet::new(),
+            cross_lib_syms: HashMap::new(),
+            exe_defined_syms: HashSet::new(),
+            processed_libs: HashSet::new(),
+            init_fini: InitFiniArrays::default(),
+            data_blobs: HashMap::new(),
+            got_slot_fixups: Vec::new(),
+            lib_bytes_cache: HashMap::new(),
+            lib_index_cache: HashMap::new(),
+            plt_map_cache: HashMap::new(),
+        }
+    }
+
+    fn test_lib(name: &str) -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs")).join(name)
+    }
+
+    /// Every R_X86_64_RELATIVE slot inside an extracted unit has to come out
+    /// with a relocation of its own. The copied bytes still hold the library's
+    /// link-time address, so a slot that keeps its original value points into
+    /// memory that is no longer mapped once the library leaves DT_NEEDED.
+    ///
+    /// `strnames` is ncurses' table of 414 pointers into `.rodata`, none of
+    /// which has a symbol or unwind info of its own — exactly the shape that
+    /// used to resolve to nothing and get left stale.
+    #[test]
+    fn every_relative_slot_in_a_pointer_table_is_retargeted() {
+        let lib = test_lib("libtinfo.so.6");
+        let key = UnitKey {
+            lib: lib.clone(),
+            sym: "strnames".to_string(),
+        };
+        let mut state = test_state();
+        process_symbol(&key, &mut state).expect("extract strnames");
+
+        let unit = state
+            .units
+            .iter()
+            .find(|u| u.name == "strnames")
+            .expect("strnames unit")
+            .clone();
+        assert_eq!(unit.size % 8, 0);
+        let slots = unit.size / 8;
+        assert!(slots > 400, "expected a large table, got {slots} slots");
+
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = object::File::parse(&*bytes).expect("parse library");
+        let object::File::Elf64(elf64) = &elf else {
+            panic!("not ELF64")
+        };
+        let sym_vaddr = state.lib_index(&lib, elf64).by_name["strnames"].vaddr;
+
+        let relative_slots: Vec<u64> = elf64
+            .dynamic_relocations()
+            .expect("dynamic relocations")
+            .filter(|(roff, reloc)| {
+                *roff >= sym_vaddr
+                    && *roff < sym_vaddr + unit.size as u64
+                    && matches!(reloc.target(), object::RelocationTarget::Absolute)
+            })
+            .map(|(roff, _)| roff - sym_vaddr)
+            .collect();
+        assert!(
+            relative_slots.len() > 400,
+            "expected the table to be relocated, got {} entries",
+            relative_slots.len()
+        );
+
+        for offset in relative_slots {
+            let reloc = unit
+                .relocations
+                .iter()
+                .find(|r| r.offset_within_unit == offset)
+                .unwrap_or_else(|| {
+                    panic!("slot {offset:#x} of strnames kept its stale library address")
+                });
+            // The target is a `.rodata` string, so it must land in the copied
+            // blob rather than being deferred to ld.so as an external.
+            assert!(
+                matches!(reloc.target, RelocTarget::DataBlobOffset(..)),
+                "slot {offset:#x} resolved to {:?}",
+                reloc.target
+            );
+        }
+    }
+
+    /// A pointer in `.data` that points back into `.data` has to resolve to the
+    /// blob being built, not fall through as unresolvable because the blob is
+    /// not registered yet.
+    #[test]
+    fn a_data_section_pointing_into_itself_resolves_to_its_own_blob() {
+        let lib = test_lib("libpcre2-8.so.0");
+        let mut state = test_state();
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = object::File::parse(&*bytes).expect("parse library");
+        let object::File::Elf64(elf64) = &elf else {
+            panic!("not ELF64")
+        };
+        let index = state.lib_index(&lib, elf64);
+        let data = elf64.section_by_name(".data").expect(".data").address();
+
+        let (blob_id, base, _) = ensure_data_blob_extracted(elf64, &index, data, &lib, &mut state)
+            .expect("extract .data")
+            .expect(".data is extractable");
+        assert_eq!(base, data);
+
+        let unit = state
+            .units
+            .iter()
+            .find(|u| u.id == blob_id)
+            .expect("blob unit");
+        assert!(
+            unit.relocations.iter().any(|r| matches!(
+                r.target,
+                RelocTarget::DataBlobOffset(id, _) if id == blob_id
+            )),
+            "no self-referential pointer resolved to the blob itself"
+        );
+    }
 }
