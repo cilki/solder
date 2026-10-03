@@ -303,7 +303,7 @@ fn print_merge_plan(
     for au in plan.all_units() {
         let stats = per_lib.entry(au.unit.source_lib.as_path()).or_default();
         stats.units += 1;
-        stats.bytes += au.unit.size;
+        stats.bytes += au.unit.bytes.len();
     }
 
     println!("Merge plan for {}", input.display());
