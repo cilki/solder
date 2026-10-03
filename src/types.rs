@@ -172,7 +172,8 @@ pub struct ExtractedUnit {
     pub id: UnitId,
     pub name: String,
     pub source_lib: PathBuf,
-    pub size: usize,
+    /// The unit's contents; `bytes.len()` is the space it occupies in the
+    /// merged segment.
     pub bytes: Vec<u8>,
     pub section_kind: SectionKind,
     /// Required alignment in bytes.
@@ -249,13 +250,8 @@ impl MergePlan {
     /// Total size in bytes of the merged segment (all units + trampolines + init/fini arrays).
     pub fn segment_size(&self) -> usize {
         let mut sz = 0usize;
-        for u in self
-            .text_units
-            .iter()
-            .chain(&self.rodata_units)
-            .chain(&self.data_units)
-        {
-            let end = (u.assigned_vaddr - self.load_address) as usize + u.unit.size;
+        for u in self.all_units() {
+            let end = (u.assigned_vaddr - self.load_address) as usize + u.unit.bytes.len();
             if end > sz {
                 sz = end;
             }

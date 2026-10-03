@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
+use indexmap::IndexSet;
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
@@ -119,13 +120,36 @@ impl ExtractionState {
     }
 
     /// Return the PLT map for `lib`, building and caching it on first use.
-    fn plt_map(&mut self, lib: &Path, lib_bytes: &[u8]) -> Rc<PltMap> {
+    fn plt_map(&mut self, lib: &Path, lib_bytes: Rc<Vec<u8>>) -> Rc<PltMap> {
         if let Some(m) = self.plt_map_cache.get(lib) {
             return Rc::clone(m);
         }
         let m = Rc::new(PltMap::build(lib_bytes));
         self.plt_map_cache.insert(lib.to_path_buf(), Rc::clone(&m));
         m
+    }
+
+    /// Zero the copied GOT slots at `slots` within `bytes` and register a fixup
+    /// for each: the copied bytes hold stale library VAs, and ld.so's GLOB_DAT
+    /// overwrites them at startup anyway (see `GotSlotFixup`).
+    fn register_got_slot_fixups(
+        &mut self,
+        unit: UnitId,
+        bytes: &mut [u8],
+        slots: Vec<(u64, String, bool)>,
+    ) {
+        for (offset, name, weak) in slots {
+            let off = offset as usize;
+            if off + 8 <= bytes.len() {
+                bytes[off..off + 8].fill(0);
+            }
+            self.got_slot_fixups.push(GotSlotFixup {
+                unit,
+                offset,
+                name,
+                weak,
+            });
+        }
     }
 }
 
@@ -231,9 +255,51 @@ pub fn extract_units(
     Ok((state.units, state.init_fini, state.got_slot_fixups))
 }
 
+/// Record a dependency on `dep_key`, queue the relocation that will be pushed
+/// at index `reloc_idx` for second-pass resolution, and hand back the
+/// placeholder target to store in it until then. The three steps have to stay
+/// in lockstep — the pending entry is keyed by the relocation's index — so they
+/// live in one place.
+fn depend_on(
+    dep_key: UnitKey,
+    reloc_idx: usize,
+    new_deps: &mut IndexSet<UnitKey>,
+    pending_relocs: &mut Vec<(usize, UnitKey)>,
+) -> RelocTarget {
+    new_deps.insert(dep_key.clone());
+    pending_relocs.push((reloc_idx, dep_key));
+    RelocTarget::MergedUnit(UnitId(u32::MAX))
+}
+
+/// Reject relocation kinds that need a GOT we cannot reproduce. `ctx` names the
+/// symbol or section being extracted.
+fn reject_got_reloc(
+    kind: object::RelocationKind,
+    encoding: object::RelocationEncoding,
+    ctx: &str,
+    lib: &Path,
+) -> Result<()> {
+    if matches!(
+        kind,
+        object::RelocationKind::Got
+            | object::RelocationKind::GotRelative
+            | object::RelocationKind::GotBaseRelative
+            | object::RelocationKind::GotBaseOffset
+    ) {
+        bail!(
+            "'{}' in {}: {} relocation is not supported in Tier 1; \
+             recompile the library with an older toolchain or wait for Tier 2 support",
+            ctx,
+            lib.display(),
+            describe_reloc(kind, encoding)
+        );
+    }
+    Ok(())
+}
+
 /// Process a single symbol: extract its bytes, parse its relocations, and
 /// return new symbols to enqueue.
-fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<UnitKey>> {
+fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet<UnitKey>> {
     let lib_bytes = state.lib_bytes(&key.lib)?;
 
     let object_file = object::File::parse(lib_bytes.as_slice())
@@ -245,7 +311,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
 
     let lib_index = state.lib_index(&key.lib, elf64);
 
-    let mut new_deps: Vec<UnitKey> = Vec::new();
+    let mut new_deps: IndexSet<UnitKey> = IndexSet::new();
 
     // Extract init/fini arrays from this library if we haven't already. Each
     // constructor/destructor becomes an extraction root of its own: when the
@@ -261,13 +327,10 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
             .iter()
             .chain(&lib_init_fini.fini_entries)
         {
-            let dep_key = UnitKey {
+            new_deps.insert(UnitKey {
                 lib: entry.source_lib.clone(),
                 sym: entry.unit_name.clone(),
-            };
-            if !new_deps.contains(&dep_key) {
-                new_deps.push(dep_key);
-            }
+            });
         }
         state
             .init_fini
@@ -347,19 +410,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
         // Validate relocation kind.
         let kind = reloc.kind();
         let encoding = reloc.encoding();
-        if kind == object::RelocationKind::Got
-            || kind == object::RelocationKind::GotRelative
-            || kind == object::RelocationKind::GotBaseRelative
-            || kind == object::RelocationKind::GotBaseOffset
-        {
-            bail!(
-                "symbol '{}' in {}: {} relocation is not supported in Tier 1; \
-                 recompile the library with an older toolchain or wait for Tier 2 support",
-                key.sym,
-                key.lib.display(),
-                describe_reloc(kind, encoding)
-            );
-        }
+        reject_got_reloc(kind, encoding, &key.sym, &key.lib)?;
 
         // Resolve the relocation target symbol.
         let target_sym = match reloc.target() {
@@ -383,14 +434,12 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         lib: other_lib,
                         sym: ts_name,
                     };
-                    if !new_deps
-                        .iter()
-                        .any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib)
-                    {
-                        new_deps.push(dep_key.clone());
-                    }
-                    pending_relocs.push((relocations.len(), dep_key));
-                    RelocTarget::MergedUnit(UnitId(u32::MAX))
+                    depend_on(
+                        dep_key,
+                        relocations.len(),
+                        &mut new_deps,
+                        &mut pending_relocs,
+                    )
                 } else {
                     bail!(
                         "symbol '{}' in {}: references external symbol '{}' which is not \
@@ -415,11 +464,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                         ensure_data_blob_extracted(elf64, &lib_index, ts_vaddr, &key.lib, state);
                     if let Ok(Some((blob_id, blob_base, blob_deps))) = extract_result {
                         let offset_in_blob = ts_vaddr - blob_base;
-                        for dep in blob_deps {
-                            if !new_deps.iter().any(|k| k.sym == dep.sym) {
-                                new_deps.push(dep);
-                            }
-                        }
+                        new_deps.extend(blob_deps);
                         RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
                     } else {
                         // It's a code symbol or unknown - extract as a unit
@@ -427,13 +472,12 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             lib: key.lib.clone(),
                             sym: ts_name,
                         };
-                        if !new_deps.iter().any(|k| k.sym == dep_key.sym) {
-                            new_deps.push(dep_key.clone());
-                        }
-                        // Track for later resolution
-                        pending_relocs.push((relocations.len(), dep_key));
-                        // Placeholder — resolved in second pass.
-                        RelocTarget::MergedUnit(UnitId(u32::MAX))
+                        depend_on(
+                            dep_key,
+                            relocations.len(),
+                            &mut new_deps,
+                            &mut pending_relocs,
+                        )
                     }
                 }
             }
@@ -475,7 +519,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
     // Scan for RIP-relative references (calls, jumps, and data accesses).
     // Create synthetic relocations for each reference so they get patched correctly.
     if section_kind == SectionKind::Text {
-        let plt_map = state.plt_map(&key.lib, lib_bytes.as_slice());
+        let plt_map = state.plt_map(&key.lib, Rc::clone(&lib_bytes));
         let rip_refs = scan_rip_relative_refs(&bytes, sym_vaddr);
         for rip_ref in rip_refs {
             let target_addr = rip_ref.target_vaddr;
@@ -517,24 +561,22 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             target: RelocTarget::External(ext_name),
                         });
                     } else if let Some(other_lib) = state.cross_lib_syms.get(&ext_name).cloned() {
-                        let dep_key = UnitKey {
-                            lib: other_lib,
-                            sym: ext_name,
-                        };
-                        if !new_deps
-                            .iter()
-                            .any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib)
-                        {
-                            new_deps.push(dep_key.clone());
-                        }
-                        pending_relocs.push((relocations.len(), dep_key));
+                        let target = depend_on(
+                            UnitKey {
+                                lib: other_lib,
+                                sym: ext_name,
+                            },
+                            relocations.len(),
+                            &mut new_deps,
+                            &mut pending_relocs,
+                        );
                         relocations.push(ExtractedReloc {
                             offset_within_unit: rip_ref.offset as u64,
                             kind: object::RelocationKind::Relative,
                             encoding: object::RelocationEncoding::Generic,
                             size: reloc_size,
                             addend: reloc_addend,
-                            target: RelocTarget::MergedUnit(UnitId(u32::MAX)),
+                            target,
                         });
                     } else {
                         // Not in exe and not in merged libs: a libc/runtime
@@ -565,15 +607,15 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             .then(|| (anon_unit_name(target_addr), 0))
                     });
                     if let Some((target_name, offset_in_target)) = dep {
-                        let dep_key = UnitKey {
-                            lib: key.lib.clone(),
-                            sym: target_name,
-                        };
-                        if !new_deps.iter().any(|k| k.sym == dep_key.sym) {
-                            new_deps.push(dep_key.clone());
-                        }
-                        // Track for later resolution
-                        pending_relocs.push((relocations.len(), dep_key));
+                        let target = depend_on(
+                            UnitKey {
+                                lib: key.lib.clone(),
+                                sym: target_name,
+                            },
+                            relocations.len(),
+                            &mut new_deps,
+                            &mut pending_relocs,
+                        );
                         // Add synthetic PC-relative relocation. The relocator
                         // computes S + A - P against the unit's base, so an
                         // interior target is reached through the addend.
@@ -583,7 +625,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                             encoding: object::RelocationEncoding::Generic,
                             size: reloc_size,
                             addend: reloc_addend + offset_in_target as i64,
-                            target: RelocTarget::MergedUnit(UnitId(u32::MAX)),
+                            target,
                         });
                     } else {
                         warn!(
@@ -604,21 +646,22 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                 if let Some((target_name, offset_in_target)) =
                     resolve_owning_unit(elf64, &lib_index, target_addr)
                 {
-                    let dep_key = UnitKey {
-                        lib: key.lib.clone(),
-                        sym: target_name,
-                    };
-                    if !new_deps.iter().any(|k| k.sym == dep_key.sym) {
-                        new_deps.push(dep_key.clone());
-                    }
-                    pending_relocs.push((relocations.len(), dep_key));
+                    let target = depend_on(
+                        UnitKey {
+                            lib: key.lib.clone(),
+                            sym: target_name,
+                        },
+                        relocations.len(),
+                        &mut new_deps,
+                        &mut pending_relocs,
+                    );
                     relocations.push(ExtractedReloc {
                         offset_within_unit: rip_ref.offset as u64,
                         kind: object::RelocationKind::Relative,
                         encoding: object::RelocationEncoding::Generic,
                         size: 32,
                         addend: rip_ref.addend + offset_in_target as i64,
-                        target: RelocTarget::MergedUnit(UnitId(u32::MAX)),
+                        target,
                     });
                     continue;
                 }
@@ -627,11 +670,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
                     ensure_data_blob_extracted(elf64, &lib_index, target_addr, &key.lib, state)?
                 {
                     let offset_in_blob = target_addr - blob_base;
-                    for dep in blob_deps {
-                        if !new_deps.iter().any(|k| k.sym == dep.sym) {
-                            new_deps.push(dep);
-                        }
-                    }
+                    new_deps.extend(blob_deps);
                     // Add synthetic PC-relative relocation pointing to data blob
                     relocations.push(ExtractedReloc {
                         offset_within_unit: rip_ref.offset as u64,
@@ -655,13 +694,8 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
 
     // Jump table detection via symbolic execution
     if section_kind == SectionKind::Text
-        && let Ok(jump_tables) = crate::jump_table::detect_jump_tables(
-            &bytes,
-            sym_vaddr,
-            &key.sym,
-            elf64,
-            lib_bytes.as_slice(),
-        )
+        && let Ok(jump_tables) =
+            crate::jump_table::detect_jump_tables(&bytes, sym_vaddr, &key.sym, elf64)
     {
         if !jump_tables.is_empty() {
             debug!(
@@ -676,11 +710,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
             if let Some((blob_id, blob_base, blob_deps)) =
                 ensure_data_blob_extracted(elf64, &lib_index, table.table_vaddr, &key.lib, state)?
             {
-                for dep in blob_deps {
-                    if !new_deps.iter().any(|k| k.sym == dep.sym) {
-                        new_deps.push(dep);
-                    }
-                }
+                new_deps.extend(blob_deps);
                 // 2. Create relocations for each table entry
                 for (idx, target_addr) in table.targets.iter().enumerate() {
                     let entry_offset_in_blob = (table.table_vaddr - blob_base) + (idx * 4) as u64;
@@ -756,7 +786,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
     // alignment padding that follows the branch instead.
     // (Reloc indices are preserved, so pending resolutions stay valid.)
     let mut bytes = bytes;
-    let mut sym_size = sym_size;
     for reloc in relocations.iter_mut() {
         if reloc.size != 8 {
             continue;
@@ -765,7 +794,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
         let end_off = bytes.len();
         let veneer_off = if end_off as i64 - (disp_off as i64 + 1) <= i8::MAX as i64 {
             bytes.extend_from_slice(&[0xe9, 0, 0, 0, 0]);
-            sym_size = bytes.len();
             end_off
         } else if let Some(slot) = find_padding_slot(&bytes, disp_off + 1, 5) {
             bytes[slot..slot + 5].copy_from_slice(&[0xe9, 0, 0, 0, 0]);
@@ -797,25 +825,12 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<Vec<Unit
         state.pending.push((id, reloc_idx, dep_key));
     }
 
-    // Zero re-resolved GOT slots and register their fixups (see GotSlotFixup).
-    for (offset, name, weak) in got_fixup_offsets {
-        let off = offset as usize;
-        if off + 8 <= bytes.len() {
-            bytes[off..off + 8].fill(0);
-        }
-        state.got_slot_fixups.push(GotSlotFixup {
-            unit: id,
-            offset,
-            name,
-            weak,
-        });
-    }
+    state.register_got_slot_fixups(id, &mut bytes, got_fixup_offsets);
 
     state.units.push(ExtractedUnit {
         id,
         name: key.sym.clone(),
         source_lib: key.lib.clone(),
-        size: sym_size,
         bytes,
         section_kind,
         alignment,
@@ -1173,34 +1188,31 @@ fn scan_rip_relative_refs(bytes: &[u8], base_vaddr: u64) -> Vec<RipRelativeRef> 
 /// cost. This captures the small amount that lookup actually needs so it can be
 /// built once per library.
 struct PltMap {
-    /// Byte ranges of the library's PLT sections (start_va, end_va).
-    plt_ranges: Vec<(u64, u64)>,
+    /// Each PLT section's (start_va, file_offset, size), so a stub's address can
+    /// be recognised and its bytes located without reparsing.
+    plt_spans: Vec<(u64, u64, u64)>,
     /// GOT slot VA → external symbol name, from JUMP_SLOT/GLOB_DAT relocations.
     got_to_name: HashMap<u64, String>,
     /// Symbol address → name (dynsym), for the fallback path.
     addr_to_name: HashMap<u64, String>,
-    /// Raw library bytes (needed to read a stub's disp32 at lookup time).
-    bytes: Vec<u8>,
-    /// Copy of each PLT section's (start_va, file_offset, size) so a stub's
-    /// bytes can be located without reparsing.
-    plt_file_spans: Vec<(u64, u64, u64)>,
+    /// Raw library bytes (needed to read a stub's disp32 at lookup time), shared
+    /// with `ExtractionState::lib_bytes_cache`.
+    bytes: Rc<Vec<u8>>,
 }
 
 impl PltMap {
-    fn build(lib_bytes: &[u8]) -> Self {
-        let mut plt_ranges = Vec::new();
-        let mut plt_file_spans = Vec::new();
+    fn build(lib_bytes: Rc<Vec<u8>>) -> Self {
+        let mut plt_spans = Vec::new();
         let mut got_to_name = HashMap::new();
         let mut addr_to_name = HashMap::new();
 
-        if let Ok(g) = goblin::elf::Elf::parse(lib_bytes) {
+        if let Ok(g) = goblin::elf::Elf::parse(&lib_bytes) {
             for sh in &g.section_headers {
                 let Some(name) = g.shdr_strtab.get_at(sh.sh_name) else {
                     continue;
                 };
                 if name == ".plt" || name == ".plt.got" || name == ".plt.sec" {
-                    plt_ranges.push((sh.sh_addr, sh.sh_addr + sh.sh_size));
-                    plt_file_spans.push((sh.sh_addr, sh.sh_offset, sh.sh_size));
+                    plt_spans.push((sh.sh_addr, sh.sh_offset, sh.sh_size));
                 }
             }
 
@@ -1227,27 +1239,18 @@ impl PltMap {
         }
 
         PltMap {
-            plt_ranges,
+            plt_spans,
             got_to_name,
             addr_to_name,
-            bytes: lib_bytes.to_vec(),
-            plt_file_spans,
+            bytes: lib_bytes,
         }
     }
 
     /// If `addr` lands in a PLT stub, return the external symbol it resolves to.
     fn target(&self, addr: u64) -> Option<String> {
-        let in_plt = self
-            .plt_ranges
-            .iter()
-            .any(|&(start, end)| addr >= start && addr < end);
-        if !in_plt {
-            return None;
-        }
-
         // Locate the stub's bytes via the containing PLT section's file span.
         let (sec_addr, sec_off, sec_size) = self
-            .plt_file_spans
+            .plt_spans
             .iter()
             .copied()
             .find(|&(start, _, size)| addr >= start && addr < start + size)?;
@@ -1293,11 +1296,12 @@ fn find_existing_data_blob(addr: u64, state: &ExtractionState) -> Option<(UnitId
     None
 }
 
-/// Find the section containing a given virtual address and return section info.
+/// Find the section containing a given virtual address and return its name,
+/// base vaddr, contents and kind.
 fn find_section_for_address(
     elf: &object::read::elf::ElfFile64<'_>,
     addr: u64,
-) -> Option<(String, u64, usize, Vec<u8>, SectionKind)> {
+) -> Option<(String, u64, Vec<u8>, SectionKind)> {
     for section in elf.sections() {
         let sec_addr = section.address();
         let sec_size = section.size();
@@ -1319,7 +1323,7 @@ fn find_section_for_address(
                 } else {
                     section.data().ok()?.to_vec()
                 };
-            return Some((name, sec_addr, data.len(), data, kind));
+            return Some((name, sec_addr, data, kind));
         }
     }
     None
@@ -1334,17 +1338,16 @@ fn find_section_for_address(
 ///
 /// Offsets pushed into `relocations`/`got_fixups` are relative to `range_start`.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::ptr_arg)]
 fn collect_dynamic_range_relocs(
     elf64: &object::read::elf::ElfFile64<'_>,
     index: &LibIndex,
-    lib: &PathBuf,
+    lib: &Path,
     ctx: &str,
     range_start: u64,
     range_size: u64,
     state: &mut ExtractionState,
     relocations: &mut Vec<ExtractedReloc>,
-    new_deps: &mut Vec<UnitKey>,
+    new_deps: &mut IndexSet<UnitKey>,
     pending_relocs: &mut Vec<(usize, UnitKey)>,
     got_fixups: &mut Vec<(u64, String, bool)>,
 ) -> Result<()> {
@@ -1366,18 +1369,7 @@ fn collect_dynamic_range_relocs(
         // Validate relocation kind (same as code extraction)
         let kind = reloc.kind();
         let encoding = reloc.encoding();
-        if kind == object::RelocationKind::Got
-            || kind == object::RelocationKind::GotRelative
-            || kind == object::RelocationKind::GotBaseRelative
-            || kind == object::RelocationKind::GotBaseOffset
-        {
-            bail!(
-                "'{}' in {}: {} relocation is not supported in Tier 1",
-                ctx,
-                lib.display(),
-                describe_reloc(kind, encoding)
-            );
-        }
+        reject_got_reloc(kind, encoding, ctx, lib)?;
 
         // Resolve the relocation target symbol. Dynamic relocation symbol
         // indices refer to .dynsym, not .symtab.
@@ -1405,14 +1397,7 @@ fn collect_dynamic_range_relocs(
                         lib: other_lib,
                         sym: ts_name,
                     };
-                    if !new_deps
-                        .iter()
-                        .any(|k| k.sym == dep_key.sym && k.lib == dep_key.lib)
-                    {
-                        new_deps.push(dep_key.clone());
-                    }
-                    pending_relocs.push((relocations.len(), dep_key));
-                    RelocTarget::MergedUnit(UnitId(u32::MAX))
+                    depend_on(dep_key, relocations.len(), new_deps, pending_relocs)
                 } else {
                     // A slot holding an external symbol's address (a copied
                     // GOT slot, or a data pointer to an external). Defer to
@@ -1426,16 +1411,10 @@ fn collect_dynamic_range_relocs(
             } else {
                 // Internal to the library
                 let dep_key = UnitKey {
-                    lib: lib.clone(),
+                    lib: lib.to_path_buf(),
                     sym: ts_name,
                 };
-                if !new_deps.iter().any(|k| k.sym == dep_key.sym) {
-                    new_deps.push(dep_key.clone());
-                }
-                // Track for later resolution
-                pending_relocs.push((relocations.len(), dep_key));
-                // Placeholder — resolved in second pass
-                RelocTarget::MergedUnit(UnitId(u32::MAX))
+                depend_on(dep_key, relocations.len(), new_deps, pending_relocs)
             }
         } else {
             // RELATIVE relocation (no symbol, addend is the target)
@@ -1458,14 +1437,10 @@ fn collect_dynamic_range_relocs(
             {
                 resolved_addend = Some(offset_in_target as i64);
                 let dep_key = UnitKey {
-                    lib: lib.clone(),
+                    lib: lib.to_path_buf(),
                     sym: target_name,
                 };
-                if !new_deps.iter().any(|k| k.sym == dep_key.sym) {
-                    new_deps.push(dep_key.clone());
-                }
-                pending_relocs.push((relocations.len(), dep_key));
-                RelocTarget::MergedUnit(UnitId(u32::MAX))
+                depend_on(dep_key, relocations.len(), new_deps, pending_relocs)
             } else if let Some((blob_id, blob_base, blob_deps)) =
                 ensure_data_blob_extracted(elf64, index, addend_va, lib, state)?
             {
@@ -1476,11 +1451,7 @@ fn collect_dynamic_range_relocs(
                 // several hundred of these). Pulling that section in and
                 // retargeting the pointer at it is the only way the copied
                 // table keeps working once the library is gone.
-                for dep in blob_deps {
-                    if !new_deps.iter().any(|k| k.sym == dep.sym) {
-                        new_deps.push(dep);
-                    }
-                }
+                new_deps.extend(blob_deps);
                 RelocTarget::DataBlobOffset(blob_id, addend_va - blob_base)
             } else {
                 warn!(
@@ -1511,16 +1482,15 @@ fn collect_dynamic_range_relocs(
 
 /// Extract a data section blob if not already extracted.
 /// Returns the blob's UnitId and base vaddr.
-#[allow(clippy::ptr_arg)]
 fn ensure_data_blob_extracted(
     elf64: &object::read::elf::ElfFile64<'_>,
     index: &LibIndex,
     target_addr: u64,
-    lib: &PathBuf,
+    lib: &Path,
     state: &mut ExtractionState,
-) -> Result<Option<(UnitId, u64, Vec<UnitKey>)>> {
+) -> Result<Option<(UnitId, u64, IndexSet<UnitKey>)>> {
     // Find the section containing this address
-    let (sec_name, sec_addr, sec_size, sec_data, sec_kind) =
+    let (sec_name, sec_addr, sec_data, sec_kind) =
         match find_section_for_address(elf64, target_addr) {
             Some(info) => info,
             None => return Ok(None), // Address not in any extractable section
@@ -1532,13 +1502,13 @@ fn ensure_data_blob_extracted(
     }
 
     let blob_key = DataBlobKey {
-        lib: lib.clone(),
+        lib: lib.to_path_buf(),
         section: sec_name.clone(),
     };
 
     // Check if already extracted
     if let Some(info) = state.data_blobs.get(&blob_key) {
-        return Ok(Some((info.id, info.base_vaddr, Vec::new())));
+        return Ok(Some((info.id, info.base_vaddr, IndexSet::new())));
     }
 
     // Claim the blob's id and register it *before* collecting its relocations.
@@ -1556,13 +1526,13 @@ fn ensure_data_blob_extracted(
         DataBlobInfo {
             id,
             base_vaddr: sec_addr,
-            size: sec_size,
+            size: sec_data.len(),
         },
     );
 
     // Collect relocations that fall within this data section's byte range.
     let mut relocations: Vec<ExtractedReloc> = Vec::new();
-    let mut new_deps: Vec<UnitKey> = Vec::new();
+    let mut new_deps: IndexSet<UnitKey> = IndexSet::new();
     let mut pending_relocs: Vec<(usize, UnitKey)> = Vec::new();
     // (offset within blob, symbol name, weak) — becomes GotSlotFixup entries.
     let mut got_fixup_offsets: Vec<(u64, String, bool)> = Vec::new();
@@ -1573,7 +1543,7 @@ fn ensure_data_blob_extracted(
         lib,
         &sec_name,
         sec_addr,
-        sec_size as u64,
+        sec_data.len() as u64,
         state,
         &mut relocations,
         &mut new_deps,
@@ -1594,21 +1564,8 @@ fn ensure_data_blob_extracted(
         );
     }
 
-    // Zero re-resolved GOT slots and register their fixups: the copied bytes
-    // hold stale library VAs and ld.so's GLOB_DAT will overwrite them anyway.
     let mut sec_data = sec_data;
-    for (offset, name, weak) in got_fixup_offsets {
-        let off = offset as usize;
-        if off + 8 <= sec_data.len() {
-            sec_data[off..off + 8].fill(0);
-        }
-        state.got_slot_fixups.push(GotSlotFixup {
-            unit: id,
-            offset,
-            name,
-            weak,
-        });
-    }
+    state.register_got_slot_fixups(id, &mut sec_data, got_fixup_offsets);
 
     let unit = ExtractedUnit {
         id,
@@ -1617,8 +1574,7 @@ fn ensure_data_blob_extracted(
             lib.file_name().unwrap_or_default().to_string_lossy(),
             sec_name
         ),
-        source_lib: lib.clone(),
-        size: sec_size,
+        source_lib: lib.to_path_buf(),
         bytes: sec_data,
         section_kind: sec_kind,
         alignment: 32, // Conservative alignment for data sections
@@ -1845,8 +1801,8 @@ mod tests {
             .find(|u| u.name == "strnames")
             .expect("strnames unit")
             .clone();
-        assert_eq!(unit.size % 8, 0);
-        let slots = unit.size / 8;
+        assert_eq!(unit.bytes.len() % 8, 0);
+        let slots = unit.bytes.len() / 8;
         assert!(slots > 400, "expected a large table, got {slots} slots");
 
         let bytes = std::fs::read(&lib).expect("read library");
@@ -1861,7 +1817,7 @@ mod tests {
             .expect("dynamic relocations")
             .filter(|(roff, reloc)| {
                 *roff >= sym_vaddr
-                    && *roff < sym_vaddr + unit.size as u64
+                    && *roff < sym_vaddr + unit.bytes.len() as u64
                     && matches!(reloc.target(), object::RelocationTarget::Absolute)
             })
             .map(|(roff, _)| roff - sym_vaddr)
