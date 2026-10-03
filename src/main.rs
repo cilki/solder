@@ -201,7 +201,7 @@ fn run() -> Result<()> {
     info!(remove_needed=?plan.remove_needed, "DT_NEEDED entries to remove");
 
     if cli.dry_run {
-        info!("Dry-run: no output written");
+        print_merge_plan(&cli.input, &plan, &imports, &dyn_info.needed);
         return Ok(());
     }
 
@@ -270,6 +270,93 @@ fn run() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Print the merge plan for `--dry-run`.
+///
+/// This goes to stdout directly rather than through `tracing`: previewing the
+/// plan is the whole point of the flag, and the default log filter is `warn`,
+/// so routing it through `info!` meant `solder --dry-run` printed nothing at
+/// all unless the user happened to set `RUST_LOG`.
+fn print_merge_plan(
+    input: &std::path::Path,
+    plan: &types::MergePlan,
+    imports: &[types::ImportedSymbol],
+    needed: &[String],
+) {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct LibStats {
+        symbols: usize,
+        units: usize,
+        bytes: usize,
+    }
+
+    let mut per_lib: BTreeMap<&std::path::Path, LibStats> = BTreeMap::new();
+    for imp in imports {
+        per_lib
+            .entry(imp.source_library.as_path())
+            .or_default()
+            .symbols += 1;
+    }
+    for au in plan.all_units() {
+        let stats = per_lib.entry(au.unit.source_lib.as_path()).or_default();
+        stats.units += 1;
+        stats.bytes += au.unit.size;
+    }
+
+    println!("Merge plan for {}", input.display());
+    println!("  libraries to merge:");
+    for (lib, stats) in &per_lib {
+        println!(
+            "    {} ({} imported symbols, {} units, {} bytes)",
+            lib.display(),
+            stats.symbols,
+            stats.units,
+            stats.bytes
+        );
+    }
+
+    if plan.remove_needed.is_empty() {
+        println!("  no DT_NEEDED entries become removable");
+    } else {
+        println!(
+            "  DT_NEEDED entries removed: {}",
+            plan.remove_needed.join(", ")
+        );
+    }
+    let kept: Vec<&str> = needed
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !plan.remove_needed.iter().any(|r| r == s))
+        .collect();
+    if !kept.is_empty() {
+        println!("  DT_NEEDED entries kept: {}", kept.join(", "));
+    }
+
+    println!(
+        "  new PT_LOAD segment at 0x{:016x}, {} bytes",
+        plan.load_address,
+        plan.segment_size()
+    );
+    println!("  GOT entries patched: {}", plan.got_patches.len());
+    println!(
+        "  trampolines for symbols still resolved at runtime: {}",
+        plan.trampoline_stubs.len()
+    );
+    println!(
+        "  symbols injected into .dynsym: {}",
+        plan.new_externals.len()
+    );
+    if let Some(init_fini) = &plan.init_fini {
+        println!(
+            "  merged constructors: {}, destructors: {}",
+            init_fini.preinit_entries.len(),
+            init_fini.combined_fini_entries.len()
+        );
+    }
+    println!("Dry run: {} left unchanged", input.display());
 }
 
 /// Parse the executable's existing init/fini array info from .dynamic.

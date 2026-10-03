@@ -61,6 +61,44 @@ pub struct ImportInfo {
     pub merged_lib_syms: std::collections::HashMap<String, PathBuf>,
 }
 
+/// Whether a `-m` filter entry selects the given DT_NEEDED soname. A filter
+/// entry may be the full soname (`libz.so.1`) or a prefix of it (`libz.so`,
+/// `libz`), so that callers don't have to know the exact version suffix.
+fn filter_selects(filter_entry: &str, needed: &str) -> bool {
+    needed == filter_entry || needed.starts_with(filter_entry)
+}
+
+/// Reject `-m` entries that cannot possibly take effect.
+///
+/// Without this, a mistyped soname (or one the executable doesn't actually link
+/// against) is silently dropped: solder reports success having merged nothing,
+/// or — worse, when several `-m` flags are given — having merged only the
+/// subset that happened to match.
+fn validate_merge_filter(needed: &[String], filter: &[String]) -> Result<()> {
+    for entry in filter {
+        let matched: Vec<&str> = needed
+            .iter()
+            .filter(|n| filter_selects(entry, n))
+            .map(|n| n.as_str())
+            .collect();
+
+        if matched.is_empty() {
+            anyhow::bail!(
+                "no DT_NEEDED entry matches '{entry}'; this executable needs: {}",
+                needed.join(", ")
+            );
+        }
+        if matched.iter().all(|n| is_excluded(n)) {
+            anyhow::bail!(
+                "'{entry}' only matches never-mergeable libraries ({}); \
+                 they are part of the libc/kernel ABI and must stay dynamic",
+                matched.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn collect_imports(
     elf: &ElfFile64<'_>,
     dyn_info: &DynamicInfo,
@@ -68,6 +106,10 @@ pub fn collect_imports(
     extra_lib_paths: &[PathBuf],
     merge_filter: Option<&[String]>,
 ) -> Result<ImportInfo> {
+    if let Some(filter) = merge_filter {
+        validate_merge_filter(&dyn_info.needed, filter)?;
+    }
+
     let bytes = elf.data();
 
     // Build a map from symbol name → source library path.
@@ -85,9 +127,7 @@ pub fn collect_imports(
             continue;
         }
         if let Some(filter) = merge_filter
-            && !filter
-                .iter()
-                .any(|f| f == needed || needed.starts_with(f.as_str()))
+            && !filter.iter().any(|f| filter_selects(f, needed))
         {
             continue;
         }
@@ -379,4 +419,59 @@ pub fn symbol_is_zero_initialized(lib_path: &std::path::Path, name: &str) -> Res
 
     // Symbol not found as a definition — nothing to preserve.
     Ok(true)
+}
+
+#[cfg(test)]
+mod merge_filter_tests {
+    use super::validate_merge_filter;
+
+    fn needed() -> Vec<String> {
+        ["libpcre2-8.so.0", "libc.so.6"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn filter(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn an_exact_soname_is_accepted() {
+        validate_merge_filter(&needed(), &filter(&["libpcre2-8.so.0"])).expect("exact soname");
+    }
+
+    #[test]
+    fn a_soname_prefix_is_accepted() {
+        validate_merge_filter(&needed(), &filter(&["libpcre2-8"])).expect("soname prefix");
+    }
+
+    #[test]
+    fn a_mistyped_soname_is_rejected_and_lists_the_real_ones() {
+        let err = validate_merge_filter(&needed(), &filter(&["libpcre2.so.0"]))
+            .expect_err("mistyped soname must not be silently ignored");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("libpcre2.so.0"), "{msg}");
+        assert!(msg.contains("libpcre2-8.so.0"), "{msg}");
+    }
+
+    #[test]
+    fn one_bad_entry_rejects_the_whole_invocation() {
+        validate_merge_filter(&needed(), &filter(&["libpcre2-8.so.0", "libz.so.1"]))
+            .expect_err("a partially matching filter must not merge only the matching subset");
+    }
+
+    #[test]
+    fn a_never_mergeable_soname_is_rejected() {
+        let err = validate_merge_filter(&needed(), &filter(&["libc.so.6"]))
+            .expect_err("libc is on the never-merge list");
+        assert!(format!("{err:#}").contains("never-mergeable"), "{err:#}");
+    }
+
+    #[test]
+    fn a_prefix_covering_both_excluded_and_mergeable_libraries_is_accepted() {
+        // "lib" matches libc (excluded) *and* libpcre2 (mergeable), so the
+        // invocation still has something to do.
+        validate_merge_filter(&needed(), &filter(&["lib"])).expect("mixed prefix");
+    }
 }
