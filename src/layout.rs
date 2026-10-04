@@ -47,14 +47,14 @@ pub fn plan_layout(
         data = data.len(),
         "Layout unit counts"
     );
-    let text_units = assign_addresses(load_address, &mut offset, text);
-    let rodata_units = assign_addresses(load_address, &mut offset, rodata);
-    let data_units = assign_addresses(load_address, &mut offset, data);
 
-    // Collect unique External symbol names referenced by any relocation.
+    // Collect unique External symbol names referenced by any relocation. This
+    // happens before any address is handed out because the trampoline stubs
+    // are code: they share the executable run of the segment with the text
+    // units, so they have to be placed before the non-executable units.
     let mut external_names: indexmap::IndexSet<String> = indexmap::IndexSet::new();
-    for au in text_units.iter().chain(&rodata_units).chain(&data_units) {
-        for reloc in &au.unit.relocations {
+    for unit in text.iter().chain(&rodata).chain(&data) {
+        for reloc in &unit.relocations {
             if let RelocTarget::External(name) = &reloc.target {
                 external_names.insert(name.clone());
             }
@@ -65,39 +65,56 @@ pub fn plan_layout(
     // We need these to populate the trampoline stubs.
     let exe_got_vas = build_exe_got_map(exe_elf)?;
 
+    let text_units = assign_addresses(load_address, &mut offset, text);
+
     // Assign VA to each trampoline stub (14 bytes: FF 25 00 00 00 00 + 8 byte addr).
-    // Trampolines are placed after all data units.
     //
     // For each external name we need a GOT slot the loader will fill with the
     // resolved function address; the trampoline does `jmp [got_slot]`. If the
     // executable already imports the symbol, we reuse its existing GOT slot.
-    // Otherwise we allocate a fresh 8-byte slot in the merged segment and
-    // record a NewExternalSym so the writer can inject a matching `.dynsym`
-    // entry and GLOB_DAT relocation.
+    // Otherwise a fresh 8-byte slot is allocated further down, in the writable
+    // run — ld.so writes the resolved address into it, so it cannot sit next
+    // to the code.
     let mut trampoline_stubs: Vec<TrampolineStub> = Vec::new();
-    let mut new_externals: Vec<NewExternalSym> = Vec::new();
+    let mut pending_got_slots: Vec<(usize, String)> = Vec::new();
     for name in &external_names {
-        let target_got_vaddr = if let Some(va) = exe_got_vas.get(name) {
-            *va
-        } else {
-            offset = align_up(offset, 8);
-            let got_vaddr = load_address + offset;
-            offset += 8;
-            new_externals.push(NewExternalSym {
-                name: name.clone(),
-                got_vaddr,
-            });
-            got_vaddr
-        };
         // Align each trampoline to 16 bytes for neatness.
         offset = align_up(offset, 16);
         let vaddr = load_address + offset;
         offset += 14;
+        let target_got_vaddr = match exe_got_vas.get(name) {
+            Some(va) => *va,
+            None => {
+                pending_got_slots.push((trampoline_stubs.len(), name.clone()));
+                0 // patched below, once the slot has an address
+            }
+        };
         trampoline_stubs.push(TrampolineStub {
             symbol_name: name.clone(),
             vaddr,
             target_got_vaddr,
         });
+    }
+
+    // End of the executable run. Padding to a page boundary is what lets the
+    // writer map the code read-execute and everything after it read-write,
+    // instead of one read-write-execute mapping covering the lot.
+    offset = align_up(offset, PAGE_SIZE);
+    let exec_size = offset;
+
+    let rodata_units = assign_addresses(load_address, &mut offset, rodata);
+    let data_units = assign_addresses(load_address, &mut offset, data);
+
+    // Fresh GOT slots for the externals the executable does not already
+    // import, plus the NewExternalSym records the writer turns into .dynsym
+    // entries and GLOB_DAT relocations.
+    let mut new_externals: Vec<NewExternalSym> = Vec::with_capacity(pending_got_slots.len());
+    for (stub_idx, name) in pending_got_slots {
+        offset = align_up(offset, 8);
+        let got_vaddr = load_address + offset;
+        offset += 8;
+        trampoline_stubs[stub_idx].target_got_vaddr = got_vaddr;
+        new_externals.push(NewExternalSym { name, got_vaddr });
     }
 
     // Build GOT patches: one per imported symbol.
@@ -175,6 +192,11 @@ pub fn plan_layout(
         &mut offset,
     )?;
 
+    // End of the writable run; the writer appends the rebuilt read-only
+    // tables and the new program header table after this point.
+    offset = align_up(offset, PAGE_SIZE);
+    let writable_end = offset;
+
     // Resolve copied-GOT-slot fixups now that every unit has an assigned VA.
     let unit_vaddr_by_id: HashMap<crate::types::UnitId, u64> = text_units
         .iter()
@@ -202,6 +224,8 @@ pub fn plan_layout(
     Ok(MergePlan {
         is_pie,
         load_address,
+        exec_size,
+        writable_end,
         text_units,
         rodata_units,
         data_units,
@@ -243,6 +267,9 @@ fn assign_addresses(
         })
         .collect()
 }
+
+/// Page size the merged segment's mappings are aligned to.
+pub const PAGE_SIZE: u64 = 0x1000;
 
 pub fn align_up(value: u64, align: u64) -> u64 {
     if align == 0 {
@@ -411,4 +438,132 @@ fn plan_init_fini_arrays(
         combined_fini_vaddr,
         combined_fini_entries,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::elf_reader::MappedElf;
+    use crate::types::{ExtractedReloc, UnitId};
+
+    fn unit(
+        id: u32,
+        name: &str,
+        kind: SectionKind,
+        len: usize,
+        externals: &[&str],
+    ) -> ExtractedUnit {
+        ExtractedUnit {
+            id: UnitId(id),
+            name: name.to_owned(),
+            source_lib: PathBuf::from("/nonexistent/libtest.so.1"),
+            bytes: vec![0x90; len],
+            section_kind: kind,
+            alignment: 16,
+            relocations: externals
+                .iter()
+                .enumerate()
+                .map(|(i, sym)| ExtractedReloc {
+                    offset_within_unit: (i * 8) as u64,
+                    kind: object::RelocationKind::Relative,
+                    encoding: object::RelocationEncoding::Generic,
+                    size: 32,
+                    addend: -4,
+                    target: RelocTarget::External((*sym).to_owned()),
+                })
+                .collect(),
+        }
+    }
+
+    /// The reason the layout is split in two runs at all: the writer maps the
+    /// leading run read-execute and the rest read-write, so a unit or a
+    /// loader-written GOT slot on the wrong side of the boundary either loses
+    /// write access it needs or gains execute permission it shouldn't have.
+    #[test]
+    fn code_and_loader_written_slots_never_share_a_page() {
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep"));
+        let mapped = MappedElf::open(path).expect("open test/grep");
+        let exe = mapped.parse().expect("parse test/grep");
+
+        // test/grep imports `memcpy`, so that trampoline reuses an existing GOT
+        // slot in the executable; the made-up name has no slot to reuse and so
+        // forces a fresh one inside the merged segment.
+        let units = vec![
+            unit(
+                0,
+                "fn_a",
+                SectionKind::Text,
+                64,
+                &["memcpy", "solder_absent_symbol"],
+            ),
+            unit(1, "ro_a", SectionKind::ReadOnlyData, 32, &[]),
+            unit(2, "data_a", SectionKind::Data, 48, &[]),
+        ];
+
+        let plan = plan_layout(
+            units,
+            &exe,
+            &[],
+            true,
+            InitFiniArrays::default(),
+            ExeInitFiniInfo::default(),
+            &[],
+            Vec::new(),
+        )
+        .expect("plan layout");
+
+        assert_eq!(plan.exec_size % PAGE_SIZE, 0, "exec run not page-aligned");
+        assert_eq!(
+            plan.writable_end % PAGE_SIZE,
+            0,
+            "writable run not page-aligned"
+        );
+        assert!(plan.exec_size > 0 && plan.writable_end > plan.exec_size);
+        assert_eq!(plan.segment_size(), plan.writable_end as usize);
+
+        let code_end = plan.load_address + plan.exec_size;
+        let writable_end = plan.load_address + plan.writable_end;
+
+        for au in &plan.text_units {
+            assert!(
+                au.assigned_vaddr >= plan.load_address
+                    && au.assigned_vaddr + au.unit.bytes.len() as u64 <= code_end,
+                "text unit '{}' is not inside the executable run",
+                au.unit.name
+            );
+        }
+        assert_eq!(plan.trampoline_stubs.len(), 2);
+        for stub in &plan.trampoline_stubs {
+            assert!(
+                stub.vaddr >= plan.load_address && stub.vaddr + 14 <= code_end,
+                "trampoline for '{}' is not inside the executable run",
+                stub.symbol_name
+            );
+        }
+        for au in plan.rodata_units.iter().chain(&plan.data_units) {
+            assert!(
+                au.assigned_vaddr >= code_end
+                    && au.assigned_vaddr + au.unit.bytes.len() as u64 <= writable_end,
+                "unit '{}' is not inside the writable run",
+                au.unit.name
+            );
+        }
+
+        assert_eq!(plan.new_externals.len(), 1, "{:?}", plan.new_externals);
+        let ext = &plan.new_externals[0];
+        assert_eq!(ext.name, "solder_absent_symbol");
+        assert!(
+            ext.got_vaddr >= code_end && ext.got_vaddr + 8 <= writable_end,
+            "GOT slot for '{}' is not inside the writable run",
+            ext.name
+        );
+        // The trampoline has to point at the slot that was actually allocated,
+        // which now happens in a later pass than the stub placement.
+        let stub = plan
+            .trampoline_stubs
+            .iter()
+            .find(|s| s.symbol_name == ext.name)
+            .expect("trampoline for the injected external");
+        assert_eq!(stub.target_got_vaddr, ext.got_vaddr);
+    }
 }

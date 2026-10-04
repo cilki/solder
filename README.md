@@ -73,7 +73,9 @@ solder ./myapp --dry-run
 - Extracts the minimal set of code/data needed
   - Uses symbolic execution to identify jump tables in .rodata
 - Applies relocations and creates trampolines for any remaining external calls
-- Appends a new `PT_LOAD` segment containing the merged code
+- Appends new `PT_LOAD` segments containing the merged code: read-execute for
+  the code and trampolines, read-write for the data and the slots the dynamic
+  loader fills in, read-only for the rebuilt symbol and relocation tables
 - Patches GOT entries to point directly to the merged symbols
 - Removes the merged libraries from `DT_NEEDED`
 

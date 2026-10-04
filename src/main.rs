@@ -336,9 +336,12 @@ fn print_merge_plan(
     }
 
     println!(
-        "  new PT_LOAD segment at 0x{:016x}, {} bytes",
+        "  new mapping at 0x{:016x}, {} bytes: {} read-execute (code, trampolines), \
+         {} read-write (data, loader-written slots)",
         plan.load_address,
-        plan.segment_size()
+        plan.segment_size(),
+        plan.exec_size,
+        plan.writable_end - plan.exec_size
     );
     println!("  GOT entries patched: {}", plan.got_patches.len());
     println!(

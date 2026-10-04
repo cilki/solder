@@ -217,8 +217,19 @@ pub struct GotPatch {
 pub struct MergePlan {
     /// Whether the executable is PIE (ET_DYN).
     pub is_pie: bool,
-    /// Base virtual address of the new PT_LOAD segment.
+    /// Base virtual address of the new PT_LOAD segments.
     pub load_address: u64,
+    /// Size of the leading executable run of the merged segment — the code
+    /// units followed by the trampoline stubs — padded up to a page boundary.
+    /// Nothing at or past this offset is mapped executable, and nothing before
+    /// it is mapped writable, so no page of the merged region is ever both.
+    pub exec_size: u64,
+    /// Offset at which the writable run of the merged segment ends, padded up
+    /// to a page boundary. This covers the data units, the GOT slots the
+    /// dynamic loader fills in, and the init/fini arrays. The writer appends
+    /// the rebuilt `.dynstr`/`.dynsym`/`.gnu.version`/`.rela.dyn` and the new
+    /// program header table after it, in a read-only mapping.
+    pub writable_end: u64,
     pub text_units: Vec<AssignedUnit>,
     pub rodata_units: Vec<AssignedUnit>,
     pub data_units: Vec<AssignedUnit>,
@@ -247,47 +258,11 @@ pub struct MergePlan {
 }
 
 impl MergePlan {
-    /// Total size in bytes of the merged segment (all units + trampolines + init/fini arrays).
+    /// Total size in bytes of the merged segment as laid out: every unit,
+    /// trampoline, injected GOT slot and init/fini array, plus the page
+    /// padding that separates the executable run from the writable one.
     pub fn segment_size(&self) -> usize {
-        let mut sz = 0usize;
-        for u in self.all_units() {
-            let end = (u.assigned_vaddr - self.load_address) as usize + u.unit.bytes.len();
-            if end > sz {
-                sz = end;
-            }
-        }
-        // Trampolines come after, each 14 bytes
-        for t in &self.trampoline_stubs {
-            let end = (t.vaddr - self.load_address) as usize + 14;
-            if end > sz {
-                sz = end;
-            }
-        }
-        // Init/fini arrays come after trampolines, each entry is 8 bytes
-        if let Some(ref init_fini) = self.init_fini {
-            if !init_fini.preinit_entries.is_empty() {
-                let end = (init_fini.preinit_vaddr - self.load_address) as usize
-                    + init_fini.preinit_entries.len() * 8;
-                if end > sz {
-                    sz = end;
-                }
-            }
-            if !init_fini.combined_fini_entries.is_empty() {
-                let end = (init_fini.combined_fini_vaddr - self.load_address) as usize
-                    + init_fini.combined_fini_entries.len() * 8;
-                if end > sz {
-                    sz = end;
-                }
-            }
-        }
-        // New GOT slots for injected external symbols, 8 bytes each.
-        for ext in &self.new_externals {
-            let end = (ext.got_vaddr - self.load_address) as usize + 8;
-            if end > sz {
-                sz = end;
-            }
-        }
-        sz
+        self.writable_end as usize
     }
 
     /// Iterate all assigned units across all section kinds.

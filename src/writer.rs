@@ -124,6 +124,8 @@ pub fn write_output(
     use object::elf::{PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR};
     use object::read::elf::{ElfFile64, ProgramHeader};
 
+    check_runtime_writes_are_writable(plan)?;
+
     let exe = ElfFile64::<object::Endianness>::parse(patched_exe)
         .context("parsing patched executable for output")?;
     let endian = exe.endian();
@@ -152,9 +154,27 @@ pub fn write_output(
         (merged_seg.to_vec(), ExtensionInfo::default())
     };
 
-    // Calculate sizes for embedding PHT within the new PT_LOAD segment.
-    // We need 1 extra entry for the new PT_LOAD itself.
-    let new_phnum = old_phdrs.len() + 1;
+    // The merged region is described by up to three PT_LOADs rather than one
+    // read-write-execute mapping: the code and trampolines, then everything
+    // ld.so writes to at startup, then the rebuilt symbol/relocation tables
+    // and the new program header table. `layout` page-aligned the boundaries
+    // so each mapping starts on a page, and `seg_file_offset` and
+    // `plan.load_address` are both page-aligned, which keeps p_offset and
+    // p_vaddr congruent modulo the page size for all three.
+    //
+    // Each element is the start offset of a mapping within the region; the
+    // mapping runs to the next element's start, or to the end of the region.
+    let mut regions: Vec<(u64, u32)> = Vec::with_capacity(3);
+    if plan.exec_size > 0 {
+        regions.push((0, PF_R | PF_X));
+    }
+    if plan.writable_end > plan.exec_size {
+        regions.push((plan.exec_size, PF_R | PF_W));
+    }
+    regions.push((plan.writable_end, PF_R));
+
+    // Calculate sizes for embedding PHT within the new PT_LOAD segments.
+    let new_phnum = old_phdrs.len() + regions.len();
     let pht_size = (new_phnum * phdr_entry_size) as u64;
 
     // PHT will be placed at the end of the extended segment, aligned to 8 bytes.
@@ -199,16 +219,25 @@ pub fn write_output(
         written += phdr_entry_size;
     }
 
-    // Write the new PT_LOAD entry for the extended merged segment (including PHT).
-    let dst = pht_start + written;
-    write_u32_le(&mut out, dst, PT_LOAD);
-    write_u32_le(&mut out, dst + 4, PF_R | PF_W | PF_X); // rwx — MVP
-    write_u64_le(&mut out, dst + 8, seg_file_offset);
-    write_u64_le(&mut out, dst + 16, plan.load_address);
-    write_u64_le(&mut out, dst + 24, plan.load_address); // p_paddr = p_vaddr
-    write_u64_le(&mut out, dst + 32, total_seg_size); // p_filesz includes PHT
-    write_u64_le(&mut out, dst + 40, total_seg_size); // p_memsz includes PHT
-    write_u64_le(&mut out, dst + 48, 0x1000); // p_align = 4 KiB
+    // Write one PT_LOAD per mapping of the merged region. The last one runs to
+    // the end of the region, so it is the one that covers the PHT.
+    for (i, (start, flags)) in regions.iter().enumerate() {
+        let end = regions
+            .get(i + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(total_seg_size);
+        let size = end - start;
+        let dst = pht_start + written;
+        write_u32_le(&mut out, dst, PT_LOAD);
+        write_u32_le(&mut out, dst + 4, *flags);
+        write_u64_le(&mut out, dst + 8, seg_file_offset + start);
+        write_u64_le(&mut out, dst + 16, plan.load_address + start);
+        write_u64_le(&mut out, dst + 24, plan.load_address + start); // p_paddr = p_vaddr
+        write_u64_le(&mut out, dst + 32, size);
+        write_u64_le(&mut out, dst + 40, size);
+        write_u64_le(&mut out, dst + 48, crate::layout::PAGE_SIZE);
+        written += phdr_entry_size;
+    }
 
     // Update ELF header: e_phoff and e_phnum.
     write_u64_le(&mut out, 32, pht_file_offset);
@@ -224,17 +253,79 @@ pub fn write_output(
         update_dynamic_init_fini(&mut out, plan, &dynamic_info)?;
     }
 
+    // `output_path` is the input executable, so read its mode before the write
+    // replaces the file: the merge must not change who is allowed to read or
+    // run the binary.
+    #[cfg(unix)]
+    let original_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(output_path)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .ok()
+    };
+
     // Write output file.
     std::fs::write(output_path, &out)
         .with_context(|| format!("writing output {}", output_path.display()))?;
 
-    // Make executable.
+    // Restore the mode the input had, adding owner-execute if it somehow
+    // lacked it. Unconditionally chmod'ing 0o755 here widened a 0o700 binary
+    // to world-readable and world-executable and silently dropped any
+    // setuid/setgid bit, neither of which is the merge's business.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(output_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(output_path, perms)?;
+        let mode = original_mode.unwrap_or(0o755) | 0o100;
+        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("restoring mode on {}", output_path.display()))?;
+    }
+
+    Ok(())
+}
+
+/// Fail before writing anything if a slot the dynamic loader has to write at
+/// startup landed in the read-execute run of the merged region.
+///
+/// The code and the loader-written slots are now in separate mappings with
+/// separate permissions, so a layout that puts an `R_X86_64_RELATIVE` target
+/// or a `GLOB_DAT` GOT slot among the code would make ld.so fault while
+/// relocating. Refusing to emit such a binary beats shipping one that cannot
+/// start.
+fn check_runtime_writes_are_writable(plan: &MergePlan) -> Result<()> {
+    let code_start = plan.load_address;
+    let code_end = plan.load_address + plan.exec_size;
+    let in_code = |vaddr: u64| vaddr >= code_start && vaddr < code_end;
+
+    for reloc in &plan.relative_relocs {
+        if in_code(reloc.vaddr) {
+            bail!(
+                "R_X86_64_RELATIVE target 0x{:x} falls in the read-execute part of the \
+                 merged segment (0x{:x}..0x{:x}); ld.so cannot write it",
+                reloc.vaddr,
+                code_start,
+                code_end
+            );
+        }
+    }
+    for ext in &plan.new_externals {
+        if in_code(ext.got_vaddr) {
+            bail!(
+                "GOT slot for '{}' at 0x{:x} falls in the read-execute part of the \
+                 merged segment; ld.so cannot write it",
+                ext.name,
+                ext.got_vaddr
+            );
+        }
+    }
+    for gi in &plan.got_imports {
+        if in_code(gi.got_vaddr) {
+            bail!(
+                "copied GOT slot for '{}' at 0x{:x} falls in the read-execute part of the \
+                 merged segment; ld.so cannot write it",
+                gi.name,
+                gi.got_vaddr
+            );
+        }
     }
 
     Ok(())
