@@ -80,7 +80,7 @@ pub fn topological_order(merged_libs: &[PathBuf]) -> Result<Vec<PathBuf>> {
 }
 
 /// Parse DT_NEEDED entries from a shared library.
-fn parse_dt_needed(lib_path: &Path) -> Result<Vec<String>> {
+pub fn parse_dt_needed(lib_path: &Path) -> Result<Vec<String>> {
     let lib_bytes =
         std::fs::read(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
 

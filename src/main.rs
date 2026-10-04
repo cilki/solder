@@ -19,7 +19,7 @@ use clap::Parser;
 use tracing::{info, warn};
 
 use elf_reader::MappedElf;
-use lib_discovery::LdsoCache;
+use lib_discovery::{LdsoCache, resolve_library};
 use symbol_analysis::{collect_imports, parse_dynamic};
 
 #[derive(Parser)]
@@ -201,6 +201,41 @@ fn run() -> Result<()> {
     }
     info!(remove_needed=?plan.remove_needed, "DT_NEEDED entries to remove");
 
+    // ── Step 3.5: inherit the merged libraries' own dependencies ─────────────
+    // The merged code keeps calling into whatever its library linked against,
+    // so any dependency that still provides one of those symbols has to move
+    // onto the executable's DT_NEEDED as the merged library leaves it.
+    plan.add_needed = {
+        let injected: HashSet<String> = plan
+            .new_externals
+            .iter()
+            .map(|e| e.name.clone())
+            .chain(plan.got_imports.iter().map(|g| g.name.clone()))
+            .collect();
+
+        let mut merged_lib_deps = Vec::with_capacity(lib_order.len());
+        for lib in &merged_libs {
+            merged_lib_deps.push(dep_graph::parse_dt_needed(lib)?);
+        }
+
+        let mut search_rpath = dyn_info.rpath.clone();
+        search_rpath.extend_from_slice(&library_path);
+        let mut resolve_exports = |soname: &str| {
+            resolve_library(soname, &search_rpath, &dyn_info.runpath, &ldso_cache)
+                .and_then(|path| symbol_analysis::exported_symbols(&path))
+                .ok()
+        };
+
+        symbol_analysis::inherited_needed(
+            &merged_lib_deps,
+            &dyn_info.needed,
+            &plan.remove_needed,
+            &injected,
+            &mut resolve_exports,
+        )
+    };
+    info!(add_needed=?plan.add_needed, "DT_NEEDED entries to add");
+
     if cli.dry_run {
         print_merge_plan(&cli.input, &plan, &imports, &dyn_info.needed);
         return Ok(());
@@ -334,6 +369,12 @@ fn print_merge_plan(
         .collect();
     if !kept.is_empty() {
         println!("  DT_NEEDED entries kept: {}", kept.join(", "));
+    }
+    if !plan.add_needed.is_empty() {
+        println!(
+            "  DT_NEEDED entries inherited from the merged libraries: {}",
+            plan.add_needed.join(", ")
+        );
     }
 
     println!(

@@ -147,7 +147,9 @@ pub fn write_output(
     // need to grow (.dynstr/.dynsym/.gnu.version when injecting new external
     // symbols; .rela.dyn whenever PIE relocs or new GLOB_DATs are added).
     let needs_rela_extension = plan.is_pie && !plan.relative_relocs.is_empty();
-    let needs_symbol_extension = !plan.new_externals.is_empty() || !plan.got_imports.is_empty();
+    let needs_symbol_extension = !plan.new_externals.is_empty()
+        || !plan.got_imports.is_empty()
+        || !plan.add_needed.is_empty();
     let (extended_seg, ext_info) = if needs_rela_extension || needs_symbol_extension {
         build_extended_segment(patched_exe, merged_seg, plan, &dynamic_info, &exe)?
     } else {
@@ -248,9 +250,10 @@ pub fn write_output(
     // entry start); d_tag is untouched.
     apply_extension_info(&mut out, &dynamic_info, &ext_info)?;
 
-    // Update DT_PREINIT_ARRAY and DT_FINI_ARRAY to point to our arrays
-    if plan.init_fini.is_some() {
-        update_dynamic_init_fini(&mut out, plan, &dynamic_info)?;
+    // Point DT_PREINIT_ARRAY/DT_FINI_ARRAY at our arrays and add a DT_NEEDED
+    // entry per inherited soname.
+    if plan.init_fini.is_some() || !plan.add_needed.is_empty() {
+        update_dynamic_entries(&mut out, plan, &dynamic_info, &ext_info)?;
     }
 
     // `output_path` is the input executable, so read its mode before the write
@@ -396,6 +399,9 @@ struct ExtensionInfo {
     rela_count: Option<u64>,
     strtab_va: Option<u64>,
     strtab_size: Option<u64>,
+    /// Offset into the rebuilt `.dynstr` of each `plan.add_needed` soname, in
+    /// the same order, for the `DT_NEEDED` entries that reference them.
+    needed_name_offsets: Vec<u32>,
     symtab_va: Option<u64>,
     versym_va: Option<u64>,
 }
@@ -548,7 +554,10 @@ fn build_extended_segment(
     // got_imports whose symbol is in neither the exe's .dynsym nor this list.
     let mut injects: Vec<(String, bool)> = Vec::new();
 
-    if !plan.new_externals.is_empty() || !plan.got_imports.is_empty() {
+    if !plan.new_externals.is_empty()
+        || !plan.got_imports.is_empty()
+        || !plan.add_needed.is_empty()
+    {
         let (old_dynstr, old_dynsym, old_versym) = read_dynsym_tables(patched_exe, exe, dyn_info)?;
         let old_num_syms = old_dynsym.len() / SYM_ENTRY_SIZE;
         new_sym_idx_base = old_num_syms;
@@ -577,18 +586,27 @@ fn build_extended_segment(
             }
         }
 
-        if !injects.is_empty() {
+        if !injects.is_empty() || !plan.add_needed.is_empty() {
             // .dynstr: copy existing bytes (preserves all existing offsets), then
-            // append a NUL-terminated name per new symbol. Track the byte offset
-            // each name lands at so we can wire st_name correctly.
+            // append a NUL-terminated name per new symbol, and one per inherited
+            // soname. Track the byte offset each name lands at so we can wire
+            // st_name and the new DT_NEEDED values correctly.
             pad_to(&mut extended, 8);
             let dynstr_offset_in_seg = extended.len();
             extended.extend_from_slice(&old_dynstr);
+            let append_string = |extended: &mut Vec<u8>, s: &str| -> u32 {
+                let offset = extended.len() as u32 - dynstr_offset_in_seg as u32;
+                extended.extend_from_slice(s.as_bytes());
+                extended.push(0);
+                offset
+            };
             let mut new_name_offsets: Vec<u32> = Vec::with_capacity(injects.len());
             for (name, _) in &injects {
-                new_name_offsets.push(extended.len() as u32 - dynstr_offset_in_seg as u32);
-                extended.extend_from_slice(name.as_bytes());
-                extended.push(0);
+                new_name_offsets.push(append_string(&mut extended, name));
+            }
+            for soname in &plan.add_needed {
+                let offset = append_string(&mut extended, soname);
+                info.needed_name_offsets.push(offset);
             }
             let dynstr_size = extended.len() - dynstr_offset_in_seg;
 
@@ -855,18 +873,20 @@ fn apply_extension_info(
     Ok(())
 }
 
-/// Update DT_PREINIT_ARRAY/DT_PREINIT_ARRAYSZ and DT_FINI_ARRAY/DT_FINI_ARRAYSZ in .dynamic
-/// to point to our combined init/fini arrays in the merged segment.
-fn update_dynamic_init_fini(
+/// Rewrite the `.dynamic` entries that the merge changes:
+///   * `DT_PREINIT_ARRAY`/`DT_FINI_ARRAY` (and their sizes) to point at the
+///     combined init/fini arrays in the merged segment, and
+///   * one `DT_NEEDED` per soname inherited from a merged-away library.
+///
+/// Both kinds of update share a single cursor over the spare `.dynamic` slots,
+/// since a tag that the executable does not already have can only be added by
+/// pushing the `DT_NULL` terminator down.
+fn update_dynamic_entries(
     out: &mut [u8],
     plan: &MergePlan,
     dyn_info: &DynamicInfo,
+    ext: &ExtensionInfo,
 ) -> Result<()> {
-    let init_fini = match &plan.init_fini {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-
     let dyn_section_offset = dyn_info.section_offset as usize;
 
     // New entries are appended at the DT_NULL terminator, pushing it down.
@@ -902,38 +922,64 @@ fn update_dynamic_init_fini(
             Ok(())
         };
 
-    // Update or create DT_PREINIT_ARRAY entries for merged constructors
-    if !init_fini.preinit_entries.is_empty() {
-        let preinit_array_size = (init_fini.preinit_entries.len() * 8) as u64;
-        set_dyn_entry(
-            out,
-            dyn_info.dt_preinit_array_idx,
-            goblin::elf::dynamic::DT_PREINIT_ARRAY,
-            init_fini.preinit_vaddr,
-        )?;
-        set_dyn_entry(
-            out,
-            dyn_info.dt_preinit_arraysz_idx,
-            goblin::elf::dynamic::DT_PREINIT_ARRAYSZ,
-            preinit_array_size,
-        )?;
+    if let Some(init_fini) = &plan.init_fini {
+        // Update or create DT_PREINIT_ARRAY entries for merged constructors
+        if !init_fini.preinit_entries.is_empty() {
+            let preinit_array_size = (init_fini.preinit_entries.len() * 8) as u64;
+            set_dyn_entry(
+                out,
+                dyn_info.dt_preinit_array_idx,
+                goblin::elf::dynamic::DT_PREINIT_ARRAY,
+                init_fini.preinit_vaddr,
+            )?;
+            set_dyn_entry(
+                out,
+                dyn_info.dt_preinit_arraysz_idx,
+                goblin::elf::dynamic::DT_PREINIT_ARRAYSZ,
+                preinit_array_size,
+            )?;
+        }
+
+        // Update or create DT_FINI_ARRAY entries
+        if !init_fini.combined_fini_entries.is_empty() {
+            let fini_array_size = (init_fini.combined_fini_entries.len() * 8) as u64;
+            set_dyn_entry(
+                out,
+                dyn_info.dt_fini_array_idx,
+                goblin::elf::dynamic::DT_FINI_ARRAY,
+                init_fini.combined_fini_vaddr,
+            )?;
+            set_dyn_entry(
+                out,
+                dyn_info.dt_fini_arraysz_idx,
+                goblin::elf::dynamic::DT_FINI_ARRAYSZ,
+                fini_array_size,
+            )?;
+        }
     }
 
-    // Update or create DT_FINI_ARRAY entries
-    if !init_fini.combined_fini_entries.is_empty() {
-        let fini_array_size = (init_fini.combined_fini_entries.len() * 8) as u64;
-        set_dyn_entry(
-            out,
-            dyn_info.dt_fini_array_idx,
-            goblin::elf::dynamic::DT_FINI_ARRAY,
-            init_fini.combined_fini_vaddr,
-        )?;
-        set_dyn_entry(
-            out,
-            dyn_info.dt_fini_arraysz_idx,
-            goblin::elf::dynamic::DT_FINI_ARRAYSZ,
-            fini_array_size,
-        )?;
+    // One fresh DT_NEEDED per inherited soname. These always append — an
+    // existing entry would mean the executable already linked the library, in
+    // which case `inherited_needed` would not have returned it.
+    if !plan.add_needed.is_empty() {
+        if ext.needed_name_offsets.len() != plan.add_needed.len() {
+            bail!(
+                "{} sonames to add to DT_NEEDED but {} were written to .dynstr — internal error",
+                plan.add_needed.len(),
+                ext.needed_name_offsets.len()
+            );
+        }
+        for (soname, &name_offset) in plan.add_needed.iter().zip(&ext.needed_name_offsets) {
+            set_dyn_entry(
+                out,
+                None,
+                goblin::elf::dynamic::DT_NEEDED,
+                name_offset as u64,
+            )
+            .with_context(|| {
+                format!("adding DT_NEEDED '{soname}' inherited from a merged library")
+            })?;
+        }
     }
 
     Ok(())

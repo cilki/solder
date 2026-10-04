@@ -234,6 +234,8 @@ pub fn plan_layout(
         jump_slot_reloc_offsets: Vec::new(),
         copy_reloc_offsets: Vec::new(),
         remove_needed,
+        // Filled in by the caller, once the injected symbol set is known.
+        add_needed: Vec::new(),
         relative_relocs: Vec::new(),
         new_externals,
         got_imports,

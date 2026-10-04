@@ -245,6 +245,10 @@ pub struct MergePlan {
     pub copy_reloc_offsets: Vec<u64>,
     /// DT_NEEDED string values to remove from the dynamic section.
     pub remove_needed: Vec<String>,
+    /// Sonames to add to DT_NEEDED: dependencies of the merged-away libraries
+    /// that still provide symbols the extracted code references. See
+    /// `symbol_analysis::inherited_needed`.
+    pub add_needed: Vec<String>,
     /// R_X86_64_RELATIVE relocations to add for PIE executables.
     pub relative_relocs: Vec<RelativeReloc>,
     /// Symbols the merged libraries reference but the executable doesn't import.

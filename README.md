@@ -44,6 +44,27 @@ Only symbols that are actually used will be merged into the final executable.
 For example, `md5sum` is only about 56K, but it dynamically links
 `libcrypto.so.3` which is 6.5M.
 
+### Inherited dependencies
+
+Merging a library moves its code into the executable but not its own
+dependencies. `libcrypto.so.3` resolves `ZSTD_compress` through its
+`DT_NEEDED` on `libzstd.so.1`, so once libcrypto is gone from the executable's
+`DT_NEEDED` nothing in the link chain provides that symbol — and the merged
+binary would not start at all.
+
+So a dependency of a merged library is added to the executable's own
+`DT_NEEDED` when all of the following hold:
+
+- the executable does not already link it,
+- it is not itself being merged away, and
+- it exports at least one symbol the extracted code refers to.
+
+A dependency nothing in the extracted code calls stays dropped. One that
+`solder` cannot find on disk is inherited without that last check, since
+guessing it away risks an executable that will not load; you'll get a warning
+saying so. `--dry-run` lists whatever gets inherited, so you can see up front
+which dependencies survive the merge.
+
 ### Nixpkgs
 
 For binaries built from [nixpkgs](https://github.com/NixOS/nixpkgs), you can
@@ -110,7 +131,9 @@ that was linked with an `RPATH`.
   the code and trampolines, read-write for the data and the slots the dynamic
   loader fills in, read-only for the rebuilt symbol and relocation tables
 - Patches GOT entries to point directly to the merged symbols
-- Removes the merged libraries from `DT_NEEDED`
+- Removes the merged libraries from `DT_NEEDED`, and moves onto the executable
+  any `DT_NEEDED` of theirs that still provides a symbol the extracted code
+  calls (see [Inherited dependencies](#inherited-dependencies))
 
 ## Limitations
 

@@ -1,8 +1,10 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use object::read::elf::ElfFile64;
 use object::{Object, ObjectSection};
+use tracing::{debug, warn};
 
 use crate::elf_reader::va_to_file_offset;
 use crate::lib_discovery::{LdsoCache, is_excluded, resolve_library};
@@ -135,20 +137,8 @@ pub fn collect_imports(
         let lib_path = resolve_library(needed, &search_rpath, search_runpath, ldso_cache)
             .with_context(|| format!("resolving DT_NEEDED '{needed}'"))?;
 
-        let lib_bytes =
-            std::fs::read(&lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
-        let lib_goblin = goblin::elf::Elf::parse(&lib_bytes)
-            .with_context(|| format!("parsing {}", lib_path.display()))?;
-
-        for sym in lib_goblin.dynsyms.iter() {
-            if sym.st_shndx != goblin::elf::section_header::SHN_UNDEF as usize
-                && sym.st_shndx != 0
-                && let Some(name) = lib_goblin.dynstrtab.get_at(sym.st_name)
-            {
-                sym_to_lib
-                    .entry(name.to_owned())
-                    .or_insert_with(|| lib_path.clone());
-            }
+        for name in exported_symbols(&lib_path)? {
+            sym_to_lib.entry(name).or_insert_with(|| lib_path.clone());
         }
     }
 
@@ -229,6 +219,104 @@ pub fn collect_imports(
         imports,
         merged_lib_syms: sym_to_lib,
     })
+}
+
+/// Names of every symbol `lib_path` defines in its `.dynsym` — i.e. everything
+/// it can satisfy an undefined reference with.
+pub fn exported_symbols(lib_path: &Path) -> Result<HashSet<String>> {
+    let bytes =
+        std::fs::read(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
+    let elf = goblin::elf::Elf::parse(&bytes)
+        .with_context(|| format!("parsing {}", lib_path.display()))?;
+
+    Ok(elf
+        .dynsyms
+        .iter()
+        .filter(|sym| sym.st_shndx != goblin::elf::section_header::SHN_UNDEF as usize)
+        .filter_map(|sym| elf.dynstrtab.get_at(sym.st_name).map(str::to_owned))
+        .collect())
+}
+
+/// Sonames the executable has to inherit from the libraries being merged away.
+///
+/// Merging a library moves its code into the executable but not its
+/// dependencies: `libcrypto.so.3` resolves `ZSTD_compress` through its own
+/// `DT_NEEDED` on `libzstd.so.1`, and once libcrypto is gone from the
+/// executable's `DT_NEEDED` nothing in the link chain provides that symbol any
+/// more. `solder` injects those references as undefined `.dynsym` entries with
+/// `GLOB_DAT` relocations, so with `DF_BIND_NOW` set the loader rejects the
+/// binary outright ("symbol lookup error: undefined symbol"). The executable
+/// therefore has to take over the dependencies that still carry its weight.
+///
+/// A merged library's soname is inherited when all of these hold:
+///   * the executable does not already list it in `DT_NEEDED`,
+///   * it is not itself being merged away, and
+///   * it exports at least one of the symbols being injected — a dependency
+///     nothing in the extracted code refers to stays dropped.
+///
+/// `exports` maps a soname to the symbols it defines, or `None` when the
+/// library cannot be found. An unresolvable dependency is inherited anyway:
+/// guessing that it was unnecessary risks an executable that will not start,
+/// while an extra `DT_NEEDED` entry at worst reintroduces a dependency the
+/// original binary already had through the merged library.
+pub fn inherited_needed(
+    merged_lib_deps: &[Vec<String>],
+    exe_needed: &[String],
+    remove_needed: &[String],
+    injected: &HashSet<String>,
+    exports: &mut dyn FnMut(&str) -> Option<HashSet<String>>,
+) -> Vec<String> {
+    if injected.is_empty() {
+        // Nothing was referenced beyond what the executable already imports,
+        // so every dependency of the merged libraries goes away with them.
+        return Vec::new();
+    }
+
+    let already_linked: HashSet<&str> = exe_needed
+        .iter()
+        .chain(remove_needed)
+        .map(String::as_str)
+        .collect();
+
+    let mut inherited: Vec<String> = Vec::new();
+    for soname in merged_lib_deps.iter().flatten() {
+        if already_linked.contains(soname.as_str()) || inherited.contains(soname) {
+            continue;
+        }
+        match exports(soname) {
+            Some(defined) => {
+                let used: Vec<&str> = injected
+                    .iter()
+                    .filter(|name| defined.contains(*name))
+                    .map(String::as_str)
+                    .collect();
+                if used.is_empty() {
+                    debug!(
+                        soname,
+                        "Merged library's dependency provides nothing the extracted code \
+                         references; leaving it out of DT_NEEDED"
+                    );
+                } else {
+                    debug!(
+                        soname,
+                        symbols = ?used,
+                        "Inheriting DT_NEEDED from merged library"
+                    );
+                    inherited.push(soname.clone());
+                }
+            }
+            None => {
+                warn!(
+                    soname,
+                    "Dependency of a merged library could not be found; adding it to DT_NEEDED \
+                     without checking whether the extracted code needs it"
+                );
+                inherited.push(soname.clone());
+            }
+        }
+    }
+
+    inherited
 }
 
 /// For a given set of imported symbols, find the file offsets of their JUMP_SLOT
@@ -419,6 +507,139 @@ pub fn symbol_is_zero_initialized(lib_path: &std::path::Path, name: &str) -> Res
 
     // Symbol not found as a definition — nothing to preserve.
     Ok(true)
+}
+
+#[cfg(test)]
+mod inherited_needed_tests {
+    use super::{HashSet, inherited_needed};
+
+    fn names(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn set(entries: &[&str]) -> HashSet<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Resolver over a fixed soname → exports table; anything not listed is
+    /// treated as a library that could not be found.
+    fn resolver<'t>(
+        table: &'t [(&'t str, &'t [&'t str])],
+    ) -> impl FnMut(&str) -> Option<HashSet<String>> + 't {
+        move |soname: &str| {
+            table
+                .iter()
+                .find(|(name, _)| *name == soname)
+                .map(|(_, syms)| set(syms))
+        }
+    }
+
+    #[test]
+    fn a_dependency_providing_an_injected_symbol_is_inherited() {
+        // libcrypto is merged away; the extracted code still calls into
+        // libzstd, which was reachable only through libcrypto's DT_NEEDED.
+        let mut exports = resolver(&[
+            ("libzstd.so.1", &["ZSTD_compress", "ZSTD_decompress"]),
+            ("libc.so.6", &["memcpy"]),
+        ]);
+        let inherited = inherited_needed(
+            &[names(&["libzstd.so.1", "libc.so.6"])],
+            &names(&["libcrypto.so.3", "libc.so.6"]),
+            &names(&["libcrypto.so.3"]),
+            &set(&["ZSTD_compress", "memcpy"]),
+            &mut exports,
+        );
+        assert_eq!(inherited, names(&["libzstd.so.1"]));
+    }
+
+    #[test]
+    fn a_dependency_nothing_references_is_left_out() {
+        let mut exports = resolver(&[("libzstd.so.1", &["ZSTD_compress"])]);
+        let inherited = inherited_needed(
+            &[names(&["libzstd.so.1"])],
+            &names(&["libcrypto.so.3", "libc.so.6"]),
+            &names(&["libcrypto.so.3"]),
+            &set(&["memcpy", "strlen"]),
+            &mut exports,
+        );
+        assert!(
+            inherited.is_empty(),
+            "a dependency the extracted code never calls must stay dropped, got {inherited:?}"
+        );
+    }
+
+    #[test]
+    fn a_dependency_that_is_itself_merged_away_is_not_re_added() {
+        // Both libcrypto and libz are merged, and libcrypto depends on libz.
+        // libz's symbols come from the merged units, not from a DT_NEEDED.
+        let mut exports = resolver(&[("libz.so.1", &["compress"])]);
+        let inherited = inherited_needed(
+            &[names(&["libz.so.1"]), Vec::new()],
+            &names(&["libcrypto.so.3", "libz.so.1", "libc.so.6"]),
+            &names(&["libcrypto.so.3", "libz.so.1"]),
+            &set(&["compress"]),
+            &mut exports,
+        );
+        assert!(
+            inherited.is_empty(),
+            "a merged-away library must not be put back in DT_NEEDED, got {inherited:?}"
+        );
+    }
+
+    #[test]
+    fn a_dependency_the_executable_already_links_is_not_duplicated() {
+        let mut exports = resolver(&[("libc.so.6", &["memcpy"])]);
+        let inherited = inherited_needed(
+            &[names(&["libc.so.6"])],
+            &names(&["libcrypto.so.3", "libc.so.6"]),
+            &names(&["libcrypto.so.3"]),
+            &set(&["memcpy"]),
+            &mut exports,
+        );
+        assert!(inherited.is_empty(), "{inherited:?}");
+    }
+
+    #[test]
+    fn an_unresolvable_dependency_is_inherited_rather_than_guessed_away() {
+        let mut exports = resolver(&[]);
+        let inherited = inherited_needed(
+            &[names(&["libzstd.so.1"])],
+            &names(&["libcrypto.so.3", "libc.so.6"]),
+            &names(&["libcrypto.so.3"]),
+            &set(&["ZSTD_compress"]),
+            &mut exports,
+        );
+        assert_eq!(inherited, names(&["libzstd.so.1"]));
+    }
+
+    #[test]
+    fn nothing_is_inherited_when_no_symbols_are_injected() {
+        // No injected symbols means the extracted code refers to nothing the
+        // executable did not already import, so even a dependency that cannot
+        // be resolved is not worth keeping.
+        let mut exports = resolver(&[]);
+        let inherited = inherited_needed(
+            &[names(&["libzstd.so.1"])],
+            &names(&["libcrypto.so.3", "libc.so.6"]),
+            &names(&["libcrypto.so.3"]),
+            &HashSet::new(),
+            &mut exports,
+        );
+        assert!(inherited.is_empty(), "{inherited:?}");
+    }
+
+    #[test]
+    fn a_dependency_shared_by_two_merged_libraries_is_added_once() {
+        let mut exports = resolver(&[("libz.so.1", &["compress"])]);
+        let inherited = inherited_needed(
+            &[names(&["libz.so.1"]), names(&["libz.so.1"])],
+            &names(&["libcrypto.so.3", "libssl.so.3", "libc.so.6"]),
+            &names(&["libcrypto.so.3", "libssl.so.3"]),
+            &set(&["compress"]),
+            &mut exports,
+        );
+        assert_eq!(inherited, names(&["libz.so.1"]));
+    }
 }
 
 #[cfg(test)]
