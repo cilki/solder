@@ -119,6 +119,12 @@ That is the dynamic linker's own order with `$SYSROOT/lib` and `-L` spliced in
 after `DT_RPATH`. Note that `-L` therefore does *not* override an executable
 that was linked with an `RPATH`.
 
+`/etc/ld.so.cache` is filtered the way the loader filters it: only x86-64
+`libc6` entries are considered, so the i386 or x32 build of a soname is never
+picked, and a `glibc-hwcaps` variant loses to the baseline library — whether
+the machine that will run the merged executable implements the instructions
+that variant was built for is not knowable from here.
+
 ## How It Works
 
 - Parses the executable's dynamic section to identify imported symbols
