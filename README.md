@@ -28,14 +28,17 @@ you properly static link them at build time).
 - ld-musl
 - linux-vdso
 - linux-gate
-- libc
-- libm
-- librt
+- libc.so
+- libm.so
+- librt.so
 - libpthread
-- libdl
+- libdl.so
 - libresolv
 - libnss\_
-- libgcc_s
+- libgcc_s.so
+
+Those are matched as prefixes of the `DT_NEEDED` soname, so the `libc.so` entry
+excludes `libc.so.6` but leaves something like `libcrypto.so.3` mergeable.
 
 Only symbols that are actually used will be merged into the final executable.
 For example, `md5sum` is only about 56K, but it dynamically links
@@ -58,18 +61,48 @@ solder ./myapp
 # Merge only specific libraries
 solder ./myapp -m libfoo.so.1 -m libbar.so.2
 
+# A prefix of the soname works too, if you'd rather not spell out the version
+solder ./myapp -m libfoo
+
 # Add additional library search paths
 solder ./myapp -L /opt/mylibs -L ./libs
 
 # Preview what would happen without writing output
 solder ./myapp --dry-run
+
+# Report what solder is doing (only warnings and errors are printed by default)
+RUST_LOG=info solder ./myapp
 ```
+
+A `-m` entry that matches no `DT_NEEDED` soname, or that matches only
+never-mergeable ones, is an error rather than a silent no-op — quietly merging
+a subset of what you asked for is almost never what you wanted.
+
+The executable is rewritten in place and no backup is kept, so hold on to a
+copy of anything you can't rebuild.
+
+### Library resolution
+
+Each `DT_NEEDED` soname is looked up in the first of these that contains it:
+
+1. `DT_RPATH` of the executable
+2. `$SYSROOT/lib`, if `SYSROOT` is set in the environment
+3. `-L` directories, in the order given
+4. `LD_LIBRARY_PATH`
+5. `DT_RUNPATH` of the executable
+6. `/etc/ld.so.cache`
+7. `/lib64`, `/usr/lib64`, `/lib`, `/usr/lib`, `/lib/x86_64-linux-gnu`,
+   `/usr/lib/x86_64-linux-gnu`
+
+That is the dynamic linker's own order with `$SYSROOT/lib` and `-L` spliced in
+after `DT_RPATH`. Note that `-L` therefore does *not* override an executable
+that was linked with an `RPATH`.
 
 ## How It Works
 
 - Parses the executable's dynamic section to identify imported symbols
-- Resolves which shared libraries provide those symbols (using regular library
-  search paths)
+- Resolves which shared libraries provide those symbols (see
+  [Library resolution](#library-resolution))
 - Extracts the minimal set of code/data needed
   - Uses symbolic execution to identify jump tables in .rodata
 - Applies relocations and creates trampolines for any remaining external calls
@@ -83,3 +116,9 @@ solder ./myapp --dry-run
 
 - x86_64 only
 - We can't merge `dlopen` libraries
+- Extracted code may not contain relocations that need the library's own GOT
+  (`R_X86_64_GOTPCREL` and friends); `solder` refuses the merge rather than
+  producing a broken binary
+- A copy-relocated data symbol (`R_X86_64_COPY`) coming from a library we're
+  removing has to be zero-initialized, since its initial value currently can't
+  be carried over

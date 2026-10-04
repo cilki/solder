@@ -30,11 +30,14 @@ pub fn is_excluded(soname: &str) -> bool {
 /// Resolve a soname (e.g. "libz.so.1") to an absolute path on disk.
 ///
 /// Search order mirrors the Linux dynamic linker:
-///   1. Caller-supplied `rpath` entries
-///   2. `LD_LIBRARY_PATH` directories (from the elfpack process environment)
+///   1. Caller-supplied `rpath` entries. The caller appends `$SYSROOT/lib` and
+///      any `-L` directories here, so those are searched after the
+///      executable's own `DT_RPATH` but ahead of `LD_LIBRARY_PATH`.
+///   2. `LD_LIBRARY_PATH` directories (from the solder process environment)
 ///   3. Caller-supplied `runpath` entries
 ///   4. `/etc/ld.so.cache`
-///   5. Default paths: /lib64, /usr/lib64, /lib, /usr/lib
+///   5. Default paths: /lib64, /usr/lib64, /lib, /usr/lib,
+///      /lib/x86_64-linux-gnu, /usr/lib/x86_64-linux-gnu
 pub fn resolve_library(
     soname: &str,
     rpath: &[PathBuf],

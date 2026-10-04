@@ -40,7 +40,8 @@ struct Cli {
     #[arg(short = 'm', long = "merge", value_name = "SONAME")]
     merge_libs: Vec<String>,
 
-    /// Additional library search directories (prepended to default search order)
+    /// Additional library search directories (searched after the executable's
+    /// DT_RPATH and $SYSROOT/lib, ahead of LD_LIBRARY_PATH)
     #[arg(short = 'L', long = "library-path", value_name = "PATH")]
     library_path: Vec<PathBuf>,
 
