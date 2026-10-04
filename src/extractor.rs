@@ -367,7 +367,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
         .with_context(|| format!("symbol '{}' has no section", key.sym))?;
 
     let section_kind = match section.kind() {
-        ObjSectionKind::Text | ObjSectionKind::Common => SectionKind::Text,
+        ObjSectionKind::Text => SectionKind::Text,
         ObjSectionKind::ReadOnlyData | ObjSectionKind::ReadOnlyString => SectionKind::ReadOnlyData,
         ObjSectionKind::Data | ObjSectionKind::UninitializedData => SectionKind::Data,
         other => bail!("symbol '{}': unsupported section kind {:?}", key.sym, other),

@@ -11,7 +11,7 @@ name = "solder"
 path = "src/main.rs"
 
 [dependencies]
-object = { version = "0.39", features = ["read_core", "elf"] }
+object = { version = "0.40", features = ["read_core", "elf"] }
 goblin = "0.10"
 memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }

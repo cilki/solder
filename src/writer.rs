@@ -166,12 +166,12 @@ pub fn write_output(
     // mapping runs to the next element's start, or to the end of the region.
     let mut regions: Vec<(u64, u32)> = Vec::with_capacity(3);
     if plan.exec_size > 0 {
-        regions.push((0, PF_R | PF_X));
+        regions.push((0, (PF_R | PF_X).0));
     }
     if plan.writable_end > plan.exec_size {
-        regions.push((plan.exec_size, PF_R | PF_W));
+        regions.push((plan.exec_size, (PF_R | PF_W).0));
     }
-    regions.push((plan.writable_end, PF_R));
+    regions.push((plan.writable_end, PF_R.0));
 
     // Calculate sizes for embedding PHT within the new PT_LOAD segments.
     let new_phnum = old_phdrs.len() + regions.len();
@@ -228,7 +228,7 @@ pub fn write_output(
             .unwrap_or(total_seg_size);
         let size = end - start;
         let dst = pht_start + written;
-        write_u32_le(&mut out, dst, PT_LOAD);
+        write_u32_le(&mut out, dst, PT_LOAD.0);
         write_u32_le(&mut out, dst + 4, *flags);
         write_u64_le(&mut out, dst + 8, seg_file_offset + start);
         write_u64_le(&mut out, dst + 16, plan.load_address + start);
