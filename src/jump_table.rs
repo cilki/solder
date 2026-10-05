@@ -10,9 +10,7 @@ use tracing::debug;
 pub struct JumpTable {
     /// Virtual address of the table base in the shared library
     pub table_vaddr: u64,
-    /// Number of entries (targets) in the table
-    pub num_entries: usize,
-    /// Target virtual addresses for each table entry
+    /// Target virtual addresses, one per 4-byte table entry
     pub targets: Vec<u64>,
 }
 
@@ -27,34 +25,46 @@ enum AbstractValue {
     ComputedTarget { table_base: u64 },
 }
 
-/// Map a sub-register to its full 64-bit GP register for state tracking.
+/// Abstract values currently held by the 64-bit GP registers. Sub-registers
+/// share their parent's entry, so `AL`, `EAX` and `RAX` are all `RAX`.
+type RegState = HashMap<Register, AbstractValue>;
+
+/// The 64-bit GP register whose state `reg` is part of, e.g. `CL`/`CX`/`ECX` →
+/// `RCX`. `None` for anything that is not a GP register: `RIP`, `XMM0`, or the
+/// `Register::None` of an operand that names no register at all.
 fn to_gpr64(reg: Register) -> Option<Register> {
-    match reg {
-        Register::AL | Register::AH | Register::AX | Register::EAX | Register::RAX => {
-            Some(Register::RAX)
-        }
-        Register::BL | Register::BH | Register::BX | Register::EBX | Register::RBX => {
-            Some(Register::RBX)
-        }
-        Register::CL | Register::CH | Register::CX | Register::ECX | Register::RCX => {
-            Some(Register::RCX)
-        }
-        Register::DL | Register::DH | Register::DX | Register::EDX | Register::RDX => {
-            Some(Register::RDX)
-        }
-        Register::SIL | Register::SI | Register::ESI | Register::RSI => Some(Register::RSI),
-        Register::DIL | Register::DI | Register::EDI | Register::RDI => Some(Register::RDI),
-        Register::BPL | Register::BP | Register::EBP | Register::RBP => Some(Register::RBP),
-        Register::SPL | Register::SP | Register::ESP | Register::RSP => Some(Register::RSP),
-        Register::R8L | Register::R8W | Register::R8D | Register::R8 => Some(Register::R8),
-        Register::R9L | Register::R9W | Register::R9D | Register::R9 => Some(Register::R9),
-        Register::R10L | Register::R10W | Register::R10D | Register::R10 => Some(Register::R10),
-        Register::R11L | Register::R11W | Register::R11D | Register::R11 => Some(Register::R11),
-        Register::R12L | Register::R12W | Register::R12D | Register::R12 => Some(Register::R12),
-        Register::R13L | Register::R13W | Register::R13D | Register::R13 => Some(Register::R13),
-        Register::R14L | Register::R14W | Register::R14D | Register::R14 => Some(Register::R14),
-        Register::R15L | Register::R15W | Register::R15D | Register::R15 => Some(Register::R15),
-        _ => None,
+    reg.is_gpr().then(|| reg.full_register())
+}
+
+/// The abstract value tracked for whichever 64-bit register `reg` is part of.
+fn value_of(regs: &RegState, reg: Register) -> Option<&AbstractValue> {
+    regs.get(&to_gpr64(reg)?)
+}
+
+/// The 64-bit GP register named by operand `op`, if it names one.
+fn operand_gpr(instr: &Instruction, op: u32) -> Option<Register> {
+    if op >= instr.op_count() || instr.op_kind(op) != OpKind::Register {
+        return None;
+    }
+    to_gpr64(instr.op_register(op))
+}
+
+/// The abstract value tracked for operand `op`, if it names a GP register.
+fn operand_value<'a>(
+    instr: &Instruction,
+    regs: &'a RegState,
+    op: u32,
+) -> Option<&'a AbstractValue> {
+    regs.get(&operand_gpr(instr, op)?)
+}
+
+/// The base and index registers of the instruction's memory operand, or
+/// `Register::None` for each when it has no memory operand.
+fn memory_regs(instr: &Instruction) -> (Register, Register) {
+    if instr.op_count() >= 2 && instr.op_kind(1) == OpKind::Memory {
+        (instr.memory_base(), instr.memory_index())
+    } else {
+        (Register::None, Register::None)
     }
 }
 
@@ -79,45 +89,36 @@ pub fn detect_jump_tables(
 
     // Symbolic execution pass
     let mut instr = Instruction::default();
-    let mut regs: HashMap<Register, AbstractValue> = HashMap::new();
+    let mut regs = RegState::new();
     let mut confirmed_bases: HashSet<u64> = HashSet::new();
 
     let mut decoder = Decoder::with_ip(64, code, base_vaddr, DecoderOptions::NONE);
     while decoder.can_decode() {
         decoder.decode_out(&mut instr);
 
-        match instr.mnemonic() {
-            Mnemonic::Lea => {
-                handle_lea(&instr, elf, &mut regs);
-            }
-            Mnemonic::Movsxd => {
-                handle_movsxd(&instr, &mut regs);
-            }
-            Mnemonic::Add => {
-                handle_add(&instr, &mut regs);
-            }
-            Mnemonic::Mov => {
-                handle_mov(&instr, &mut regs);
-            }
-            _ => {
-                // Check for indirect jump with a computed target
-                if instr.flow_control() == FlowControl::IndirectBranch
-                    && instr.op_count() >= 1
-                    && instr.op_kind(0) == OpKind::Register
-                    && let Some(gpr) = to_gpr64(instr.op_register(0))
-                    && let Some(AbstractValue::ComputedTarget { table_base }) = regs.get(&gpr)
-                {
-                    debug!(
-                        table_base = format_args!("{:#x}", table_base),
-                        jmp_addr = format_args!("{:#x}", instr.ip()),
-                        "Confirmed jump table"
-                    );
-                    confirmed_bases.insert(*table_base);
-                }
+        // An indirect branch through a register holding table base + entry is
+        // what confirms a table.
+        if instr.flow_control() == FlowControl::IndirectBranch
+            && let Some(gpr) = operand_gpr(&instr, 0)
+            && let Some(AbstractValue::ComputedTarget { table_base }) = regs.get(&gpr)
+        {
+            debug!(
+                table_base = format_args!("{:#x}", table_base),
+                jmp_addr = format_args!("{:#x}", instr.ip()),
+                "Confirmed jump table"
+            );
+            confirmed_bases.insert(*table_base);
+        }
 
-                // Kill destination register for any other instruction that writes to a GP register
-                kill_dest_register(&instr, &mut regs);
-            }
+        // Every instruction this scanner models writes its first operand, and
+        // whatever it leaves there replaces what we were tracking. An
+        // instruction we cannot interpret invalidates its destination instead
+        // of letting a stale value survive the write.
+        if let Some(dst) = operand_gpr(&instr, 0) {
+            match transfer(&instr, elf, &regs) {
+                Some(value) => regs.insert(dst, value),
+                None => regs.remove(&dst),
+            };
         }
     }
 
@@ -137,7 +138,7 @@ pub fn detect_jump_tables(
             Ok(table) => {
                 debug!(
                     vaddr = format_args!("{:#x}", table.table_vaddr),
-                    entries = table.num_entries,
+                    entries = table.targets.len(),
                     "Validated jump table"
                 );
                 jump_tables.push(table);
@@ -155,161 +156,62 @@ pub fn detect_jump_tables(
     Ok(jump_tables)
 }
 
-/// Handle LEA instruction: if it's a RIP-relative LEA targeting .rodata, track the value.
-fn handle_lea(
+/// The abstract value an instruction leaves in its first operand, or `None`
+/// when the instruction is not one of the forms this scanner understands — in
+/// which case the caller discards whatever that register held.
+///
+/// Every form below is one step of the switch-dispatch sequence; the register
+/// state is only ever these three values, so one function covers all of them.
+fn transfer(
     instr: &Instruction,
     elf: &object::read::elf::ElfFile64<'_>,
-    regs: &mut HashMap<Register, AbstractValue>,
-) {
-    // LEA reg, [rip+disp] — destination is always op0 (register)
-    if instr.op_count() < 2 {
-        return;
-    }
-    let dst = match instr.op_kind(0) {
-        OpKind::Register => instr.op_register(0),
-        _ => return,
-    };
-    let Some(gpr) = to_gpr64(dst) else {
-        return;
-    };
-
-    if instr.is_ip_rel_memory_operand() {
-        let target = instr.ip_rel_memory_address();
-        if is_rodata_address(elf, target) {
-            regs.insert(gpr, AbstractValue::RodataAddr(target));
-            return;
+    regs: &RegState,
+) -> Option<AbstractValue> {
+    match instr.mnemonic() {
+        // `lea dst, [rip+disp]` pointing into read-only data: a candidate
+        // table base.
+        Mnemonic::Lea if instr.is_ip_rel_memory_operand() => {
+            let table = instr.ip_rel_memory_address();
+            is_rodata_address(elf, table).then_some(AbstractValue::RodataAddr(table))
         }
-    }
-
-    // LEA used for arithmetic (e.g., lea rax, [rbx+rcx]) — check if it combines base+offset
-    if instr.op_kind(1) == OpKind::Memory {
-        let base_reg = instr.memory_base();
-        let index_reg = instr.memory_index();
-
-        if base_reg != Register::None
-            && index_reg != Register::None
-            && let (Some(gpr_base), Some(gpr_index)) = (to_gpr64(base_reg), to_gpr64(index_reg))
-        {
-            let base_val = regs.get(&gpr_base).cloned();
-            let index_val = regs.get(&gpr_index).cloned();
-            if let Some(table_base) = try_combine(&base_val, &index_val) {
-                regs.insert(gpr, AbstractValue::ComputedTarget { table_base });
-                return;
+        // `lea dst, [base+index]` and `add dst, src` both add a table base to
+        // an entry read out of that table, which is the branch target.
+        Mnemonic::Lea => {
+            let (base, index) = memory_regs(instr);
+            combine(value_of(regs, base), value_of(regs, index))
+        }
+        Mnemonic::Add => combine(operand_value(instr, regs, 0), operand_value(instr, regs, 1)),
+        // `movsxd dst, [table+idx*4]` reads a signed 32-bit entry out of a
+        // tracked table.
+        Mnemonic::Movsxd => {
+            let (table, _) = memory_regs(instr);
+            match value_of(regs, table)? {
+                &AbstractValue::RodataAddr(table_base) => {
+                    Some(AbstractValue::TableEntry { table_base })
+                }
+                _ => None,
             }
         }
-    }
-
-    // Unrecognized LEA pattern — kill the destination
-    regs.remove(&gpr);
-}
-
-/// Handle MOVSXD instruction: if base register holds a RodataAddr, this is a table entry load.
-fn handle_movsxd(instr: &Instruction, regs: &mut HashMap<Register, AbstractValue>) {
-    if instr.op_count() < 2 {
-        return;
-    }
-    let dst = match instr.op_kind(0) {
-        OpKind::Register => instr.op_register(0),
-        _ => return,
-    };
-    let Some(gpr_dst) = to_gpr64(dst) else {
-        return;
-    };
-
-    // Source is a memory operand — check if base register is a tracked RodataAddr
-    if instr.op_kind(1) == OpKind::Memory {
-        let base_reg = instr.memory_base();
-        if base_reg != Register::None
-            && let Some(gpr_base) = to_gpr64(base_reg)
-            && let Some(AbstractValue::RodataAddr(addr)) = regs.get(&gpr_base)
-        {
-            regs.insert(gpr_dst, AbstractValue::TableEntry { table_base: *addr });
-            return;
-        }
-    }
-
-    regs.remove(&gpr_dst);
-}
-
-/// Handle ADD instruction: if one operand is RodataAddr and other is TableEntry, produce ComputedTarget.
-fn handle_add(instr: &Instruction, regs: &mut HashMap<Register, AbstractValue>) {
-    if instr.op_count() < 2 {
-        return;
-    }
-
-    // ADD reg, reg
-    if instr.op_kind(0) == OpKind::Register && instr.op_kind(1) == OpKind::Register {
-        let dst = instr.op_register(0);
-        let src = instr.op_register(1);
-        let (Some(gpr_dst), Some(gpr_src)) = (to_gpr64(dst), to_gpr64(src)) else {
-            return;
-        };
-
-        let dst_val = regs.get(&gpr_dst).cloned();
-        let src_val = regs.get(&gpr_src).cloned();
-
-        if let Some(table_base) = try_combine(&dst_val, &src_val) {
-            regs.insert(gpr_dst, AbstractValue::ComputedTarget { table_base });
-            return;
-        }
-    }
-
-    // Any other ADD pattern — kill destination
-    if instr.op_kind(0) == OpKind::Register
-        && let Some(gpr) = to_gpr64(instr.op_register(0))
-    {
-        regs.remove(&gpr);
-    }
-}
-
-/// Handle MOV reg, reg: copy abstract value.
-fn handle_mov(instr: &Instruction, regs: &mut HashMap<Register, AbstractValue>) {
-    if instr.op_count() < 2 {
-        return;
-    }
-
-    if instr.op_kind(0) == OpKind::Register && instr.op_kind(1) == OpKind::Register {
-        let dst = instr.op_register(0);
-        let src = instr.op_register(1);
-        if let (Some(gpr_dst), Some(gpr_src)) = (to_gpr64(dst), to_gpr64(src)) {
-            if let Some(val) = regs.get(&gpr_src).cloned() {
-                regs.insert(gpr_dst, val);
-            } else {
-                regs.remove(&gpr_dst);
-            }
-            return;
-        }
-    }
-
-    // MOV reg, mem or MOV reg, imm — kill destination
-    if instr.op_kind(0) == OpKind::Register
-        && let Some(gpr) = to_gpr64(instr.op_register(0))
-    {
-        regs.remove(&gpr);
-    }
-}
-
-/// Try to combine two abstract values into a ComputedTarget.
-/// Returns Some(table_base) if one is RodataAddr and the other is TableEntry with matching base.
-fn try_combine(a: &Option<AbstractValue>, b: &Option<AbstractValue>) -> Option<u64> {
-    match (a, b) {
-        (Some(AbstractValue::RodataAddr(addr)), Some(AbstractValue::TableEntry { table_base }))
-        | (Some(AbstractValue::TableEntry { table_base }), Some(AbstractValue::RodataAddr(addr)))
-            if addr == table_base =>
-        {
-            Some(*table_base)
-        }
+        // `mov dst, src` carries whatever `src` held.
+        Mnemonic::Mov => operand_value(instr, regs, 1).cloned(),
         _ => None,
     }
 }
 
-/// Kill the destination register of an instruction that writes to a GP register.
-fn kill_dest_register(instr: &Instruction, regs: &mut HashMap<Register, AbstractValue>) {
-    if instr.op_count() >= 1
-        && instr.op_kind(0) == OpKind::Register
-        && let Some(gpr) = to_gpr64(instr.op_register(0))
-    {
-        regs.remove(&gpr);
+/// Add a table base to an entry read out of that same table, in either operand
+/// order, giving the jump target the dispatch branches to. Any other pair of
+/// values is not part of the pattern.
+fn combine(a: Option<&AbstractValue>, b: Option<&AbstractValue>) -> Option<AbstractValue> {
+    match (a?, b?) {
+        (AbstractValue::RodataAddr(addr), AbstractValue::TableEntry { table_base })
+        | (AbstractValue::TableEntry { table_base }, AbstractValue::RodataAddr(addr))
+            if addr == table_base =>
+        {
+            Some(AbstractValue::ComputedTarget {
+                table_base: *table_base,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -339,7 +241,7 @@ fn is_rodata_address(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> bool 
 ///    - Validate the target lands inside `func_base .. func_base + func_size`
 /// 4. Stop at the first entry that fails, at the next detected table, or at the
 ///    end of the section
-pub fn identify_table_bounds(
+fn identify_table_bounds(
     elf: &object::read::elf::ElfFile64<'_>,
     table_base: u64,
     func_base: u64,
@@ -377,7 +279,6 @@ pub fn identify_table_bounds(
 
     Ok(JumpTable {
         table_vaddr: table_base,
-        num_entries: targets.len(),
         targets,
     })
 }
@@ -445,7 +346,74 @@ fn scan_table_entries(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TABLE_ENTRIES, scan_table_entries};
+    use super::{MAX_TABLE_ENTRIES, detect_jump_tables, scan_table_entries};
+    use object::{Object, ObjectSection, ObjectSymbol};
+
+    /// A function's machine code, with the virtual address it was linked at.
+    fn function_code(elf: &object::read::elf::ElfFile64<'_>, symbol: &str) -> (Vec<u8>, u64) {
+        let sym = elf
+            .dynamic_symbols()
+            .find(|s| s.name() == Ok(symbol))
+            .unwrap_or_else(|| panic!("no symbol '{symbol}'"));
+        let object::SymbolSection::Section(si) = sym.section() else {
+            panic!("'{symbol}' is not in a section");
+        };
+        let section = elf.section_by_index(si).expect("symbol section");
+        let data = section.data().expect("section data");
+        let start = (sym.address() - section.address()) as usize;
+        (
+            data[start..start + sym.size() as usize].to_vec(),
+            sym.address(),
+        )
+    }
+
+    /// The symbolic executor has to recognise the dispatch sequence a real
+    /// compiler emits — `lea` of the table in `.rodata`, `movsxd` of an entry,
+    /// `add` to fold the two together, indirect `jmp` — across the register
+    /// shuffling that sits between those four instructions in optimized code.
+    ///
+    /// `pcre2_config_8` is a plain `switch` over its first argument, compiled
+    /// into two such tables of sixteen entries each. Recovering them is what
+    /// lets the merged copy of the function dispatch at all: the entries are
+    /// offsets relative to the table, so without a relocation per entry the
+    /// copied table still points where the library used to be loaded.
+    #[test]
+    fn recovers_the_switch_tables_of_a_real_function() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/libs/libpcre2-8.so.0"
+        ))
+        .expect("read library");
+        let file = object::File::parse(&*bytes).expect("parse library");
+        let object::File::Elf64(elf) = &file else {
+            panic!("not ELF64")
+        };
+
+        let (code, base) = function_code(elf, "pcre2_config_8");
+        let tables = detect_jump_tables(&code, base, "pcre2_config_8", elf).expect("detect");
+        assert_eq!(tables.len(), 2, "{tables:#x?}");
+
+        let rodata = elf.section_by_name(".rodata").expect(".rodata");
+        let rodata = rodata.address()..rodata.address() + rodata.size();
+        for table in &tables {
+            assert_eq!(table.targets.len(), 16, "{table:#x?}");
+            assert!(
+                rodata.contains(&table.table_vaddr),
+                "table at {:#x} is not in .rodata",
+                table.table_vaddr
+            );
+            // Every entry must branch into the function that owns the table;
+            // an entry outside it would be a neighbouring table's, relocated
+            // against the wrong function.
+            assert!(
+                table
+                    .targets
+                    .iter()
+                    .all(|t| (base..base + code.len() as u64).contains(t)),
+                "{table:#x?}"
+            );
+        }
+    }
 
     const SECTION_ADDR: u64 = 0x7e000;
     const FUNC_BASE: u64 = 0x3350;
