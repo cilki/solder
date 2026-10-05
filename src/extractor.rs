@@ -271,6 +271,21 @@ fn depend_on(
     RelocTarget::MergedUnit(UnitId(u32::MAX))
 }
 
+/// A synthetic PC-relative relocation over a displacement the instruction
+/// scanner found, at `offset` bytes into the unit being extracted. Every
+/// scanned reference is patched the same way — only the displacement width,
+/// the addend and the target differ.
+fn pcrel_reloc(offset: u64, size: u8, addend: i64, target: RelocTarget) -> ExtractedReloc {
+    ExtractedReloc {
+        offset_within_unit: offset,
+        kind: object::RelocationKind::Relative,
+        encoding: object::RelocationEncoding::Generic,
+        size,
+        addend,
+        target,
+    }
+}
+
 /// Reject relocation kinds that need a GOT we cannot reproduce. `ctx` names the
 /// symbol or section being extracted.
 fn reject_got_reloc(
@@ -541,27 +556,24 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                 // rel8 (short jump) displacements get an 8-bit relocation; the
                 // relocator verifies the final offset still fits.
                 let reloc_size: u8 = if rip_ref.disp_size == 1 { 8 } else { 32 };
-                let reloc_addend = rip_ref.addend;
                 // First check if this is a PLT call (call to external symbol)
                 if let Some(ext_name) = plt_map.target(target_addr) {
                     // PLT call resolution order:
-                    //   1. Executable exports the symbol → trampoline through exe's GOT.
-                    //   2. Another merged library defines the symbol → extract from
-                    //      that library and create a direct merged-unit reference.
-                    //   3. Otherwise unresolvable; leaving the original library
-                    //      offset in place will crash if this path runs. Warn so
-                    //      it's at least visible.
-                    if state.external_syms.contains(&ext_name) {
-                        relocations.push(ExtractedReloc {
-                            offset_within_unit: rip_ref.offset as u64,
-                            kind: object::RelocationKind::Relative,
-                            encoding: object::RelocationEncoding::Generic,
-                            size: reloc_size,
-                            addend: reloc_addend,
-                            target: RelocTarget::External(ext_name),
-                        });
-                    } else if let Some(other_lib) = state.cross_lib_syms.get(&ext_name).cloned() {
-                        let target = depend_on(
+                    //   1. Another merged library defines the symbol, and the
+                    //      executable's own .dynsym does not mention it →
+                    //      extract from that library and create a direct
+                    //      merged-unit reference.
+                    //   2. Otherwise the symbol stays external. Either the
+                    //      executable already exports or imports it, in which
+                    //      case the reference trampolines through the exe's
+                    //      GOT, or it is a libc/runtime symbol the executable
+                    //      does not import yet, in which case the writer
+                    //      injects a .dynsym entry and a GLOB_DAT relocation
+                    //      so ld.so resolves it at load time.
+                    let target = if !state.external_syms.contains(&ext_name)
+                        && let Some(other_lib) = state.cross_lib_syms.get(&ext_name).cloned()
+                    {
+                        depend_on(
                             UnitKey {
                                 lib: other_lib,
                                 sym: ext_name,
@@ -569,30 +581,16 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                             relocations.len(),
                             &mut new_deps,
                             &mut pending_relocs,
-                        );
-                        relocations.push(ExtractedReloc {
-                            offset_within_unit: rip_ref.offset as u64,
-                            kind: object::RelocationKind::Relative,
-                            encoding: object::RelocationEncoding::Generic,
-                            size: reloc_size,
-                            addend: reloc_addend,
-                            target,
-                        });
+                        )
                     } else {
-                        // Not in exe and not in merged libs: a libc/runtime
-                        // symbol the executable doesn't already import. Emit
-                        // an External reloc; the writer will inject a new
-                        // .dynsym entry and a GLOB_DAT relocation so ld.so
-                        // resolves it at load time.
-                        relocations.push(ExtractedReloc {
-                            offset_within_unit: rip_ref.offset as u64,
-                            kind: object::RelocationKind::Relative,
-                            encoding: object::RelocationEncoding::Generic,
-                            size: reloc_size,
-                            addend: reloc_addend,
-                            target: RelocTarget::External(ext_name),
-                        });
-                    }
+                        RelocTarget::External(ext_name)
+                    };
+                    relocations.push(pcrel_reloc(
+                        rip_ref.offset as u64,
+                        reloc_size,
+                        rip_ref.addend,
+                        target,
+                    ));
                 } else {
                     // Direct call/jmp to an internal address. Prefer a named
                     // symbol; otherwise synthesize an anonymous unit for a
@@ -616,17 +614,15 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                             &mut new_deps,
                             &mut pending_relocs,
                         );
-                        // Add synthetic PC-relative relocation. The relocator
-                        // computes S + A - P against the unit's base, so an
-                        // interior target is reached through the addend.
-                        relocations.push(ExtractedReloc {
-                            offset_within_unit: rip_ref.offset as u64,
-                            kind: object::RelocationKind::Relative,
-                            encoding: object::RelocationEncoding::Generic,
-                            size: reloc_size,
-                            addend: reloc_addend + offset_in_target as i64,
+                        // The relocator computes S + A - P against the unit's
+                        // base, so an interior target is reached through the
+                        // addend.
+                        relocations.push(pcrel_reloc(
+                            rip_ref.offset as u64,
+                            reloc_size,
+                            rip_ref.addend + offset_in_target as i64,
                             target,
-                        });
+                        ));
                     } else {
                         warn!(
                             symbol = key.sym,
@@ -655,14 +651,12 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                         &mut new_deps,
                         &mut pending_relocs,
                     );
-                    relocations.push(ExtractedReloc {
-                        offset_within_unit: rip_ref.offset as u64,
-                        kind: object::RelocationKind::Relative,
-                        encoding: object::RelocationEncoding::Generic,
-                        size: 32,
-                        addend: rip_ref.addend + offset_in_target as i64,
+                    relocations.push(pcrel_reloc(
+                        rip_ref.offset as u64,
+                        32,
+                        rip_ref.addend + offset_in_target as i64,
                         target,
-                    });
+                    ));
                     continue;
                 }
                 // Otherwise try to extract the data section
@@ -671,15 +665,12 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                 {
                     let offset_in_blob = target_addr - blob_base;
                     new_deps.extend(blob_deps);
-                    // Add synthetic PC-relative relocation pointing to data blob
-                    relocations.push(ExtractedReloc {
-                        offset_within_unit: rip_ref.offset as u64,
-                        kind: object::RelocationKind::Relative,
-                        encoding: object::RelocationEncoding::Generic,
-                        size: 32,
-                        addend: rip_ref.addend,
-                        target: RelocTarget::DataBlobOffset(blob_id, offset_in_blob),
-                    });
+                    relocations.push(pcrel_reloc(
+                        rip_ref.offset as u64,
+                        32,
+                        rip_ref.addend,
+                        RelocTarget::DataBlobOffset(blob_id, offset_in_blob),
+                    ));
                 } else {
                     warn!(
                         symbol = key.sym,
@@ -750,14 +741,12 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                     if let Some(blob_unit) = state.units.iter_mut().find(|u| u.id == blob_id) {
                         let reloc_idx = blob_unit.relocations.len();
 
-                        blob_unit.relocations.push(ExtractedReloc {
-                            offset_within_unit: entry_offset_in_blob,
-                            kind: object::RelocationKind::Relative,
-                            encoding: object::RelocationEncoding::Generic,
-                            size: 32,
-                            addend, // Offset within target function, adjusted for PC-relative
-                            target: RelocTarget::MergedUnit(UnitId(u32::MAX)), // Placeholder
-                        });
+                        blob_unit.relocations.push(pcrel_reloc(
+                            entry_offset_in_blob,
+                            32,
+                            addend, // offset within target function, PC-relative
+                            RelocTarget::MergedUnit(UnitId(u32::MAX)), // placeholder
+                        ));
 
                         // The target is this very unit, which is already being
                         // extracted, so there is no new dependency to enqueue —
