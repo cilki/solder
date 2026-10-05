@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 
-use crate::elf_reader::va_to_file_offset;
+use crate::elf_reader::{DynamicTable, va_to_file_offset};
 use crate::layout::align_up;
 use crate::types::{MergePlan, RelativeReloc};
 
@@ -130,8 +130,8 @@ pub fn write_output(
         .context("parsing patched executable for output")?;
     let endian = exe.endian();
 
-    // Pre-compute .dynamic section info from the ORIGINAL exe before we modify headers.
-    let dynamic_info = parse_dynamic_info(patched_exe)?;
+    // Read .dynamic from the ORIGINAL exe before we modify headers.
+    let dynamic = DynamicTable::parse(patched_exe).context("reading .dynamic for output")?;
 
     // Collect existing program headers.
     let old_phdrs: Vec<object::elf::ProgramHeader64<object::Endianness>> =
@@ -151,7 +151,7 @@ pub fn write_output(
         || !plan.got_imports.is_empty()
         || !plan.add_needed.is_empty();
     let (extended_seg, ext_info) = if needs_rela_extension || needs_symbol_extension {
-        build_extended_segment(patched_exe, merged_seg, plan, &dynamic_info, &exe)?
+        build_extended_segment(patched_exe, merged_seg, plan, &dynamic, &exe)?
     } else {
         (merged_seg.to_vec(), ExtensionInfo::default())
     };
@@ -252,12 +252,12 @@ pub fn write_output(
     // Update .dynamic entries for any sections we relocated into the merged
     // segment. Each update writes only the d_val field (offset +8 from the
     // entry start); d_tag is untouched.
-    apply_extension_info(&mut out, &dynamic_info, &ext_info)?;
+    apply_extension_info(&mut out, &dynamic, &ext_info);
 
     // Point DT_PREINIT_ARRAY/DT_FINI_ARRAY at our arrays and add a DT_NEEDED
     // entry per inherited soname.
     if plan.init_fini.is_some() || !plan.add_needed.is_empty() {
-        update_dynamic_entries(&mut out, plan, &dynamic_info, &ext_info)?;
+        update_dynamic_entries(&mut out, plan, &dynamic, &ext_info)?;
     }
 
     // `output_path` is the input executable, so read its mode before the write
@@ -357,153 +357,17 @@ const R_X86_64_RELATIVE: u32 = 8;
 /// Size of an Elf64_Rela entry
 const RELA_ENTRY_SIZE: usize = 24;
 
-/// Size of an Elf64_Dyn entry
-const DYN_ENTRY_SIZE: usize = 16;
-
-/// Pre-parsed .dynamic section info to avoid re-parsing modified ELF.
-#[derive(Debug, Default)]
-struct DynamicInfo {
-    /// File offset of the .dynamic section
-    section_offset: u64,
-    /// Index and value of various DT_* entries
-    dt_rela_idx: Option<usize>,
-    dt_rela_val: Option<u64>,
-    dt_relasz_idx: Option<usize>,
-    dt_relasz_val: Option<u64>,
-    dt_relacount_idx: Option<usize>,
-    dt_relacount_val: Option<u64>,
-    dt_preinit_array_idx: Option<usize>,
-    dt_preinit_arraysz_idx: Option<usize>,
-    dt_fini_array_idx: Option<usize>,
-    dt_fini_arraysz_idx: Option<usize>,
-    dt_strtab_idx: Option<usize>,
-    dt_strtab_val: Option<u64>,
-    dt_strsz_idx: Option<usize>,
-    dt_strsz_val: Option<u64>,
-    dt_symtab_idx: Option<usize>,
-    dt_symtab_val: Option<u64>,
-    dt_versym_idx: Option<usize>,
-    dt_versym_val: Option<u64>,
-    /// Number of entries before the DT_NULL terminator.
-    used_entries: usize,
-    /// Total 16-byte slots in the .dynamic section.
-    capacity: usize,
-}
-
-/// Summary of which sections were rebuilt in the merged segment and the new
-/// VAs / sizes that need to land in .dynamic.
+/// What `build_extended_segment` rebuilt in the merged segment, as the
+/// `.dynamic` edits that make the loader read the new copies.
 #[derive(Debug, Default)]
 struct ExtensionInfo {
-    rela_va: Option<u64>,
-    rela_size: Option<u64>,
-    rela_count: Option<u64>,
-    strtab_va: Option<u64>,
-    strtab_size: Option<u64>,
+    /// `(d_tag, new d_val)` per entry to repoint. An entry the executable does
+    /// not have is skipped: there is nothing pointing at the old table either,
+    /// so nothing to redirect.
+    dyn_updates: Vec<(u64, u64)>,
     /// Offset into the rebuilt `.dynstr` of each `plan.add_needed` soname, in
     /// the same order, for the `DT_NEEDED` entries that reference them.
     needed_name_offsets: Vec<u32>,
-    symtab_va: Option<u64>,
-    versym_va: Option<u64>,
-}
-
-/// Parse .dynamic section info from an unmodified ELF.
-fn parse_dynamic_info(bytes: &[u8]) -> Result<DynamicInfo> {
-    let goblin_elf = goblin::elf::Elf::parse(bytes).context("goblin parse for .dynamic info")?;
-
-    let mut info = DynamicInfo::default();
-
-    // Find .dynamic section offset and size
-    let mut section_size: u64 = 0;
-    for sh in &goblin_elf.section_headers {
-        if goblin_elf.shdr_strtab.get_at(sh.sh_name) == Some(".dynamic") {
-            info.section_offset = sh.sh_offset;
-            section_size = sh.sh_size;
-            break;
-        }
-    }
-
-    if info.section_offset == 0 {
-        // Try to find via PT_DYNAMIC program header
-        for ph in &goblin_elf.program_headers {
-            if ph.p_type == goblin::elf::program_header::PT_DYNAMIC {
-                info.section_offset = ph.p_offset;
-                section_size = ph.p_filesz;
-                break;
-            }
-        }
-    }
-
-    if info.section_offset == 0 {
-        bail!(".dynamic section not found");
-    }
-
-    // How many 16-byte slots the section holds, and how many precede the
-    // DT_NULL terminator. New entries are appended at the terminator (pushing
-    // it down into spare capacity) — slots after the terminator are invisible
-    // to ld.so, so they can't be written directly.
-    info.capacity = (section_size / DYN_ENTRY_SIZE as u64) as usize;
-    info.used_entries = info.capacity; // assume full unless a terminator is found
-    for i in 0..info.capacity {
-        let off = info.section_offset as usize + i * DYN_ENTRY_SIZE;
-        if off + DYN_ENTRY_SIZE <= bytes.len()
-            && u64::from_le_bytes(bytes[off..off + 8].try_into().expect("8 bytes")) == 0
-        {
-            info.used_entries = i;
-            break;
-        }
-    }
-
-    // Parse dynamic entries
-    if let Some(dynamic) = &goblin_elf.dynamic {
-        for (i, entry) in dynamic.dyns.iter().enumerate() {
-            match entry.d_tag {
-                goblin::elf::dynamic::DT_RELA => {
-                    info.dt_rela_idx = Some(i);
-                    info.dt_rela_val = Some(entry.d_val);
-                }
-                goblin::elf::dynamic::DT_RELASZ => {
-                    info.dt_relasz_idx = Some(i);
-                    info.dt_relasz_val = Some(entry.d_val);
-                }
-                goblin::elf::dynamic::DT_RELACOUNT => {
-                    info.dt_relacount_idx = Some(i);
-                    info.dt_relacount_val = Some(entry.d_val);
-                }
-                goblin::elf::dynamic::DT_PREINIT_ARRAY => {
-                    info.dt_preinit_array_idx = Some(i);
-                }
-                goblin::elf::dynamic::DT_PREINIT_ARRAYSZ => {
-                    info.dt_preinit_arraysz_idx = Some(i);
-                }
-                goblin::elf::dynamic::DT_FINI_ARRAY => {
-                    info.dt_fini_array_idx = Some(i);
-                }
-                goblin::elf::dynamic::DT_FINI_ARRAYSZ => {
-                    info.dt_fini_arraysz_idx = Some(i);
-                }
-                goblin::elf::dynamic::DT_STRTAB => {
-                    info.dt_strtab_idx = Some(i);
-                    info.dt_strtab_val = Some(entry.d_val);
-                }
-                goblin::elf::dynamic::DT_STRSZ => {
-                    info.dt_strsz_idx = Some(i);
-                    info.dt_strsz_val = Some(entry.d_val);
-                }
-                goblin::elf::dynamic::DT_SYMTAB => {
-                    info.dt_symtab_idx = Some(i);
-                    info.dt_symtab_val = Some(entry.d_val);
-                }
-                0x6ffffff0u64 => {
-                    // DT_VERSYM
-                    info.dt_versym_idx = Some(i);
-                    info.dt_versym_val = Some(entry.d_val);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(info)
 }
 
 /// R_X86_64_GLOB_DAT relocation type.
@@ -532,9 +396,13 @@ fn build_extended_segment(
     patched_exe: &[u8],
     merged_seg: &[u8],
     plan: &MergePlan,
-    dyn_info: &DynamicInfo,
+    dynamic: &DynamicTable,
     exe: &object::read::elf::ElfFile64<'_, object::Endianness>,
 ) -> Result<(Vec<u8>, ExtensionInfo)> {
+    use goblin::elf::dynamic::{
+        DT_RELA, DT_RELACOUNT, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMTAB, DT_VERSYM,
+    };
+
     let mut extended = Vec::from(merged_seg);
     let mut info = ExtensionInfo::default();
 
@@ -554,18 +422,16 @@ fn build_extended_segment(
     // got_imports whose symbol is in neither the exe's .dynsym nor this list.
     let mut injects: Vec<(String, bool)> = Vec::new();
 
-    if !plan.new_externals.is_empty()
-        || !plan.got_imports.is_empty()
-        || !plan.add_needed.is_empty()
+    if !plan.new_externals.is_empty() || !plan.got_imports.is_empty() || !plan.add_needed.is_empty()
     {
-        let (old_dynstr, old_dynsym, old_versym) = read_dynsym_tables(patched_exe, exe, dyn_info)?;
+        let (old_dynstr, old_dynsym, old_versym) = read_dynsym_tables(patched_exe, exe, dynamic)?;
         let old_num_syms = old_dynsym.len() / SYM_ENTRY_SIZE;
         new_sym_idx_base = old_num_syms;
 
         for i in 0..old_num_syms {
-            let st_name =
-                u32::from_le_bytes(old_dynsym[i * SYM_ENTRY_SIZE..i * SYM_ENTRY_SIZE + 4].try_into()?)
-                    as usize;
+            let st_name = u32::from_le_bytes(
+                old_dynsym[i * SYM_ENTRY_SIZE..i * SYM_ENTRY_SIZE + 4].try_into()?,
+            ) as usize;
             if st_name < old_dynstr.len()
                 && let Some(end) = old_dynstr[st_name..].iter().position(|&b| b == 0)
                 && end > 0
@@ -639,10 +505,12 @@ fn build_extended_segment(
                 extended.extend_from_slice(&VER_NDX_GLOBAL.to_le_bytes());
             }
 
-            info.strtab_va = Some(plan.load_address + dynstr_offset_in_seg as u64);
-            info.strtab_size = Some(dynstr_size as u64);
-            info.symtab_va = Some(plan.load_address + dynsym_offset_in_seg as u64);
-            info.versym_va = Some(plan.load_address + versym_offset_in_seg as u64);
+            info.dyn_updates.extend([
+                (DT_STRTAB, plan.load_address + dynstr_offset_in_seg as u64),
+                (DT_STRSZ, dynstr_size as u64),
+                (DT_SYMTAB, plan.load_address + dynsym_offset_in_seg as u64),
+                (DT_VERSYM, plan.load_address + versym_offset_in_seg as u64),
+            ]);
         }
     }
 
@@ -663,7 +531,7 @@ fn build_extended_segment(
         || !plan.got_imports.is_empty();
     if need_new_rela {
         let (existing_relative, existing_non_relative, old_relacount) =
-            read_existing_rela_dyn(patched_exe, exe, dyn_info)?;
+            read_existing_rela_dyn(patched_exe, exe, dynamic)?;
 
         // New RELATIVE entries for PIE (trampolines, GOT patches, init/fini).
         let mut new_relative = Vec::with_capacity(plan.relative_relocs.len() * RELA_ENTRY_SIZE);
@@ -712,9 +580,11 @@ fn build_extended_segment(
             + new_glob_dat.len();
         let new_count = old_relacount + (plan.relative_relocs.len() as u64);
 
-        info.rela_va = Some(plan.load_address + rela_offset_in_seg as u64);
-        info.rela_size = Some(total_size as u64);
-        info.rela_count = Some(new_count);
+        info.dyn_updates.extend([
+            (DT_RELA, plan.load_address + rela_offset_in_seg as u64),
+            (DT_RELASZ, total_size as u64),
+            (DT_RELACOUNT, new_count),
+        ]);
     }
 
     Ok((extended, info))
@@ -726,23 +596,25 @@ fn build_extended_segment(
 fn read_dynsym_tables(
     patched_exe: &[u8],
     exe: &object::read::elf::ElfFile64<'_, object::Endianness>,
-    dyn_info: &DynamicInfo,
+    dynamic: &DynamicTable,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let strtab_va = dyn_info
-        .dt_strtab_val
+    use goblin::elf::dynamic::{DT_STRSZ, DT_STRTAB, DT_SYMTAB, DT_VERSYM};
+
+    let strtab_va = dynamic
+        .value_of(DT_STRTAB)
         .context("executable missing DT_STRTAB")?;
-    let strsz = dyn_info
-        .dt_strsz_val
+    let strsz = dynamic
+        .value_of(DT_STRSZ)
         .context("executable missing DT_STRSZ")? as usize;
-    let symtab_va = dyn_info
-        .dt_symtab_val
+    let symtab_va = dynamic
+        .value_of(DT_SYMTAB)
         .context("executable missing DT_SYMTAB")?;
-    let versym_va = dyn_info
-        .dt_versym_val
+    let versym_va = dynamic
+        .value_of(DT_VERSYM)
         .context("executable missing DT_VERSYM")?;
 
-    let strtab_off = va_to_file_offset(exe, strtab_va).context("DT_STRTAB not in any PT_LOAD")?
-        as usize;
+    let strtab_off =
+        va_to_file_offset(exe, strtab_va).context("DT_STRTAB not in any PT_LOAD")? as usize;
 
     // .dynsym size has to come from the section header — DT_SYMENT only gives
     // the per-entry width, and there is no DT_SYMSZ.
@@ -760,10 +632,10 @@ fn read_dynsym_tables(
     let dynsym_size = dynsym_size.context(".dynsym section header not found")?;
     let versym_size = versym_size.context(".gnu.version section header not found")?;
 
-    let symtab_off = va_to_file_offset(exe, symtab_va).context("DT_SYMTAB not in any PT_LOAD")?
-        as usize;
-    let versym_off = va_to_file_offset(exe, versym_va).context("DT_VERSYM not in any PT_LOAD")?
-        as usize;
+    let symtab_off =
+        va_to_file_offset(exe, symtab_va).context("DT_SYMTAB not in any PT_LOAD")? as usize;
+    let versym_off =
+        va_to_file_offset(exe, versym_va).context("DT_VERSYM not in any PT_LOAD")? as usize;
 
     if strtab_off + strsz > patched_exe.len() {
         bail!(".dynstr extends past end of file");
@@ -787,15 +659,17 @@ fn read_dynsym_tables(
 fn read_existing_rela_dyn(
     patched_exe: &[u8],
     exe: &object::read::elf::ElfFile64<'_, object::Endianness>,
-    dyn_info: &DynamicInfo,
+    dynamic: &DynamicTable,
 ) -> Result<(Vec<u8>, Vec<u8>, u64)> {
-    let rela_va = dyn_info
-        .dt_rela_val
+    use goblin::elf::dynamic::{DT_RELA, DT_RELACOUNT, DT_RELASZ};
+
+    let rela_va = dynamic
+        .value_of(DT_RELA)
         .context("executable missing DT_RELA")?;
-    let relasz = dyn_info
-        .dt_relasz_val
+    let relasz = dynamic
+        .value_of(DT_RELASZ)
         .context("executable missing DT_RELASZ")? as usize;
-    let relacount = dyn_info.dt_relacount_val.unwrap_or(0);
+    let relacount = dynamic.value_of(DT_RELACOUNT).unwrap_or(0);
 
     let rela_off = va_to_file_offset(exe, rela_va).context("DT_RELA not in any PT_LOAD")? as usize;
     if rela_off + relasz > patched_exe.len() {
@@ -823,54 +697,12 @@ fn pad_to(buf: &mut Vec<u8>, alignment: usize) {
 }
 
 /// Write any updated DT_* d_val fields back into the in-memory .dynamic image.
-fn apply_extension_info(
-    out: &mut [u8],
-    dyn_info: &DynamicInfo,
-    ext: &ExtensionInfo,
-) -> Result<()> {
-    let dyn_section_offset = dyn_info.section_offset as usize;
-    let write_val = |out: &mut [u8], idx: usize, val: u64| {
-        let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-        write_u64_le(out, entry_offset + 8, val);
-    };
-
-    if let Some(va) = ext.rela_va
-        && let Some(idx) = dyn_info.dt_rela_idx
-    {
-        write_val(out, idx, va);
+fn apply_extension_info(out: &mut [u8], dynamic: &DynamicTable, ext: &ExtensionInfo) {
+    for &(tag, val) in &ext.dyn_updates {
+        if let Some(idx) = dynamic.index_of(tag) {
+            write_u64_le(out, dynamic.value_offset(idx), val);
+        }
     }
-    if let Some(sz) = ext.rela_size
-        && let Some(idx) = dyn_info.dt_relasz_idx
-    {
-        write_val(out, idx, sz);
-    }
-    if let Some(c) = ext.rela_count
-        && let Some(idx) = dyn_info.dt_relacount_idx
-    {
-        write_val(out, idx, c);
-    }
-    if let Some(va) = ext.strtab_va
-        && let Some(idx) = dyn_info.dt_strtab_idx
-    {
-        write_val(out, idx, va);
-    }
-    if let Some(sz) = ext.strtab_size
-        && let Some(idx) = dyn_info.dt_strsz_idx
-    {
-        write_val(out, idx, sz);
-    }
-    if let Some(va) = ext.symtab_va
-        && let Some(idx) = dyn_info.dt_symtab_idx
-    {
-        write_val(out, idx, va);
-    }
-    if let Some(va) = ext.versym_va
-        && let Some(idx) = dyn_info.dt_versym_idx
-    {
-        write_val(out, idx, va);
-    }
-
-    Ok(())
 }
 
 /// Rewrite the `.dynamic` entries that the merge changes:
@@ -884,77 +716,57 @@ fn apply_extension_info(
 fn update_dynamic_entries(
     out: &mut [u8],
     plan: &MergePlan,
-    dyn_info: &DynamicInfo,
+    dynamic: &DynamicTable,
     ext: &ExtensionInfo,
 ) -> Result<()> {
-    let dyn_section_offset = dyn_info.section_offset as usize;
+    use goblin::elf::dynamic::{
+        DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_NEEDED, DT_NULL, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ,
+    };
 
     // New entries are appended at the DT_NULL terminator, pushing it down.
     // The last slot must stay DT_NULL so ld.so's scan terminates.
-    let mut next_free = dyn_info.used_entries;
+    let mut next_free = dynamic.used();
 
-    // Helper to write a dynamic entry
     let write_dyn_entry = |out: &mut [u8], idx: usize, tag: u64, val: u64| {
-        let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-        write_u64_le(out, entry_offset, tag);
-        write_u64_le(out, entry_offset + 8, val);
+        write_u64_le(out, dynamic.entry_offset(idx), tag);
+        write_u64_le(out, dynamic.value_offset(idx), val);
     };
 
-    // Update the existing entry for `tag`, or append a new one at the terminator.
-    let mut set_dyn_entry =
-        |out: &mut [u8], existing_idx: Option<usize>, tag: u64, val: u64| -> Result<()> {
-            if let Some(idx) = existing_idx {
-                let entry_offset = dyn_section_offset + idx * DYN_ENTRY_SIZE;
-                write_u64_le(out, entry_offset + 8, val);
-            } else if next_free + 1 < dyn_info.capacity {
+    // Update the existing entry for `tag`, or append a new one at the
+    // terminator. `force_new` is for DT_NEEDED, which repeats rather than
+    // being overwritten.
+    let mut set_dyn_entry = |out: &mut [u8], tag: u64, val: u64, force_new: bool| -> Result<()> {
+        match dynamic.index_of(tag).filter(|_| !force_new) {
+            Some(idx) => write_u64_le(out, dynamic.value_offset(idx), val),
+            None if next_free + 1 < dynamic.capacity() => {
                 write_dyn_entry(out, next_free, tag, val);
                 next_free += 1;
                 // Re-terminate (slots after the old terminator may be garbage).
-                write_dyn_entry(out, next_free, 0, 0);
-            } else {
-                bail!(
-                    ".dynamic has no spare capacity to append dynamic tag {tag:#x} \
-                     ({} slots, {} used)",
-                    dyn_info.capacity,
-                    dyn_info.used_entries
-                );
+                write_dyn_entry(out, next_free, DT_NULL, 0);
             }
-            Ok(())
-        };
+            None => bail!(
+                ".dynamic has no spare capacity to append dynamic tag {tag:#x} \
+                 ({} slots, {} used)",
+                dynamic.capacity(),
+                dynamic.used()
+            ),
+        }
+        Ok(())
+    };
 
     if let Some(init_fini) = &plan.init_fini {
         // Update or create DT_PREINIT_ARRAY entries for merged constructors
         if !init_fini.preinit_entries.is_empty() {
-            let preinit_array_size = (init_fini.preinit_entries.len() * 8) as u64;
-            set_dyn_entry(
-                out,
-                dyn_info.dt_preinit_array_idx,
-                goblin::elf::dynamic::DT_PREINIT_ARRAY,
-                init_fini.preinit_vaddr,
-            )?;
-            set_dyn_entry(
-                out,
-                dyn_info.dt_preinit_arraysz_idx,
-                goblin::elf::dynamic::DT_PREINIT_ARRAYSZ,
-                preinit_array_size,
-            )?;
+            let size = (init_fini.preinit_entries.len() * 8) as u64;
+            set_dyn_entry(out, DT_PREINIT_ARRAY, init_fini.preinit_vaddr, false)?;
+            set_dyn_entry(out, DT_PREINIT_ARRAYSZ, size, false)?;
         }
 
         // Update or create DT_FINI_ARRAY entries
         if !init_fini.combined_fini_entries.is_empty() {
-            let fini_array_size = (init_fini.combined_fini_entries.len() * 8) as u64;
-            set_dyn_entry(
-                out,
-                dyn_info.dt_fini_array_idx,
-                goblin::elf::dynamic::DT_FINI_ARRAY,
-                init_fini.combined_fini_vaddr,
-            )?;
-            set_dyn_entry(
-                out,
-                dyn_info.dt_fini_arraysz_idx,
-                goblin::elf::dynamic::DT_FINI_ARRAYSZ,
-                fini_array_size,
-            )?;
+            let size = (init_fini.combined_fini_entries.len() * 8) as u64;
+            set_dyn_entry(out, DT_FINI_ARRAY, init_fini.combined_fini_vaddr, false)?;
+            set_dyn_entry(out, DT_FINI_ARRAYSZ, size, false)?;
         }
     }
 
@@ -970,13 +782,7 @@ fn update_dynamic_entries(
             );
         }
         for (soname, &name_offset) in plan.add_needed.iter().zip(&ext.needed_name_offsets) {
-            set_dyn_entry(
-                out,
-                None,
-                goblin::elf::dynamic::DT_NEEDED,
-                name_offset as u64,
-            )
-            .with_context(|| {
+            set_dyn_entry(out, DT_NEEDED, name_offset as u64, true).with_context(|| {
                 format!("adding DT_NEEDED '{soname}' inherited from a merged library")
             })?;
         }

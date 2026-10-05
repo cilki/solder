@@ -409,30 +409,17 @@ fn print_merge_plan(
 fn parse_exe_init_fini(
     exe_elf: &object::read::elf::ElfFile64<'_>,
 ) -> Result<types::ExeInitFiniInfo> {
-    let exe_bytes = exe_elf.data();
-    let goblin = goblin::elf::Elf::parse(exe_bytes).context("goblin for init/fini parsing")?;
+    use goblin::elf::dynamic::{
+        DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ,
+    };
 
-    let mut info = types::ExeInitFiniInfo::default();
+    let dynamic = elf_reader::DynamicTable::parse(exe_elf.data())
+        .context("reading .dynamic for init/fini arrays")?;
 
-    if let Some(dynamic) = &goblin.dynamic {
-        for entry in &dynamic.dyns {
-            match entry.d_tag {
-                goblin::elf::dynamic::DT_PREINIT_ARRAY => {
-                    info.preinit_array_vaddr = Some(entry.d_val);
-                }
-                goblin::elf::dynamic::DT_PREINIT_ARRAYSZ => {
-                    info.preinit_array_size = entry.d_val;
-                }
-                goblin::elf::dynamic::DT_FINI_ARRAY => {
-                    info.fini_array_vaddr = Some(entry.d_val);
-                }
-                goblin::elf::dynamic::DT_FINI_ARRAYSZ => {
-                    info.fini_array_size = entry.d_val;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(info)
+    Ok(types::ExeInitFiniInfo {
+        preinit_array_vaddr: dynamic.value_of(DT_PREINIT_ARRAY),
+        preinit_array_size: dynamic.value_of(DT_PREINIT_ARRAYSZ).unwrap_or(0),
+        fini_array_vaddr: dynamic.value_of(DT_FINI_ARRAY),
+        fini_array_size: dynamic.value_of(DT_FINI_ARRAYSZ).unwrap_or(0),
+    })
 }

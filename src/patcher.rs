@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 
+use crate::elf_reader::{DYN_ENTRY_SIZE, DynamicTable};
 use crate::types::{MergePlan, RelativeReloc};
 
 /// Apply all in-place patches to a mutable copy of the executable bytes:
@@ -82,63 +83,41 @@ fn zero_copy_relocs(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
 /// Strategy: find the entry in .dynamic matching the soname, then shift all
 /// subsequent entries up by one slot, zeroing the last slot.
 fn remove_dt_needed(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
+    use goblin::elf::dynamic::DT_NEEDED;
+
     if plan.remove_needed.is_empty() {
         return Ok(());
     }
 
-    // Parse goblin to collect the entry indices and section offset, then drop
-    // the borrow before mutating `bytes`.
-    let (dyn_section_offset, num_entries, removal_indices): (u64, usize, Vec<usize>) = {
-        let goblin_elf =
-            goblin::elf::Elf::parse(bytes).context("goblin parse for DT_NEEDED removal")?;
+    let dynamic = DynamicTable::parse(bytes).context("reading .dynamic for DT_NEEDED removal")?;
 
-        let dynamic = match &goblin_elf.dynamic {
-            Some(d) => d,
-            None => return Ok(()),
-        };
+    let mut removal_indices: Vec<usize> = plan
+        .remove_needed
+        .iter()
+        .filter_map(|soname| {
+            dynamic
+                .entries_of(DT_NEEDED)
+                .find(|&(_, val)| dynamic.string_at(bytes, val) == Some(soname.as_str()))
+                .map(|(idx, _)| idx)
+        })
+        .collect();
 
-        let dyn_section_offset = find_section_file_offset(bytes, ".dynamic")?;
-        if dyn_section_offset == 0 {
-            return Ok(());
-        }
-
-        let num_entries = dynamic.dyns.len();
-
-        let mut indices = Vec::new();
-        for soname in &plan.remove_needed {
-            if let Some(idx) = dynamic.dyns.iter().position(|entry| {
-                entry.d_tag == goblin::elf::dynamic::DT_NEEDED
-                    && goblin_elf
-                        .dynstrtab
-                        .get_at(entry.d_val as usize)
-                        .map(|s| s == soname)
-                        .unwrap_or(false)
-            }) {
-                indices.push(idx);
-            }
-        }
-        (dyn_section_offset, num_entries, indices)
-        // goblin_elf + borrow of bytes is dropped here
-    };
-
-    // Each Elf64_Dyn entry is 16 bytes: d_tag(8) + d_val/d_ptr(8)
-    const ENTRY_SIZE: usize = 16;
-    let base = dyn_section_offset as usize;
+    // The DT_NULL terminator shifts up along with the entries behind the one
+    // being dropped, so it is part of the range that moves.
+    let slots = (dynamic.used() + 1).min(dynamic.capacity());
 
     // Process removals in reverse index order so earlier removals don't shift later indices.
-    let mut sorted_indices = removal_indices;
-    sorted_indices.sort_unstable_by(|a, b| b.cmp(a)); // descending
+    removal_indices.sort_unstable_by(|a, b| b.cmp(a)); // descending
 
-    for idx in sorted_indices {
-        // Shift entries [idx+1 .. num_entries) up by one slot.
-        let src_start = base + (idx + 1) * ENTRY_SIZE;
-        let dst_start = base + idx * ENTRY_SIZE;
-        let move_count = (num_entries - idx - 1) * ENTRY_SIZE;
-        bytes.copy_within(src_start..src_start + move_count, dst_start);
+    for idx in removal_indices {
+        // Shift entries [idx+1 .. slots) up by one slot.
+        let src = dynamic.entry_offset(idx + 1);
+        let moved = (slots - idx - 1) * DYN_ENTRY_SIZE;
+        bytes.copy_within(src..src + moved, dynamic.entry_offset(idx));
 
         // Zero the last entry.
-        let last_start = base + (num_entries - 1) * ENTRY_SIZE;
-        bytes[last_start..last_start + ENTRY_SIZE].fill(0);
+        let last = dynamic.entry_offset(slots - 1);
+        bytes[last..last + DYN_ENTRY_SIZE].fill(0);
     }
 
     Ok(())
@@ -154,106 +133,47 @@ fn remove_dt_needed(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
 /// treats NONE as a no-op, so forcing BIND_NOW makes the binary load reliably
 /// regardless of glibc version or binding mode.
 fn ensure_bind_now(bytes: &mut [u8]) -> Result<()> {
-    // DT_* tag values not all exposed by goblin as constants we want, hardcode:
-    const DT_NULL: u64 = 0;
-    const DT_FLAGS: u64 = 30;
-    const DT_BIND_NOW: u64 = 24;
-    const DT_FLAGS_1: u64 = 0x6ffffffb;
-    const DF_BIND_NOW: u64 = 0x8;
-    const DF_1_NOW: u64 = 0x1;
-    const ENTRY_SIZE: usize = 16;
+    use goblin::elf::dynamic::{DF_1_NOW, DF_BIND_NOW, DT_BIND_NOW, DT_FLAGS, DT_FLAGS_1};
 
-    let dyn_section_offset = find_section_file_offset(bytes, ".dynamic")?;
-    if dyn_section_offset == 0 {
-        return Ok(());
-    }
+    let dynamic = DynamicTable::parse(bytes).context("reading .dynamic for BIND_NOW")?;
 
-    // Parse to discover current state, then drop the borrow before mutating.
-    let (already_now, flags_idx, num_entries, dyn_segment_filesz): (
-        bool,
-        Option<usize>,
-        usize,
-        u64,
-    ) = {
-        let goblin_elf = goblin::elf::Elf::parse(bytes).context("goblin parse for BIND_NOW")?;
-
-        let dyn_filesz = goblin_elf
-            .program_headers
-            .iter()
-            .find(|ph| ph.p_type == goblin::elf::program_header::PT_DYNAMIC)
-            .map(|ph| ph.p_filesz)
-            .unwrap_or(0);
-
-        let dynamic = match &goblin_elf.dynamic {
-            Some(d) => d,
-            None => return Ok(()),
-        };
-
-        let mut already = false;
-        let mut flags_at: Option<usize> = None;
-        for (i, e) in dynamic.dyns.iter().enumerate() {
-            if e.d_tag == DT_BIND_NOW {
-                already = true;
-            } else if e.d_tag == DT_FLAGS {
-                flags_at = Some(i);
-                if e.d_val & DF_BIND_NOW != 0 {
-                    already = true;
-                }
-            } else if e.d_tag == DT_FLAGS_1 && e.d_val & DF_1_NOW != 0 {
-                already = true;
-            }
-        }
-
-        (already, flags_at, dynamic.dyns.len(), dyn_filesz)
-    };
-
+    let already_now = dynamic.value_of(DT_BIND_NOW).is_some()
+        || dynamic
+            .value_of(DT_FLAGS)
+            .is_some_and(|flags| flags & DF_BIND_NOW != 0)
+        || dynamic
+            .value_of(DT_FLAGS_1)
+            .is_some_and(|flags| flags & DF_1_NOW != 0);
     if already_now {
         return Ok(());
     }
 
-    let base = dyn_section_offset as usize;
-
-    if let Some(idx) = flags_idx {
+    if let Some(idx) = dynamic.index_of(DT_FLAGS) {
         // OR DF_BIND_NOW into the existing DT_FLAGS entry.
-        let val_off = base + idx * ENTRY_SIZE + 8;
-        let current = u64::from_le_bytes(bytes[val_off..val_off + 8].try_into().unwrap());
-        let new = current | DF_BIND_NOW;
-        bytes[val_off..val_off + 8].copy_from_slice(&new.to_le_bytes());
+        let at = dynamic.value_offset(idx);
+        let current = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+        bytes[at..at + 8].copy_from_slice(&(current | DF_BIND_NOW).to_le_bytes());
         return Ok(());
     }
 
-    // Append a new DT_FLAGS entry. Goblin includes the DT_NULL terminator in
-    // `dynamic.dyns`, so the terminator lives at index `num_entries - 1`. We
-    // overwrite that slot with our new entry; the slot after becomes the new
-    // DT_NULL terminator.
-    if num_entries == 0 {
-        anyhow::bail!("empty dynamic section");
-    }
-    let new_entry_off = base + (num_entries - 1) * ENTRY_SIZE;
-    let next_off = new_entry_off + ENTRY_SIZE;
-
-    if (next_off + ENTRY_SIZE) > base + dyn_segment_filesz as usize {
-        anyhow::bail!(
+    // Append a new DT_FLAGS entry over the DT_NULL terminator; the slot after
+    // it becomes the new terminator, so PT_DYNAMIC needs one spare slot.
+    let terminator = dynamic.used();
+    if terminator + 1 >= dynamic.capacity() {
+        bail!(
             "no room in PT_DYNAMIC to add DT_FLAGS=DF_BIND_NOW entry \
-             (segment filesz=0x{:x}, would need offset 0x{:x})",
-            dyn_segment_filesz,
-            next_off + ENTRY_SIZE - base
+             ({} slots, {terminator} used)",
+            dynamic.capacity()
         );
     }
 
-    // Sanity: the slot we're overwriting should currently be DT_NULL.
-    let cur_tag = u64::from_le_bytes(bytes[new_entry_off..new_entry_off + 8].try_into().unwrap());
-    if cur_tag != DT_NULL {
-        anyhow::bail!(
-            "expected DT_NULL at .dynamic offset 0x{:x}, found tag 0x{:x}",
-            new_entry_off - base,
-            cur_tag
-        );
-    }
-
-    bytes[new_entry_off..new_entry_off + 8].copy_from_slice(&DT_FLAGS.to_le_bytes());
-    bytes[new_entry_off + 8..new_entry_off + 16].copy_from_slice(&DF_BIND_NOW.to_le_bytes());
-    bytes[next_off..next_off + ENTRY_SIZE].fill(0);
+    let at = dynamic.entry_offset(terminator);
+    bytes[at..at + 8].copy_from_slice(&DT_FLAGS.to_le_bytes());
+    bytes[at + 8..at + 16].copy_from_slice(&DF_BIND_NOW.to_le_bytes());
+    // Zeroing the following slot makes it the new DT_NULL terminator; slots
+    // past the old one may hold garbage.
+    let next = dynamic.entry_offset(terminator + 1);
+    bytes[next..next + DYN_ENTRY_SIZE].fill(0);
 
     Ok(())
 }
@@ -282,6 +202,8 @@ fn find_section_file_offset(bytes: &[u8], name: &str) -> Result<u64> {
 /// 2. Update vn_next pointers to skip removed entries (linked list surgery)
 /// 3. Decrement DT_VERNEEDNUM in .dynamic
 fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
+    use goblin::elf::dynamic::{DT_DEBUG, DT_VERNEED, DT_VERNEEDNUM};
+
     if plan.remove_needed.is_empty() {
         return Ok(());
     }
@@ -294,90 +216,38 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     //   vn_next:    u32  (offset 12) - offset to next Verneed (relative to this entry), 0 if last
     const VERNEED_SIZE: usize = 16;
 
-    // Collect info we need before mutating bytes
-    let (
-        verneed_offset,
-        verneed_va,
-        verneed_dyn_idx,
-        verneednum_dyn_idx,
-        dyn_section_offset,
-        entries_to_remove,
-    ): (u64, u64, Option<usize>, Option<usize>, u64, Vec<u64>) = {
-        let goblin_elf =
-            goblin::elf::Elf::parse(bytes).context("goblin parse for verneed removal")?;
+    let dynamic = DynamicTable::parse(bytes).context("reading .dynamic for verneed removal")?;
 
-        let dynamic = match &goblin_elf.dynamic {
-            Some(d) => d,
-            None => return Ok(()),
-        };
-
-        // Find DT_VERNEED value (VA of .gnu.version_r) and DT_VERNEEDNUM index
-        let mut verneed_va: Option<u64> = None;
-        let mut verneed_idx: Option<usize> = None;
-        let mut verneednum_idx: Option<usize> = None;
-
-        for (i, entry) in dynamic.dyns.iter().enumerate() {
-            match entry.d_tag {
-                goblin::elf::dynamic::DT_VERNEED => {
-                    verneed_va = Some(entry.d_val);
-                    verneed_idx = Some(i);
-                }
-                goblin::elf::dynamic::DT_VERNEEDNUM => {
-                    verneednum_idx = Some(i);
-                }
-                _ => {}
-            }
-        }
-
-        let verneed_va = match verneed_va {
-            Some(va) => va,
-            None => return Ok(()), // No version requirements section
-        };
-
-        // Find .gnu.version_r section offset
-        let verneed_file_offset = find_section_file_offset(bytes, ".gnu.version_r")?;
-        if verneed_file_offset == 0 {
-            return Ok(());
-        }
-
-        let dyn_offset = find_section_file_offset(bytes, ".dynamic")?;
-
-        // Walk the Verneed linked list to find entries matching libraries to remove
-        let mut entries_to_remove = Vec::new();
-        let mut offset = verneed_file_offset as usize;
-
-        loop {
-            if offset + VERNEED_SIZE > bytes.len() {
-                break;
-            }
-
-            let vn_file = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
-            let vn_next = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap());
-
-            // Check if this entry's library matches one we're removing
-            if let Some(lib_name) = goblin_elf.dynstrtab.get_at(vn_file as usize)
-                && plan.remove_needed.iter().any(|s| s == lib_name)
-            {
-                entries_to_remove.push(offset as u64);
-            }
-
-            if vn_next == 0 {
-                break;
-            }
-            offset += vn_next as usize;
-        }
-
-        (
-            verneed_file_offset,
-            verneed_va,
-            verneed_idx,
-            verneednum_idx,
-            dyn_offset,
-            entries_to_remove,
-        )
+    // No version requirements section: nothing to unlink.
+    let Some((verneed_dyn_idx, verneed_va)) = dynamic.entries_of(DT_VERNEED).next() else {
+        return Ok(());
     };
+    let verneed_offset = find_section_file_offset(bytes, ".gnu.version_r")? as usize;
+    if verneed_offset == 0 {
+        return Ok(());
+    }
 
-    if entries_to_remove.is_empty() {
+    // Walk the Verneed linked list to find entries matching libraries to remove
+    let mut removed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut offset = verneed_offset;
+    while offset + VERNEED_SIZE <= bytes.len() {
+        let vn_file = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let vn_next = u32::from_le_bytes(bytes[offset + 12..offset + 16].try_into().unwrap());
+
+        // Check if this entry's library matches one we're removing
+        if let Some(lib_name) = dynamic.string_at(bytes, vn_file as u64)
+            && plan.remove_needed.iter().any(|s| s == lib_name)
+        {
+            removed.insert(offset);
+        }
+
+        if vn_next == 0 {
+            break;
+        }
+        offset += vn_next as usize;
+    }
+
+    if removed.is_empty() {
         return Ok(());
     }
 
@@ -388,44 +258,27 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     // `vn_cnt`.  So a removed library's entry cannot merely be zeroed in place —
     // it must be unlinked from the list entirely, including when it is the head
     // (in which case DT_VERNEED itself must be advanced to the next entry).
-    let removed: std::collections::HashSet<usize> =
-        entries_to_remove.iter().map(|&o| o as usize).collect();
+    let (new_head, kept_count) = relink_verneed_list(bytes, verneed_offset, &removed);
 
-    let (new_head, kept_count) = relink_verneed_list(bytes, verneed_offset as usize, &removed);
-
-    // If the head entry was removed, point DT_VERNEED at the first kept entry.
-    // (Its VA tracks the file offset since the section is contiguous.)
-    if kept_count > 0 {
-        if new_head as u64 != verneed_offset
-            && let Some(idx) = verneed_dyn_idx
-        {
-            let new_va = verneed_va + (new_head as u64 - verneed_offset);
-            let entry_offset = dyn_section_offset as usize + idx * 16 + 8; // d_val at +8
-            if entry_offset + 8 <= bytes.len() {
-                bytes[entry_offset..entry_offset + 8].copy_from_slice(&new_va.to_le_bytes());
-            }
-        }
-    } else {
+    let tag_at = dynamic.entry_offset(verneed_dyn_idx);
+    let val_at = dynamic.value_offset(verneed_dyn_idx);
+    if kept_count == 0 {
         // No requirements remain at all. Drop DT_VERNEED so ld.so doesn't walk a
         // now-empty section (rare: only if every needed library was merged).
-        if let Some(idx) = verneed_dyn_idx {
-            let entry_offset = dyn_section_offset as usize + idx * 16;
-            if entry_offset + 16 <= bytes.len() {
-                // Rewrite tag to a runtime no-op (DT_DEBUG is ignored by ld.so).
-                let dt_debug = goblin::elf::dynamic::DT_DEBUG.to_le_bytes();
-                bytes[entry_offset..entry_offset + 8].copy_from_slice(&dt_debug);
-                bytes[entry_offset + 8..entry_offset + 16].copy_from_slice(&0u64.to_le_bytes());
-            }
-        }
+        // Rewrite the tag to a runtime no-op (DT_DEBUG is ignored by ld.so).
+        bytes[tag_at..tag_at + 8].copy_from_slice(&DT_DEBUG.to_le_bytes());
+        bytes[val_at..val_at + 8].fill(0);
+    } else if new_head != verneed_offset {
+        // The head entry was removed, so point DT_VERNEED at the first kept
+        // one. (Its VA tracks the file offset since the section is contiguous.)
+        let new_va = verneed_va + (new_head - verneed_offset) as u64;
+        bytes[val_at..val_at + 8].copy_from_slice(&new_va.to_le_bytes());
     }
 
     // Update DT_VERNEEDNUM to the number of surviving entries.
-    if let Some(idx) = verneednum_dyn_idx {
-        let entry_offset = dyn_section_offset as usize + idx * 16 + 8; // d_val is at offset 8
-        if entry_offset + 8 <= bytes.len() {
-            bytes[entry_offset..entry_offset + 8]
-                .copy_from_slice(&(kept_count as u64).to_le_bytes());
-        }
+    if let Some(idx) = dynamic.index_of(DT_VERNEEDNUM) {
+        let at = dynamic.value_offset(idx);
+        bytes[at..at + 8].copy_from_slice(&(kept_count as u64).to_le_bytes());
     }
 
     Ok(())
