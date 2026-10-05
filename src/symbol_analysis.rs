@@ -112,8 +112,6 @@ pub fn collect_imports(
         validate_merge_filter(&dyn_info.needed, filter)?;
     }
 
-    let bytes = elf.data();
-
     // Build a map from symbol name → source library path.
     // For each DT_NEEDED entry (in order), find the library, parse its .dynsym,
     // and record which symbols it exports.  The first library providing a symbol wins.
@@ -142,83 +140,139 @@ pub fn collect_imports(
         }
     }
 
-    // Now walk .rela.plt (JUMP_SLOT) and .rela.dyn (GLOB_DAT) to find GOT offsets.
-    let goblin_exe = goblin::elf::Elf::parse(bytes).context("goblin parse of executable")?;
-
-    // Build a name→index map for .dynsym so we can look up each relocation's symbol name.
-    let mut dynidx_to_name: std::collections::HashMap<usize, String> =
-        std::collections::HashMap::new();
-    for (i, sym) in goblin_exe.dynsyms.iter().enumerate() {
-        if let Some(name) = goblin_exe.dynstrtab.get_at(sym.st_name) {
-            dynidx_to_name.insert(i, name.to_owned());
-        }
-    }
-
+    // Now walk .rela.plt (all JUMP_SLOT) and the GLOB_DATs of .rela.dyn,
+    // recording the GOT slot of every symbol a mergeable library provides. The
+    // first relocation naming a symbol wins; later ones point at the same slot.
     let mut imports: Vec<ImportedSymbol> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
-    // Helper: get the file offset of a GOT slot from its virtual address.
-    let got_file_offset = |va: u64| -> Result<u64> {
-        va_to_file_offset(elf, va)
-            .with_context(|| format!("GOT VA 0x{va:x} not in any PT_LOAD segment"))
-    };
-
-    // Process .rela.plt → JUMP_SLOT
-    for rela in &goblin_exe.pltrelocs {
-        let sym_idx = rela.r_sym;
-        let sym_name = match dynidx_to_name.get(&sym_idx) {
-            Some(n) => n.clone(),
-            None => continue,
+    for (entry, kind) in RelaTables::read(elf)?.imports() {
+        // A symbol no mergeable library provides is external (glibc etc.).
+        let Some(source_library) = sym_to_lib.get(&entry.symbol) else {
+            continue;
         };
-        if seen.contains(&sym_name) {
+        if !seen.insert(entry.symbol.clone()) {
             continue;
         }
-        let source_library = match sym_to_lib.get(&sym_name) {
-            Some(p) => p.clone(),
-            None => continue, // external (glibc) symbol — not importing from a mergeable lib
-        };
-        let gfo = got_file_offset(rela.r_offset)?;
         imports.push(ImportedSymbol {
-            name: sym_name.clone(),
-            source_library,
-            got_file_offset: gfo,
-            kind: ImportKind::JumpSlot,
+            name: entry.symbol.clone(),
+            source_library: source_library.clone(),
+            got_file_offset: va_to_file_offset(elf, entry.target_vaddr).with_context(|| {
+                format!(
+                    "GOT VA 0x{:x} not in any PT_LOAD segment",
+                    entry.target_vaddr
+                )
+            })?,
+            kind,
         });
-        seen.insert(sym_name);
-    }
-
-    // Process .rela.dyn → GLOB_DAT
-    for rela in &goblin_exe.dynrelas {
-        use goblin::elf64::reloc::R_X86_64_GLOB_DAT;
-        if rela.r_type != R_X86_64_GLOB_DAT {
-            continue;
-        }
-        let sym_idx = rela.r_sym;
-        let sym_name = match dynidx_to_name.get(&sym_idx) {
-            Some(n) => n.clone(),
-            None => continue,
-        };
-        if seen.contains(&sym_name) {
-            continue;
-        }
-        let source_library = match sym_to_lib.get(&sym_name) {
-            Some(p) => p.clone(),
-            None => continue,
-        };
-        let gfo = got_file_offset(rela.r_offset)?;
-        imports.push(ImportedSymbol {
-            name: sym_name.clone(),
-            source_library,
-            got_file_offset: gfo,
-            kind: ImportKind::GlobDat,
-        });
-        seen.insert(sym_name);
     }
 
     Ok(ImportInfo {
         imports,
         merged_lib_syms: sym_to_lib,
     })
+}
+
+/// Size of an `Elf64_Rela` entry and the offset of its `r_info` field within
+/// one. A relocation is neutralized by zeroing `r_info` and the `r_addend`
+/// that follows it, so `RelaEntry::r_info_offset` points at `r_info`.
+const RELA_ENTRY_SIZE: u64 = 24;
+const RELA_R_INFO_OFFSET: u64 = 8;
+
+/// One entry of a `.rela.*` table, reduced to what anything here wants from it.
+struct RelaEntry {
+    /// File offset of the entry's `r_info` field.
+    r_info_offset: u64,
+    /// `r_offset` — the virtual address the relocation applies to, i.e. the
+    /// GOT slot or data word being filled in.
+    target_vaddr: u64,
+    /// Low half of `r_info`: the `R_X86_64_*` relocation type.
+    r_type: u32,
+    /// Name of the `.dynsym` symbol the entry refers to, empty if it has none.
+    symbol: String,
+}
+
+/// The executable's two dynamic relocation tables, decoded.
+///
+/// Entries are read out of the `.rela.*` section bytes rather than taken from a
+/// parsed relocation list because every caller needs an entry's *file offset*,
+/// which a parsed relocation does not carry. A missing section is an empty
+/// table.
+struct RelaTables {
+    /// `.rela.plt`, which holds nothing but JUMP_SLOTs.
+    jump_slot: Vec<RelaEntry>,
+    /// `.rela.dyn`, which mixes GLOB_DAT with RELATIVE, COPY and TLS entries.
+    dynamic: Vec<RelaEntry>,
+}
+
+impl RelaTables {
+    fn read(elf: &ElfFile64<'_>) -> Result<Self> {
+        // Relocation symbol indices address .dynsym, so resolve them there.
+        let goblin_elf =
+            goblin::elf::Elf::parse(elf.data()).context("goblin parse of executable")?;
+        let names: Vec<&str> = goblin_elf
+            .dynsyms
+            .iter()
+            .map(|sym| goblin_elf.dynstrtab.get_at(sym.st_name).unwrap_or(""))
+            .collect();
+
+        Ok(Self {
+            jump_slot: read_rela_section(elf, ".rela.plt", &names)?,
+            dynamic: read_rela_section(elf, ".rela.dyn", &names)?,
+        })
+    }
+
+    /// The `.rela.dyn` entries of one relocation type.
+    fn dynamic_of_type(&self, r_type: u32) -> impl Iterator<Item = &RelaEntry> {
+        self.dynamic.iter().filter(move |e| e.r_type == r_type)
+    }
+
+    /// Every entry that can name a symbol imported from a shared library: all
+    /// of `.rela.plt` plus the GLOB_DATs of `.rela.dyn`, each paired with the
+    /// kind of import it represents.
+    fn imports(&self) -> impl Iterator<Item = (&RelaEntry, ImportKind)> {
+        use goblin::elf64::reloc::R_X86_64_GLOB_DAT;
+
+        self.jump_slot
+            .iter()
+            .map(|e| (e, ImportKind::JumpSlot))
+            .chain(
+                self.dynamic_of_type(R_X86_64_GLOB_DAT)
+                    .map(|e| (e, ImportKind::GlobDat)),
+            )
+    }
+}
+
+/// Decode the named `.rela.*` section, naming each entry's symbol out of
+/// `dynsym_names` (indexed by `.dynsym` index).
+fn read_rela_section(
+    elf: &ElfFile64<'_>,
+    section_name: &str,
+    dynsym_names: &[&str],
+) -> Result<Vec<RelaEntry>> {
+    let Some(section) = elf.section_by_name(section_name) else {
+        return Ok(Vec::new());
+    };
+    let sh_offset = section.file_range().map(|(off, _)| off).unwrap_or(0);
+    let data = section
+        .data()
+        .with_context(|| format!("{section_name} data"))?;
+
+    let mut entries = Vec::new();
+    for (i, entry) in data.chunks_exact(RELA_ENTRY_SIZE as usize).enumerate() {
+        let r_offset = u64::from_le_bytes(entry[..8].try_into().unwrap());
+        let r_info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
+        let Some(symbol) = dynsym_names.get((r_info >> 32) as usize) else {
+            continue;
+        };
+        entries.push(RelaEntry {
+            r_info_offset: sh_offset + i as u64 * RELA_ENTRY_SIZE + RELA_R_INFO_OFFSET,
+            target_vaddr: r_offset,
+            r_type: r_info as u32,
+            symbol: (*symbol).to_owned(),
+        });
+    }
+    Ok(entries)
 }
 
 /// Names of every symbol `lib_path` defines in its `.dynsym` — i.e. everything
@@ -326,88 +380,13 @@ pub fn inherited_needed(
 /// JUMP_SLOT relocations are in .rela.plt, GLOB_DAT relocations are in .rela.dyn.
 pub fn find_jump_slot_reloc_offsets(
     elf: &ElfFile64<'_>,
-    imported_names: &std::collections::HashSet<String>,
+    imported_names: &HashSet<String>,
 ) -> Result<Vec<u64>> {
-    use goblin::elf64::reloc::R_X86_64_GLOB_DAT;
-
-    let bytes = elf.data();
-    let goblin_exe = goblin::elf::Elf::parse(bytes).context("goblin parse")?;
-
-    let mut offsets = Vec::new();
-
-    // Build dynsym index → name map once for both sections
-    let dynidx_to_name: std::collections::HashMap<usize, String> = goblin_exe
-        .dynsyms
-        .iter()
-        .enumerate()
-        .filter_map(|(i, sym)| {
-            goblin_exe
-                .dynstrtab
-                .get_at(sym.st_name)
-                .map(|n| (i, n.to_owned()))
-        })
-        .collect();
-
-    // Each Rela64 entry is 24 bytes: r_offset(8) + r_info(8) + r_addend(8)
-    // We need the file offset of the r_info field (offset +8) and r_addend (offset+16)
-    // to zero them out.
-
-    // Process .rela.plt for JUMP_SLOT relocations
-    for section in elf.sections() {
-        if section.name() != Ok(".rela.plt") {
-            continue;
-        }
-        let sh_offset = section.file_range().map(|(off, _)| off).unwrap_or(0);
-        let data = section.data().context(".rela.plt data")?;
-        let n = data.len() / 24;
-
-        for i in 0..n {
-            let entry = &data[i * 24..(i + 1) * 24];
-            let r_info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-            let sym_idx = (r_info >> 32) as usize;
-            let name = match dynidx_to_name.get(&sym_idx) {
-                Some(n) => n,
-                None => continue,
-            };
-            if imported_names.contains(name) {
-                offsets.push(sh_offset + (i as u64) * 24 + 8);
-            }
-        }
-        break;
-    }
-
-    // Process .rela.dyn for GLOB_DAT relocations
-    for section in elf.sections() {
-        if section.name() != Ok(".rela.dyn") {
-            continue;
-        }
-        let sh_offset = section.file_range().map(|(off, _)| off).unwrap_or(0);
-        let data = section.data().context(".rela.dyn data")?;
-        let n = data.len() / 24;
-
-        for i in 0..n {
-            let entry = &data[i * 24..(i + 1) * 24];
-            let r_info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-            let r_type = (r_info & 0xffffffff) as u32;
-
-            // Only zero out GLOB_DAT relocations for merged symbols
-            if r_type != R_X86_64_GLOB_DAT {
-                continue;
-            }
-
-            let sym_idx = (r_info >> 32) as usize;
-            let name = match dynidx_to_name.get(&sym_idx) {
-                Some(n) => n,
-                None => continue,
-            };
-            if imported_names.contains(name) {
-                offsets.push(sh_offset + (i as u64) * 24 + 8);
-            }
-        }
-        break;
-    }
-
-    Ok(offsets)
+    Ok(RelaTables::read(elf)?
+        .imports()
+        .filter(|(entry, _)| imported_names.contains(&entry.symbol))
+        .map(|(entry, _)| entry.r_info_offset)
+        .collect())
 }
 
 /// Find the file offsets of R_X86_64_COPY relocations in `.rela.dyn` whose symbol
@@ -420,57 +399,15 @@ pub fn find_jump_slot_reloc_offsets(
 /// sufficient for the common case where the source value is zero-initialized.
 pub fn find_copy_reloc_offsets(
     elf: &ElfFile64<'_>,
-    removed_provided_syms: &std::collections::HashSet<String>,
+    removed_provided_syms: &HashSet<String>,
 ) -> Result<Vec<(u64, String)>> {
     use goblin::elf64::reloc::R_X86_64_COPY;
 
-    let bytes = elf.data();
-    let goblin_exe = goblin::elf::Elf::parse(bytes).context("goblin parse")?;
-
-    let dynidx_to_name: std::collections::HashMap<usize, String> = goblin_exe
-        .dynsyms
-        .iter()
-        .enumerate()
-        .filter_map(|(i, sym)| {
-            goblin_exe
-                .dynstrtab
-                .get_at(sym.st_name)
-                .map(|n| (i, n.to_owned()))
-        })
-        .collect();
-
-    let mut found = Vec::new();
-
-    for section in elf.sections() {
-        if section.name() != Ok(".rela.dyn") {
-            continue;
-        }
-        let sh_offset = section.file_range().map(|(off, _)| off).unwrap_or(0);
-        let data = section.data().context(".rela.dyn data")?;
-        let n = data.len() / 24;
-
-        for i in 0..n {
-            let entry = &data[i * 24..(i + 1) * 24];
-            let r_info = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-            let r_type = (r_info & 0xffffffff) as u32;
-
-            if r_type != R_X86_64_COPY {
-                continue;
-            }
-
-            let sym_idx = (r_info >> 32) as usize;
-            let name = match dynidx_to_name.get(&sym_idx) {
-                Some(n) => n,
-                None => continue,
-            };
-            if removed_provided_syms.contains(name) {
-                found.push((sh_offset + (i as u64) * 24 + 8, name.clone()));
-            }
-        }
-        break;
-    }
-
-    Ok(found)
+    Ok(RelaTables::read(elf)?
+        .dynamic_of_type(R_X86_64_COPY)
+        .filter(|e| removed_provided_syms.contains(&e.symbol))
+        .map(|e| (e.r_info_offset, e.symbol.clone()))
+        .collect())
 }
 
 /// Whether the named defined symbol in `lib_path` is zero-initialized — either
