@@ -6,7 +6,7 @@ use object::read::elf::ElfFile64;
 use object::{Object, ObjectSection};
 use tracing::{debug, warn};
 
-use crate::elf_reader::va_to_file_offset;
+use crate::elf_reader::{DynamicTable, va_to_file_offset};
 use crate::lib_discovery::{LdsoCache, is_excluded, resolve_library};
 use crate::types::{ImportKind, ImportedSymbol};
 
@@ -21,35 +21,27 @@ pub fn parse_dynamic(elf: &ElfFile64<'_>) -> Result<DynamicInfo> {
     use goblin::elf::dynamic::{DT_NEEDED, DT_RPATH, DT_RUNPATH};
 
     let bytes = elf.data();
-    let goblin_elf = goblin::elf::Elf::parse(bytes).context("goblin parse for dynamic section")?;
+    let dynamic = DynamicTable::parse(bytes).context("reading .dynamic of the executable")?;
 
-    let mut needed = Vec::new();
-    let mut rpath = Vec::new();
-    let mut runpath = Vec::new();
-
-    if let Some(dynamic) = &goblin_elf.dynamic {
-        for entry in &dynamic.dyns {
-            let tag = entry.d_tag;
-            if tag == DT_NEEDED {
-                if let Some(s) = goblin_elf.dynstrtab.get_at(entry.d_val as usize) {
-                    needed.push(s.to_owned());
-                }
-            } else if tag == DT_RPATH {
-                if let Some(s) = goblin_elf.dynstrtab.get_at(entry.d_val as usize) {
-                    rpath.extend(s.split(':').filter(|p| !p.is_empty()).map(PathBuf::from));
-                }
-            } else if tag == DT_RUNPATH
-                && let Some(s) = goblin_elf.dynstrtab.get_at(entry.d_val as usize)
-            {
-                runpath.extend(s.split(':').filter(|p| !p.is_empty()).map(PathBuf::from));
-            }
-        }
-    }
+    // DT_RPATH and DT_RUNPATH each name a colon-separated list of directories.
+    let search_list = |tag: u64| -> Vec<PathBuf> {
+        dynamic
+            .values_of(tag)
+            .filter_map(|val| dynamic.string_at(bytes, val))
+            .flat_map(|s| s.split(':'))
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    };
 
     Ok(DynamicInfo {
-        needed,
-        rpath,
-        runpath,
+        needed: dynamic
+            .values_of(DT_NEEDED)
+            .filter_map(|val| dynamic.string_at(bytes, val))
+            .map(str::to_owned)
+            .collect(),
+        rpath: search_list(DT_RPATH),
+        runpath: search_list(DT_RUNPATH),
     })
 }
 
