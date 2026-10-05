@@ -156,22 +156,26 @@ pub fn write_output(
         (merged_seg.to_vec(), ExtensionInfo::default())
     };
 
-    // The merged region is described by up to three PT_LOADs rather than one
-    // read-write-execute mapping: the code and trampolines, then everything
-    // ld.so writes to at startup, then the rebuilt symbol/relocation tables
-    // and the new program header table. `layout` page-aligned the boundaries
-    // so each mapping starts on a page, and `seg_file_offset` and
-    // `plan.load_address` are both page-aligned, which keeps p_offset and
-    // p_vaddr congruent modulo the page size for all three.
+    // The merged region is described by up to four PT_LOADs rather than one
+    // read-write-execute mapping: the code and trampolines, then the merged
+    // constants, then everything ld.so writes to at startup, then the rebuilt
+    // symbol/relocation tables and the new program header table. `layout`
+    // page-aligned the boundaries so each mapping starts on a page, and
+    // `seg_file_offset` and `plan.load_address` are both page-aligned, which
+    // keeps p_offset and p_vaddr congruent modulo the page size for all of
+    // them.
     //
     // Each element is the start offset of a mapping within the region; the
     // mapping runs to the next element's start, or to the end of the region.
-    let mut regions: Vec<(u64, u32)> = Vec::with_capacity(3);
+    let mut regions: Vec<(u64, u32)> = Vec::with_capacity(4);
     if plan.exec_size > 0 {
         regions.push((0, (PF_R | PF_X).0));
     }
-    if plan.writable_end > plan.exec_size {
-        regions.push((plan.exec_size, (PF_R | PF_W).0));
+    if plan.rodata_end > plan.exec_size {
+        regions.push((plan.exec_size, PF_R.0));
+    }
+    if plan.writable_end > plan.rodata_end {
+        regions.push((plan.rodata_end, (PF_R | PF_W).0));
     }
     regions.push((plan.writable_end, PF_R.0));
 
@@ -287,46 +291,42 @@ pub fn write_output(
 }
 
 /// Fail before writing anything if a slot the dynamic loader has to write at
-/// startup landed in the read-execute run of the merged region.
+/// startup landed outside the writable run of the merged region.
 ///
-/// The code and the loader-written slots are now in separate mappings with
-/// separate permissions, so a layout that puts an `R_X86_64_RELATIVE` target
-/// or a `GLOB_DAT` GOT slot among the code would make ld.so fault while
-/// relocating. Refusing to emit such a binary beats shipping one that cannot
-/// start.
+/// Only one of the merged region's mappings is writable, so a layout that puts
+/// an `R_X86_64_RELATIVE` target or a `GLOB_DAT` GOT slot among the code or
+/// among the read-only constants would make ld.so fault while relocating.
+/// Refusing to emit such a binary beats shipping one that cannot start.
+///
+/// `plan.load_address` sits past the end of every original `PT_LOAD`, so any
+/// target at or above it belongs to the merged region; the ones below it are
+/// slots in the executable's own GOT, which keep whatever permissions the
+/// executable already gave them.
 fn check_runtime_writes_are_writable(plan: &MergePlan) -> Result<()> {
-    let code_start = plan.load_address;
-    let code_end = plan.load_address + plan.exec_size;
-    let in_code = |vaddr: u64| vaddr >= code_start && vaddr < code_end;
+    let writable = plan.load_address + plan.rodata_end..plan.load_address + plan.writable_end;
+    let misplaced = |vaddr: u64| vaddr >= plan.load_address && !writable.contains(&vaddr);
 
-    for reloc in &plan.relative_relocs {
-        if in_code(reloc.vaddr) {
+    let slots = plan
+        .relative_relocs
+        .iter()
+        .map(|r| ("R_X86_64_RELATIVE target", r.vaddr, String::new()))
+        .chain(
+            plan.new_externals
+                .iter()
+                .map(|e| ("GOT slot", e.got_vaddr, format!(" for '{}'", e.name))),
+        )
+        .chain(
+            plan.got_imports
+                .iter()
+                .map(|g| ("copied GOT slot", g.got_vaddr, format!(" for '{}'", g.name))),
+        );
+    for (what, vaddr, which) in slots {
+        if misplaced(vaddr) {
             bail!(
-                "R_X86_64_RELATIVE target 0x{:x} falls in the read-execute part of the \
+                "{what}{which} at 0x{vaddr:x} falls outside the writable part of the \
                  merged segment (0x{:x}..0x{:x}); ld.so cannot write it",
-                reloc.vaddr,
-                code_start,
-                code_end
-            );
-        }
-    }
-    for ext in &plan.new_externals {
-        if in_code(ext.got_vaddr) {
-            bail!(
-                "GOT slot for '{}' at 0x{:x} falls in the read-execute part of the \
-                 merged segment; ld.so cannot write it",
-                ext.name,
-                ext.got_vaddr
-            );
-        }
-    }
-    for gi in &plan.got_imports {
-        if in_code(gi.got_vaddr) {
-            bail!(
-                "copied GOT slot for '{}' at 0x{:x} falls in the read-execute part of the \
-                 merged segment; ld.so cannot write it",
-                gi.name,
-                gi.got_vaddr
+                writable.start,
+                writable.end
             );
         }
     }
@@ -983,4 +983,99 @@ fn update_dynamic_entries(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_write_tests {
+    use super::*;
+    use crate::types::{GotSlotImport, NewExternalSym};
+
+    const LOAD: u64 = 0x10_0000;
+    const EXEC_END: u64 = LOAD + 0x1000;
+    const RODATA_END: u64 = LOAD + 0x2000;
+    const WRITABLE_END: u64 = LOAD + 0x3000;
+
+    /// An otherwise empty plan whose merged region has all three runs:
+    /// read-execute, read-only and read-write, one page each.
+    fn plan() -> MergePlan {
+        MergePlan {
+            is_pie: true,
+            load_address: LOAD,
+            exec_size: EXEC_END - LOAD,
+            rodata_end: RODATA_END - LOAD,
+            writable_end: WRITABLE_END - LOAD,
+            text_units: Vec::new(),
+            rodata_units: Vec::new(),
+            data_units: Vec::new(),
+            trampoline_stubs: Vec::new(),
+            got_patches: Vec::new(),
+            jump_slot_reloc_offsets: Vec::new(),
+            copy_reloc_offsets: Vec::new(),
+            remove_needed: Vec::new(),
+            add_needed: Vec::new(),
+            relative_relocs: Vec::new(),
+            new_externals: Vec::new(),
+            got_imports: Vec::new(),
+            init_fini: None,
+        }
+    }
+
+    #[test]
+    fn a_rebased_pointer_in_the_writable_run_is_accepted() {
+        let mut plan = plan();
+        plan.relative_relocs.push(RelativeReloc {
+            vaddr: RODATA_END,
+            addend: 0,
+        });
+        plan.got_imports.push(GotSlotImport {
+            got_vaddr: WRITABLE_END - 8,
+            name: "memcpy".to_owned(),
+            weak: false,
+        });
+        check_runtime_writes_are_writable(&plan).expect("the writable run is writable");
+    }
+
+    #[test]
+    fn a_rebased_pointer_in_the_read_only_run_is_rejected() {
+        let mut plan = plan();
+        plan.relative_relocs.push(RelativeReloc {
+            vaddr: RODATA_END - 8,
+            addend: 0,
+        });
+        let err = check_runtime_writes_are_writable(&plan)
+            .expect_err("ld.so would fault writing a read-only page");
+        assert!(
+            format!("{err}").contains("R_X86_64_RELATIVE"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_got_slot_among_the_code_is_rejected() {
+        let mut plan = plan();
+        plan.new_externals.push(NewExternalSym {
+            name: "solder_absent_symbol".to_owned(),
+            got_vaddr: EXEC_END - 8,
+        });
+        let err = check_runtime_writes_are_writable(&plan)
+            .expect_err("ld.so would fault writing an executable page");
+        assert!(
+            format!("{err}").contains("solder_absent_symbol"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    /// The patcher records a RELATIVE relocation for every GOT slot it
+    /// pre-fills in the executable itself. Those sit below the merged region
+    /// entirely, under whatever permissions the executable already had, and are
+    /// none of this check's business.
+    #[test]
+    fn a_rebased_pointer_in_the_executable_itself_is_accepted() {
+        let mut plan = plan();
+        plan.relative_relocs.push(RelativeReloc {
+            vaddr: LOAD - 0x100,
+            addend: 0,
+        });
+        check_runtime_writes_are_writable(&plan).expect("the executable's own GOT is writable");
+    }
 }

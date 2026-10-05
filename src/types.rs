@@ -166,6 +166,23 @@ pub struct ExtractedReloc {
     pub target: RelocTarget,
 }
 
+impl ExtractedReloc {
+    /// Whether this is a 64-bit absolute patch site. The value written there is
+    /// a VA inside the output image, so under PIE the dynamic loader has to
+    /// rebase it at startup — which both adds an `R_X86_64_RELATIVE` entry and
+    /// requires the containing page to be writable while it does so.
+    ///
+    /// (`Unknown` covers the GLOB_DAT/RELATIVE entries lifted from a library's
+    /// own `.rela.dyn`, which the relocator treats as absolute.)
+    pub fn is_absolute64(&self) -> bool {
+        self.size == 64
+            && matches!(
+                self.kind,
+                object::RelocationKind::Absolute | object::RelocationKind::Unknown
+            )
+    }
+}
+
 /// A chunk of code or data extracted from a shared library.
 #[derive(Debug, Clone)]
 pub struct ExtractedUnit {
@@ -224,11 +241,18 @@ pub struct MergePlan {
     /// Nothing at or past this offset is mapped executable, and nothing before
     /// it is mapped writable, so no page of the merged region is ever both.
     pub exec_size: u64,
+    /// Offset at which the read-only run of merged constants ends, padded up to
+    /// a page boundary. It starts at `exec_size` and holds the extracted
+    /// read-only data nothing writes to at runtime (string literals, jump
+    /// tables, lookup tables), which the library itself had mapped read-only.
+    /// Equal to `exec_size` when there is no such data.
+    pub rodata_end: u64,
     /// Offset at which the writable run of the merged segment ends, padded up
-    /// to a page boundary. This covers the data units, the GOT slots the
-    /// dynamic loader fills in, and the init/fini arrays. The writer appends
-    /// the rebuilt `.dynstr`/`.dynsym`/`.gnu.version`/`.rela.dyn` and the new
-    /// program header table after it, in a read-only mapping.
+    /// to a page boundary. It starts at `rodata_end` and covers the data units,
+    /// the read-only data the dynamic loader still has to rebase, the GOT slots
+    /// it fills in, and the init/fini arrays. The writer appends the rebuilt
+    /// `.dynstr`/`.dynsym`/`.gnu.version`/`.rela.dyn` and the new program
+    /// header table after it, in a read-only mapping.
     pub writable_end: u64,
     pub text_units: Vec<AssignedUnit>,
     pub rodata_units: Vec<AssignedUnit>,
@@ -264,7 +288,7 @@ pub struct MergePlan {
 impl MergePlan {
     /// Total size in bytes of the merged segment as laid out: every unit,
     /// trampoline, injected GOT slot and init/fini array, plus the page
-    /// padding that separates the executable run from the writable one.
+    /// padding that separates the executable, read-only and writable runs.
     pub fn segment_size(&self) -> usize {
         self.writable_end as usize
     }

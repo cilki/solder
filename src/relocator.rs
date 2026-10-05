@@ -82,14 +82,9 @@ fn apply_unit_relocations(
         })?;
 
         // Absolute 64-bit sites hold image VAs and must be rebased under PIE.
-        // (Unknown covers GLOB_DAT/RELATIVE entries lifted from the library's
-        // .rela.dyn, which apply_one_reloc treats as absolute.)
-        let is_abs64 = reloc.size == 64
-            && matches!(
-                reloc.kind,
-                object::RelocationKind::Absolute | object::RelocationKind::Unknown
-            );
-        if is_pie && is_abs64 {
+        // `layout` reads the same predicate off the unit to decide whether it
+        // can go in the merged region's read-only run, so the two must agree.
+        if is_pie && reloc.is_absolute64() {
             new_relative.push(RelativeReloc {
                 vaddr: p,
                 addend: s.wrapping_add(a as u64) as i64,

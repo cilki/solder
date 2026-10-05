@@ -379,11 +379,12 @@ fn print_merge_plan(
 
     println!(
         "  new mapping at 0x{:016x}, {} bytes: {} read-execute (code, trampolines), \
-         {} read-write (data, loader-written slots)",
+         {} read-only (constants), {} read-write (data, loader-written slots)",
         plan.load_address,
         plan.segment_size(),
         plan.exec_size,
-        plan.writable_end - plan.exec_size
+        plan.rodata_end - plan.exec_size,
+        plan.writable_end - plan.rodata_end
     );
     println!("  GOT entries patched: {}", plan.got_patches.len());
     println!(

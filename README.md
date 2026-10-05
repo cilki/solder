@@ -134,8 +134,11 @@ that variant was built for is not knowable from here.
   - Uses symbolic execution to identify jump tables in .rodata
 - Applies relocations and creates trampolines for any remaining external calls
 - Appends new `PT_LOAD` segments containing the merged code: read-execute for
-  the code and trampolines, read-write for the data and the slots the dynamic
-  loader fills in, read-only for the rebuilt symbol and relocation tables
+  the code and trampolines, read-only for the constants, read-write for the
+  data and the slots the dynamic loader fills in, read-only for the rebuilt
+  symbol and relocation tables. Extracted read-only data only lands in the
+  writable mapping when the dynamic loader still has to write to it — a
+  pointer it rebases at startup, or a GOT slot it resolves
 - Patches GOT entries to point directly to the merged symbols
 - Removes the merged libraries from `DT_NEEDED`, and moves onto the executable
   any `DT_NEEDED` of theirs that still provides a symbol the extracted code

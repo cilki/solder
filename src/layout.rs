@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -102,7 +102,30 @@ pub fn plan_layout(
     offset = align_up(offset, PAGE_SIZE);
     let exec_size = offset;
 
-    let rodata_units = assign_addresses(load_address, &mut offset, rodata);
+    // Read-only data that nothing writes to at runtime gets a mapping of its
+    // own, so the merged constants keep the permissions the library gave them.
+    // The rest — anything the dynamic loader rebases or resolves at startup —
+    // has to stay in the writable run.
+    let got_slot_units: HashSet<crate::types::UnitId> =
+        got_slot_fixups.iter().map(|f| f.unit).collect();
+    let (rebased_rodata, const_rodata): (Vec<ExtractedUnit>, Vec<ExtractedUnit>) =
+        rodata.into_iter().partition(|unit| {
+            got_slot_units.contains(&unit.id)
+                || (is_pie && unit.relocations.iter().any(|r| r.is_absolute64()))
+        });
+    debug!(
+        read_only = const_rodata.len(),
+        loader_written = rebased_rodata.len(),
+        "Read-only data units by mapping"
+    );
+
+    let mut rodata_units = assign_addresses(load_address, &mut offset, const_rodata);
+
+    // End of the read-only run, for the same page-boundary reason.
+    offset = align_up(offset, PAGE_SIZE);
+    let rodata_end = offset;
+
+    rodata_units.extend(assign_addresses(load_address, &mut offset, rebased_rodata));
     let data_units = assign_addresses(load_address, &mut offset, data);
 
     // Fresh GOT slots for the externals the executable does not already
@@ -225,6 +248,7 @@ pub fn plan_layout(
         is_pie,
         load_address,
         exec_size,
+        rodata_end,
         writable_end,
         text_units,
         rodata_units,
@@ -477,16 +501,46 @@ mod tests {
         }
     }
 
-    /// The reason the layout is split in two runs at all: the writer maps the
-    /// leading run read-execute and the rest read-write, so a unit or a
-    /// loader-written GOT slot on the wrong side of the boundary either loses
-    /// write access it needs or gains execute permission it shouldn't have.
-    #[test]
-    fn code_and_loader_written_slots_never_share_a_page() {
+    /// A read-only unit holding one 64-bit absolute pointer: under PIE the
+    /// loader rebases that pointer at startup, so the unit cannot be mapped
+    /// read-only even though the library had it in `.rodata`.
+    fn rebased_rodata_unit(id: u32, name: &str) -> ExtractedUnit {
+        let mut u = unit(id, name, SectionKind::ReadOnlyData, 16, &[]);
+        u.relocations.push(ExtractedReloc {
+            offset_within_unit: 0,
+            kind: object::RelocationKind::Absolute,
+            encoding: object::RelocationEncoding::Generic,
+            size: 64,
+            addend: 0,
+            target: RelocTarget::MergedUnit(UnitId(0)),
+        });
+        u
+    }
+
+    fn plan_for(units: Vec<ExtractedUnit>, is_pie: bool) -> MergePlan {
         let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep"));
         let mapped = MappedElf::open(path).expect("open test/grep");
         let exe = mapped.parse().expect("parse test/grep");
+        plan_layout(
+            units,
+            &exe,
+            &[],
+            is_pie,
+            InitFiniArrays::default(),
+            ExeInitFiniInfo::default(),
+            &[],
+            Vec::new(),
+        )
+        .expect("plan layout")
+    }
 
+    /// The reason the layout is split into runs at all: the writer maps the
+    /// leading run read-execute, the next read-only and the one after that
+    /// read-write, so a unit or a loader-written GOT slot on the wrong side of
+    /// a boundary either loses write access it needs, keeps write access it
+    /// does not, or gains execute permission it shouldn't have.
+    #[test]
+    fn each_unit_lands_in_the_run_with_the_permissions_it_needs() {
         // test/grep imports `memcpy`, so that trampoline reuses an existing GOT
         // slot in the executable; the made-up name has no slot to reuse and so
         // forces a fresh one inside the merged segment.
@@ -500,36 +554,42 @@ mod tests {
             ),
             unit(1, "ro_a", SectionKind::ReadOnlyData, 32, &[]),
             unit(2, "data_a", SectionKind::Data, 48, &[]),
+            rebased_rodata_unit(3, "ro_rebased"),
         ];
 
-        let plan = plan_layout(
-            units,
-            &exe,
-            &[],
-            true,
-            InitFiniArrays::default(),
-            ExeInitFiniInfo::default(),
-            &[],
-            Vec::new(),
-        )
-        .expect("plan layout");
+        let plan = plan_for(units, true);
 
         assert_eq!(plan.exec_size % PAGE_SIZE, 0, "exec run not page-aligned");
+        assert_eq!(
+            plan.rodata_end % PAGE_SIZE,
+            0,
+            "read-only run not page-aligned"
+        );
         assert_eq!(
             plan.writable_end % PAGE_SIZE,
             0,
             "writable run not page-aligned"
         );
-        assert!(plan.exec_size > 0 && plan.writable_end > plan.exec_size);
+        assert!(plan.exec_size > 0);
+        assert!(plan.rodata_end > plan.exec_size);
+        assert!(plan.writable_end > plan.rodata_end);
         assert_eq!(plan.segment_size(), plan.writable_end as usize);
 
         let code_end = plan.load_address + plan.exec_size;
+        let rodata_end = plan.load_address + plan.rodata_end;
         let writable_end = plan.load_address + plan.writable_end;
+        let within = |au: &AssignedUnit, start: u64, end: u64| {
+            au.assigned_vaddr >= start && au.assigned_vaddr + au.unit.bytes.len() as u64 <= end
+        };
+        let named = |name: &str| {
+            plan.all_units()
+                .find(|au| au.unit.name == name)
+                .unwrap_or_else(|| panic!("unit '{name}' is missing from the plan"))
+        };
 
         for au in &plan.text_units {
             assert!(
-                au.assigned_vaddr >= plan.load_address
-                    && au.assigned_vaddr + au.unit.bytes.len() as u64 <= code_end,
+                within(au, plan.load_address, code_end),
                 "text unit '{}' is not inside the executable run",
                 au.unit.name
             );
@@ -542,12 +602,14 @@ mod tests {
                 stub.symbol_name
             );
         }
-        for au in plan.rodata_units.iter().chain(&plan.data_units) {
+        assert!(
+            within(named("ro_a"), code_end, rodata_end),
+            "read-only data nothing writes to is not inside the read-only run"
+        );
+        for name in ["data_a", "ro_rebased"] {
             assert!(
-                au.assigned_vaddr >= code_end
-                    && au.assigned_vaddr + au.unit.bytes.len() as u64 <= writable_end,
-                "unit '{}' is not inside the writable run",
-                au.unit.name
+                within(named(name), rodata_end, writable_end),
+                "unit '{name}' is not inside the writable run"
             );
         }
 
@@ -555,7 +617,7 @@ mod tests {
         let ext = &plan.new_externals[0];
         assert_eq!(ext.name, "solder_absent_symbol");
         assert!(
-            ext.got_vaddr >= code_end && ext.got_vaddr + 8 <= writable_end,
+            ext.got_vaddr >= rodata_end && ext.got_vaddr + 8 <= writable_end,
             "GOT slot for '{}' is not inside the writable run",
             ext.name
         );
@@ -567,5 +629,33 @@ mod tests {
             .find(|s| s.symbol_name == ext.name)
             .expect("trampoline for the injected external");
         assert_eq!(stub.target_got_vaddr, ext.got_vaddr);
+    }
+
+    /// Nothing rebases an absolute pointer in a non-PIE executable — the
+    /// relocator writes its final value at merge time — so that data can be
+    /// mapped read-only, unlike in the PIE case above.
+    #[test]
+    fn non_pie_keeps_pointer_bearing_rodata_read_only() {
+        let units = vec![
+            unit(0, "fn_a", SectionKind::Text, 64, &[]),
+            rebased_rodata_unit(1, "ro_rebased"),
+        ];
+
+        let plan = plan_for(units, false);
+
+        let au = plan
+            .all_units()
+            .find(|au| au.unit.name == "ro_rebased")
+            .expect("the rodata unit");
+        assert!(
+            au.assigned_vaddr >= plan.load_address + plan.exec_size
+                && au.assigned_vaddr + au.unit.bytes.len() as u64
+                    <= plan.load_address + plan.rodata_end,
+            "non-PIE rodata is not inside the read-only run"
+        );
+        assert_eq!(
+            plan.writable_end, plan.rodata_end,
+            "nothing should have been placed in the writable run"
+        );
     }
 }
