@@ -106,7 +106,7 @@ copy of anything you can't rebuild.
 
 Each `DT_NEEDED` soname is looked up in the first of these that contains it:
 
-1. `DT_RPATH` of the executable
+1. `DT_RPATH` of the executable, unless it also has a `DT_RUNPATH`
 2. `$SYSROOT/lib`, if `SYSROOT` is set in the environment
 3. `-L` directories, in the order given
 4. `LD_LIBRARY_PATH`
@@ -117,7 +117,21 @@ Each `DT_NEEDED` soname is looked up in the first of these that contains it:
 
 That is the dynamic linker's own order with `$SYSROOT/lib` and `-L` spliced in
 after `DT_RPATH`. Note that `-L` therefore does *not* override an executable
-that was linked with an `RPATH`.
+that was linked with an `RPATH`. As with the loader, a `DT_RUNPATH` supersedes
+the `DT_RPATH` of the same object entirely rather than being searched after it.
+
+`DT_RPATH` and `DT_RUNPATH` entries go through the same dynamic string token
+substitution the loader applies, so an executable that ships its libraries
+beside itself (`-Wl,-rpath,'$ORIGIN/libs'`) resolves them from there:
+
+- `$ORIGIN` / `${ORIGIN}` — the directory holding the executable, symlinks
+  resolved
+- `$LIB` / `${LIB}` — `lib64`, solder being x86-64 only
+
+`$PLATFORM` is deliberately *not* substituted: it stands for whatever the
+loader makes of the CPU the merged binary eventually runs on, which is not
+knowable at merge time. An entry containing it is skipped with a warning, the
+same way the loader skips it when it has no platform string.
 
 `/etc/ld.so.cache` is filtered the way the loader filters it: only x86-64
 `libc6` entries are considered, so the i386 or x32 build of a soname is never

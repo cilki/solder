@@ -7,34 +7,72 @@ use object::{Object, ObjectSection};
 use tracing::{debug, warn};
 
 use crate::elf_reader::{DynamicTable, va_to_file_offset};
-use crate::lib_discovery::{LdsoCache, is_excluded, resolve_library};
+use crate::lib_discovery::{LdsoCache, expand_dynamic_tokens, is_excluded, resolve_library};
 use crate::types::{ImportKind, ImportedSymbol};
 
 /// Parse the dynamic section of an ELF to extract DT_NEEDED, DT_RPATH, and DT_RUNPATH.
 pub struct DynamicInfo {
     pub needed: Vec<String>,
+    /// `DT_RPATH`, with dynamic string tokens expanded. Read it through
+    /// [`DynamicInfo::search_rpath`] rather than directly.
     pub rpath: Vec<PathBuf>,
+    /// `DT_RUNPATH`, with dynamic string tokens expanded.
     pub runpath: Vec<PathBuf>,
 }
 
-pub fn parse_dynamic(elf: &ElfFile64<'_>) -> Result<DynamicInfo> {
+impl DynamicInfo {
+    /// The `DT_RPATH` directories the loader would actually search.
+    ///
+    /// `DT_RUNPATH` supersedes `DT_RPATH` outright: ld.so ignores an object's
+    /// `DT_RPATH` whenever that object also carries a `DT_RUNPATH`. Searching
+    /// both would let solder pick a library out of a directory the loader
+    /// never reads, and merge code the executable does not actually run.
+    pub fn search_rpath(&self) -> &[PathBuf] {
+        if self.runpath.is_empty() {
+            &self.rpath
+        } else {
+            &[]
+        }
+    }
+}
+
+pub fn parse_dynamic(elf: &ElfFile64<'_>, exe_path: &Path) -> Result<DynamicInfo> {
     use goblin::elf::dynamic::{DT_NEEDED, DT_RPATH, DT_RUNPATH};
 
     let bytes = elf.data();
     let dynamic = DynamicTable::parse(bytes).context("reading .dynamic of the executable")?;
 
-    // DT_RPATH and DT_RUNPATH each name a colon-separated list of directories.
+    // `$ORIGIN` is the directory holding the object with symlinks resolved,
+    // which is how ld.so computes it. Canonicalizing also turns the usual
+    // `solder ./myapp` invocation into an absolute directory, so the resulting
+    // search path does not depend on the working directory.
+    let exe_real = exe_path
+        .canonicalize()
+        .unwrap_or_else(|_| exe_path.to_path_buf());
+    let origin = exe_real.parent().unwrap_or(Path::new("."));
+
+    // DT_RPATH and DT_RUNPATH each name a colon-separated list of directories,
+    // each of which may contain dynamic string tokens.
     let search_list = |tag: u64| -> Vec<PathBuf> {
         dynamic
             .values_of(tag)
             .filter_map(|val| dynamic.string_at(bytes, val))
             .flat_map(|s| s.split(':'))
             .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
+            .filter_map(|p| {
+                let dir = expand_dynamic_tokens(p, origin);
+                if dir.is_none() {
+                    warn!(
+                        entry = p,
+                        "ignoring library search path with a token that cannot be expanded"
+                    );
+                }
+                dir
+            })
             .collect()
     };
 
-    Ok(DynamicInfo {
+    let info = DynamicInfo {
         needed: dynamic
             .values_of(DT_NEEDED)
             .filter_map(|val| dynamic.string_at(bytes, val))
@@ -42,7 +80,16 @@ pub fn parse_dynamic(elf: &ElfFile64<'_>) -> Result<DynamicInfo> {
             .collect(),
         rpath: search_list(DT_RPATH),
         runpath: search_list(DT_RUNPATH),
-    })
+    };
+
+    if !info.runpath.is_empty() && !info.rpath.is_empty() {
+        debug!(
+            ignored=?info.rpath,
+            "DT_RUNPATH is present, so DT_RPATH is ignored as ld.so ignores it"
+        );
+    }
+
+    Ok(info)
 }
 
 /// Collect all symbols the executable imports from shared libraries, resolving
@@ -110,7 +157,7 @@ pub fn collect_imports(
     let mut sym_to_lib: std::collections::HashMap<String, PathBuf> =
         std::collections::HashMap::new();
 
-    let mut search_rpath = dyn_info.rpath.clone();
+    let mut search_rpath = dyn_info.search_rpath().to_vec();
     search_rpath.extend_from_slice(extra_lib_paths);
     let search_runpath = dyn_info.runpath.as_slice();
 

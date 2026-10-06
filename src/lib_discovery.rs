@@ -27,6 +27,54 @@ pub fn is_excluded(soname: &str) -> bool {
         .any(|prefix| soname.starts_with(prefix))
 }
 
+/// Expand the dynamic string tokens `ld.so` substitutes into a `DT_RPATH` or
+/// `DT_RUNPATH` entry before using it as a search directory, in both the
+/// `$TOKEN` and `${TOKEN}` spellings.
+///
+/// `origin` is the directory holding the object the entry came from, with
+/// symlinks resolved — what `$ORIGIN` means to the loader.
+///
+/// Returns `None` for an entry carrying a token that cannot be resolved here.
+/// The loader skips such an entry as well, and searching a directory named
+/// literally `$PLATFORM` would only mask the fact that solder and the loader
+/// are looking in different places.
+pub fn expand_dynamic_tokens(entry: &str, origin: &Path) -> Option<PathBuf> {
+    let mut out = String::with_capacity(entry.len());
+    let mut rest = entry;
+
+    while let Some(dollar) = rest.find('$') {
+        out.push_str(&rest[..dollar]);
+        let after = &rest[dollar + 1..];
+        let (token, tail) = match after.strip_prefix('{') {
+            // `${TOKEN}`: without a closing brace there is no token to expand.
+            Some(braced) => braced.split_once('}')?,
+            // `$TOKEN` runs up to the first character that cannot be part of
+            // a name — usually the `/` starting the rest of the path.
+            None => {
+                let end = after
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(after.len());
+                after.split_at(end)
+            }
+        };
+
+        match token {
+            "ORIGIN" => out.push_str(origin.to_str()?),
+            // ld.so(8): `lib` or `lib64` according to the architecture, and
+            // solder only ever merges x86-64 objects.
+            "LIB" => out.push_str("lib64"),
+            // `$PLATFORM` names whatever the loader makes of the CPU it finds
+            // itself on (on x86-64: `haswell`, `xeon_phi`, or nothing at all),
+            // so the directory it would pick is not knowable from here.
+            _ => return None,
+        }
+        rest = tail;
+    }
+
+    out.push_str(rest);
+    Some(PathBuf::from(out))
+}
+
 /// Resolve a soname (e.g. "libz.so.1") to an absolute path on disk.
 ///
 /// Search order mirrors the Linux dynamic linker:
@@ -283,6 +331,121 @@ fn read_cstr(data: &[u8], offset: usize) -> Result<&str> {
         .unwrap_or(data.len());
     std::str::from_utf8(&data[offset..end])
         .with_context(|| format!("non-UTF8 string at offset {offset}"))
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    /// A cache with nothing in it, so resolution depends only on the paths.
+    fn empty_cache() -> LdsoCache {
+        LdsoCache {
+            map: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn origin_expands_to_the_directory_holding_the_object() {
+        assert_eq!(
+            expand_dynamic_tokens("$ORIGIN/../lib", Path::new("/opt/app/bin")),
+            Some(PathBuf::from("/opt/app/bin/../lib"))
+        );
+    }
+
+    #[test]
+    fn braced_tokens_are_expanded_too() {
+        assert_eq!(
+            expand_dynamic_tokens("${ORIGIN}/libs", Path::new("/opt/app")),
+            Some(PathBuf::from("/opt/app/libs"))
+        );
+    }
+
+    #[test]
+    fn several_tokens_in_one_entry_are_all_expanded() {
+        assert_eq!(
+            expand_dynamic_tokens("$ORIGIN/../$LIB/plugins", Path::new("/opt/app/bin")),
+            Some(PathBuf::from("/opt/app/bin/../lib64/plugins"))
+        );
+    }
+
+    #[test]
+    fn lib_expands_to_the_x86_64_library_directory() {
+        assert_eq!(
+            expand_dynamic_tokens("/usr/$LIB", Path::new("/opt/app")),
+            Some(PathBuf::from("/usr/lib64"))
+        );
+    }
+
+    #[test]
+    fn an_entry_without_tokens_is_left_alone() {
+        assert_eq!(
+            expand_dynamic_tokens("/usr/local/lib", Path::new("/opt/app")),
+            Some(PathBuf::from("/usr/local/lib"))
+        );
+    }
+
+    #[test]
+    fn an_entry_with_an_unresolvable_token_is_dropped() {
+        // `$PLATFORM` depends on the CPU the merged binary ends up running on,
+        // and an unterminated `${` is not a token at all. Either way, guessing
+        // a directory is worse than leaving the entry out of the search.
+        for entry in ["/usr/lib/$PLATFORM", "${ORIGIN/lib", "$ORIGIN$"] {
+            assert_eq!(
+                expand_dynamic_tokens(entry, Path::new("/opt/app")),
+                None,
+                "{entry} should not have expanded"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expanded_origin_entry_resolves_a_bundled_library() {
+        // The case this is all for: an executable linked with
+        // `-Wl,-rpath,'$ORIGIN/libs'` ships its libraries next to itself, and
+        // the unexpanded entry names a directory that never exists.
+        let root = tempfile::tempdir().expect("tempdir");
+        let libs = root.path().join("libs");
+        std::fs::create_dir(&libs).expect("libs dir");
+        std::fs::write(libs.join("libfoo.so.1"), b"").expect("bundled library");
+
+        let origin = root.path();
+        let raw = "$ORIGIN/libs";
+        assert!(
+            resolve_library("libfoo.so.1", &[PathBuf::from(raw)], &[], &empty_cache()).is_err(),
+            "an unexpanded $ORIGIN entry cannot name a real directory"
+        );
+
+        let expanded = expand_dynamic_tokens(raw, origin).expect("expands");
+        assert_eq!(
+            resolve_library("libfoo.so.1", &[expanded], &[], &empty_cache()).ok(),
+            Some(libs.join("libfoo.so.1"))
+        );
+    }
+
+    #[test]
+    fn rpath_is_ignored_when_runpath_is_present() {
+        use crate::symbol_analysis::DynamicInfo;
+
+        let rpath = vec![PathBuf::from("/from/rpath")];
+        let runpath = vec![PathBuf::from("/from/runpath")];
+
+        let both = DynamicInfo {
+            needed: Vec::new(),
+            rpath: rpath.clone(),
+            runpath,
+        };
+        assert!(
+            both.search_rpath().is_empty(),
+            "ld.so ignores DT_RPATH on an object that also has DT_RUNPATH"
+        );
+
+        let rpath_only = DynamicInfo {
+            needed: Vec::new(),
+            rpath: rpath.clone(),
+            runpath: Vec::new(),
+        };
+        assert_eq!(rpath_only.search_rpath(), rpath.as_slice());
+    }
 }
 
 #[cfg(test)]

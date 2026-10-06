@@ -92,7 +92,7 @@ fn run() -> Result<()> {
     }
 
     // ── Step 1: parse dynamic section + collect imports ──────────────────────
-    let dyn_info = parse_dynamic(&exe_elf)?;
+    let dyn_info = parse_dynamic(&exe_elf, &cli.input)?;
 
     if dyn_info.needed.is_empty() {
         anyhow::bail!("executable has no DT_NEEDED entries — nothing to merge");
@@ -218,7 +218,7 @@ fn run() -> Result<()> {
             merged_lib_deps.push(dep_graph::parse_dt_needed(lib)?);
         }
 
-        let mut search_rpath = dyn_info.rpath.clone();
+        let mut search_rpath = dyn_info.search_rpath().to_vec();
         search_rpath.extend_from_slice(&library_path);
         let mut resolve_exports = |soname: &str| {
             resolve_library(soname, &search_rpath, &dyn_info.runpath, &ldso_cache)
