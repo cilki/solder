@@ -43,9 +43,20 @@ dependency recorded as a path rather than a soname is matched on its last
 component, so spelling glibc `/usr/lib64/libc.so.6` does not get it past the
 list.
 
-Only symbols that are actually used will be merged into the final executable.
-For example, `md5sum` is only about 56K, but it dynamically links
-`libcrypto.so.3` which is 6.5M.
+Only the symbols the executable actually reaches are merged, together with
+their transitive closure inside the library. How much that leaves behind
+depends entirely on how interconnected the library is, and the closure of even
+a handful of entry points tends to reach most of it. The fixtures under `test/`
+are representative:
+
+| executable | merged library | before | after |
+| ---------- | -------------- | -----: | ----: |
+| `grep`     | `libpcre2-8.so.0` (695K) |  198K |  807K |
+| `md5sum`   | `libcrypto.so.3` (6.2M)  |   54K |  5.3M |
+
+So `solder` is a way to drop a runtime dependency, not a way to keep the result
+small. Point `--dry-run` at a binary to see how much a merge would pull in
+before committing to it.
 
 ### Inherited dependencies
 
