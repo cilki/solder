@@ -11,7 +11,7 @@ mod symbol_analysis;
 mod types;
 mod writer;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -216,16 +216,38 @@ fn run() -> Result<()> {
             .collect();
 
         let mut merged_lib_deps = Vec::with_capacity(merged_libs.len());
+        // `$ORIGIN` in a path-valued DT_NEEDED entry means the directory of the
+        // object that declared it, so a dependency of a merged library resolves
+        // against that library's directory rather than the executable's.
+        let mut dep_origin: HashMap<String, PathBuf> = HashMap::new();
         for lib in &merged_libs {
-            merged_lib_deps.push(dep_graph::parse_dt_needed(lib)?);
+            let deps = dep_graph::parse_dt_needed(lib)?;
+            if let Some(dir) = lib.parent() {
+                for dep in &deps {
+                    dep_origin
+                        .entry(dep.clone())
+                        .or_insert_with(|| dir.to_path_buf());
+                }
+            }
+            merged_lib_deps.push(deps);
         }
 
         let mut search_rpath = dyn_info.search_rpath().to_vec();
         search_rpath.extend_from_slice(&library_path);
         let mut resolve_exports = |soname: &str| {
-            resolve_library(soname, &search_rpath, &dyn_info.runpath, &ldso_cache)
-                .and_then(|path| symbol_analysis::exported_symbols(&path))
-                .ok()
+            let origin = dep_origin
+                .get(soname)
+                .map(PathBuf::as_path)
+                .unwrap_or(dyn_info.origin.as_path());
+            resolve_library(
+                soname,
+                &search_rpath,
+                &dyn_info.runpath,
+                &ldso_cache,
+                origin,
+            )
+            .and_then(|path| symbol_analysis::exported_symbols(&path))
+            .ok()
         };
 
         symbol_analysis::inherited_needed(

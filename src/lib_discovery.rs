@@ -20,11 +20,26 @@ const NEVER_MERGE_PREFIXES: &[&str] = &[
     "libgcc_s.so",
 ];
 
-/// Returns true if the given soname should never be merged.
-pub fn is_excluded(soname: &str) -> bool {
+/// The file-name part of a `DT_NEEDED` entry.
+///
+/// A dependency is usually recorded as a bare soname, but it may also be
+/// recorded as a path — `/opt/app/lib/libfoo.so`, `$ORIGIN/../lib/libfoo.so`,
+/// `sub/libfoo.so` — which is what the linker writes when the library it was
+/// given has no `DT_SONAME`. Everything that reasons about a dependency *by
+/// name* has to look at the last component, or a path-shaped entry slips past
+/// it: `"/usr/lib64/libc.so.6".starts_with("libc.so")` is false, which is
+/// enough to walk a path-shaped entry straight through the never-merge list.
+pub fn soname_base(needed: &str) -> &str {
+    needed.rsplit('/').next().unwrap_or(needed)
+}
+
+/// Returns true if the given `DT_NEEDED` entry names a library that must never
+/// be merged.
+pub fn is_excluded(needed: &str) -> bool {
+    let name = soname_base(needed);
     NEVER_MERGE_PREFIXES
         .iter()
-        .any(|prefix| soname.starts_with(prefix))
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// Expand the dynamic string tokens `ld.so` substitutes into a `DT_RPATH` or
@@ -75,9 +90,15 @@ pub fn expand_dynamic_tokens(entry: &str, origin: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(out))
 }
 
-/// Resolve a soname (e.g. "libz.so.1") to an absolute path on disk.
+/// Resolve a `DT_NEEDED` entry (e.g. "libz.so.1") to an absolute path on disk.
 ///
-/// Search order mirrors the Linux dynamic linker:
+/// An entry containing a slash names a file rather than a soname and is
+/// resolved by [`resolve_path_entry`] without consulting the search path at
+/// all, exactly as ld.so does. `origin` is the directory holding the object the
+/// entry came from, with symlinks resolved — what `$ORIGIN` means to the
+/// loader.
+///
+/// For a bare soname the search order mirrors the Linux dynamic linker:
 ///   1. Caller-supplied `rpath` entries. The caller appends `$SYSROOT/lib` and
 ///      any `-L` directories here, so those are searched after the
 ///      executable's own `DT_RPATH` but ahead of `LD_LIBRARY_PATH`.
@@ -91,7 +112,13 @@ pub fn resolve_library(
     rpath: &[PathBuf],
     runpath: &[PathBuf],
     ldso_cache: &LdsoCache,
+    origin: &Path,
 ) -> Result<PathBuf> {
+    // 0. Not a soname at all, but a path.
+    if soname.contains('/') {
+        return resolve_path_entry(soname, origin);
+    }
+
     // 1. RPATH
     for dir in rpath {
         let candidate = dir.join(soname);
@@ -141,6 +168,48 @@ pub fn resolve_library(
     }
 
     bail!("cannot find shared library '{soname}' — try -L to add a search path")
+}
+
+/// Resolve a `DT_NEEDED` entry that names a path instead of a soname.
+///
+/// glibc's `_dl_map_object` branches on `strchr (name, '/')`: an entry with a
+/// slash in it is expanded for dynamic string tokens and opened directly, and
+/// no search directory is ever consulted for it. Joining such an entry onto the
+/// search path instead — which is what `dir.join(entry)` did for every entry —
+/// is wrong twice over:
+///
+///   * `..` in the entry walks out of the directory it is joined to, so an
+///     entry like `../../../usr/lib64/libfoo.so` escapes `$SYSROOT/lib` or a
+///     `-L` directory and merges host code into a sysroot build; an absolute
+///     entry discards the search directory outright, since `Path::join` with
+///     an absolute path replaces the whole base.
+///   * even when it stays inside, `<searchdir>/<entry>` is a different file
+///     from the one ld.so will open, so the merge pulls in code the executable
+///     never runs.
+fn resolve_path_entry(needed: &str, origin: &Path) -> Result<PathBuf> {
+    let path = expand_dynamic_tokens(needed, origin).with_context(|| {
+        format!("DT_NEEDED '{needed}' names a path whose tokens cannot be expanded here")
+    })?;
+
+    // ld.so resolves a relative entry against the working directory of the
+    // *running process*, which is not knowable when the merge happens. Merging
+    // whichever file solder's own working directory points at would be a guess
+    // at which library the executable loads.
+    if !path.is_absolute() {
+        bail!(
+            "DT_NEEDED '{needed}' is a relative path, which ld.so resolves against the \
+             working directory of the running process — solder cannot tell which file that \
+             will be. Exclude this library from the merge, or relink the executable against \
+             a soname or an absolute (or $ORIGIN-relative) path."
+        );
+    }
+    if !path.exists() {
+        bail!(
+            "cannot find shared library '{needed}': {} does not exist",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 /// `CACHEMAGIC_NEW CACHE_VERSION` — the magic of `struct cache_file_new`.
@@ -411,15 +480,147 @@ mod resolution_tests {
         let origin = root.path();
         let raw = "$ORIGIN/libs";
         assert!(
-            resolve_library("libfoo.so.1", &[PathBuf::from(raw)], &[], &empty_cache()).is_err(),
+            resolve_library(
+                "libfoo.so.1",
+                &[PathBuf::from(raw)],
+                &[],
+                &empty_cache(),
+                origin
+            )
+            .is_err(),
             "an unexpanded $ORIGIN entry cannot name a real directory"
         );
 
         let expanded = expand_dynamic_tokens(raw, origin).expect("expands");
         assert_eq!(
-            resolve_library("libfoo.so.1", &[expanded], &[], &empty_cache()).ok(),
+            resolve_library("libfoo.so.1", &[expanded], &[], &empty_cache(), origin).ok(),
             Some(libs.join("libfoo.so.1"))
         );
+    }
+
+    #[test]
+    fn the_never_merge_list_is_matched_against_the_last_path_component() {
+        // A library linked without a DT_SONAME is recorded in DT_NEEDED as the
+        // path the linker was handed. Matching the never-merge prefixes against
+        // the whole entry let such a spelling of glibc through the list, and
+        // solder would go on to statically merge libc into the executable.
+        for entry in [
+            "/usr/lib64/libc.so.6",
+            "../../lib/libc.so.6",
+            "./libpthread.so.0",
+            "$ORIGIN/../lib/ld-linux-x86-64.so.2",
+            "lib/libgcc_s.so.1",
+        ] {
+            assert!(is_excluded(entry), "{entry} must stay a dynamic dependency");
+        }
+
+        assert!(is_excluded("libc.so.6"), "a bare soname still matches");
+        assert!(!is_excluded("/opt/app/lib/libfoo.so.1"));
+        assert!(
+            !is_excluded("/libc.so.6-not-really/libfoo.so"),
+            "a directory named after an excluded library does not exclude the file in it"
+        );
+    }
+
+    /// A tree with the same library name present both inside and outside a
+    /// search directory, so a resolution that escapes the search directory is
+    /// distinguishable from one that stays inside it.
+    fn decoy_tree() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        for dir in ["sysroot/lib/sub", "elsewhere/sub"] {
+            std::fs::create_dir_all(root.path().join(dir)).expect("dir");
+            std::fs::write(root.path().join(dir).join("libfoo.so.1"), b"").expect("library");
+        }
+        root
+    }
+
+    #[test]
+    fn a_relative_path_entry_does_not_walk_out_of_a_search_directory() {
+        // ld.so opens a slash-bearing DT_NEEDED entry directly, relative to the
+        // working directory of the running process; it never joins it onto a
+        // search directory. Joining it meant `..` escaped `$SYSROOT/lib` (or a
+        // `-L` directory) and solder merged a library from the host that the
+        // executable will never load.
+        let root = decoy_tree();
+        let sysroot_lib = root.path().join("sysroot/lib");
+        let escaped = root.path().join("elsewhere/sub/libfoo.so.1");
+        assert!(
+            sysroot_lib.join("../../elsewhere/sub/libfoo.so.1").exists(),
+            "the traversal target has to exist for this to be a meaningful test"
+        );
+
+        let resolved = resolve_library(
+            "../../elsewhere/sub/libfoo.so.1",
+            &[sysroot_lib],
+            &[],
+            &empty_cache(),
+            root.path(),
+        );
+        assert_ne!(
+            resolved.as_deref().ok(),
+            Some(escaped.as_path()),
+            "a relative entry must not be resolved through the search path"
+        );
+        let err = format!("{:#}", resolved.expect_err("relative entry"));
+        assert!(err.contains("relative path"), "{err}");
+    }
+
+    #[test]
+    fn an_absolute_path_entry_ignores_the_search_path() {
+        // `Path::join` with an absolute path throws the base away, so the old
+        // search-path walk resolved an absolute entry to itself as a side
+        // effect of the first search directory that happened to be non-empty.
+        // Now it is deliberate — and it no longer depends on there being one.
+        let root = decoy_tree();
+        let wanted = root.path().join("elsewhere/sub/libfoo.so.1");
+        assert_eq!(
+            resolve_library(
+                wanted.to_str().expect("utf8"),
+                &[],
+                &[],
+                &empty_cache(),
+                root.path()
+            )
+            .ok(),
+            Some(wanted)
+        );
+    }
+
+    #[test]
+    fn an_origin_relative_path_entry_resolves_against_the_object() {
+        // The useful shape of a path-valued DT_NEEDED: a bundled library
+        // referenced from the executable's own directory.
+        let root = decoy_tree();
+        let origin = root.path().join("sysroot");
+        assert_eq!(
+            resolve_library(
+                "$ORIGIN/lib/sub/libfoo.so.1",
+                &[],
+                &[],
+                &empty_cache(),
+                &origin
+            )
+            .ok(),
+            Some(origin.join("lib/sub/libfoo.so.1"))
+        );
+    }
+
+    #[test]
+    fn a_path_entry_that_does_not_exist_names_the_path_it_looked_at() {
+        let root = decoy_tree();
+        let missing = root.path().join("sysroot/lib/sub/libmissing.so.1");
+        let err = format!(
+            "{:#}",
+            resolve_library(
+                "$ORIGIN/sub/libmissing.so.1",
+                &[root.path().join("sysroot/lib/sub")],
+                &[],
+                &empty_cache(),
+                &root.path().join("sysroot/lib"),
+            )
+            .expect_err("the library is not there")
+        );
+        assert!(err.contains(&missing.display().to_string()), "{err}");
     }
 
     #[test]
@@ -433,6 +634,7 @@ mod resolution_tests {
             needed: Vec::new(),
             rpath: rpath.clone(),
             runpath,
+            origin: PathBuf::from("/opt/app"),
         };
         assert!(
             both.search_rpath().is_empty(),
@@ -443,6 +645,7 @@ mod resolution_tests {
             needed: Vec::new(),
             rpath: rpath.clone(),
             runpath: Vec::new(),
+            origin: PathBuf::from("/opt/app"),
         };
         assert_eq!(rpath_only.search_rpath(), rpath.as_slice());
     }
