@@ -66,9 +66,53 @@ pub fn va_to_file_offset(elf: &ElfFile64<'_>, va: u64) -> Option<u64> {
     None
 }
 
-/// Find the virtual address of the last byte of the last PT_LOAD segment,
-/// page-aligned up — used to find a free VA for the merged segment.
-pub fn next_free_va(elf: &ElfFile64<'_>) -> u64 {
+/// `p_vaddr - p_offset` of the `PT_LOAD` that starts the image — the one
+/// mapping the ELF header, and in a linker's output the one holding the
+/// program header table.
+///
+/// Later mappings are only congruent to this modulo the page size, not equal
+/// to it, so this is not an image-wide constant. It is specifically the
+/// difference that holds for the program header table, which is what makes it
+/// the one the merged region has to reproduce (see `merged_load_address`).
+pub fn image_base_delta(elf: &ElfFile64<'_>) -> u64 {
+    use object::read::elf::ProgramHeader;
+    let endian = elf.endian();
+    elf.elf_program_headers()
+        .iter()
+        .filter(|seg| seg.p_type(endian) == object::elf::PT_LOAD)
+        .min_by_key(|seg| seg.p_vaddr(endian))
+        .map(|seg| {
+            seg.p_vaddr(endian)
+                .saturating_sub(seg.p_offset(endian))
+                // Mappings are congruent modulo the page size, so the
+                // difference is a whole number of pages; truncate anything
+                // else rather than carry it into the merged region's address.
+                & !0xfff
+        })
+        .unwrap_or(0)
+}
+
+/// Virtual address to place the merged region at.
+///
+/// It has to clear the executable's memory image, and it has to sit far enough
+/// past it that the merged region's file offset — which the writer derives as
+/// `load_address - image_base_delta` — lands past the executable's own bytes.
+///
+/// That second condition is why this is not simply the end of the memory
+/// image. The merged region holds the rebuilt program header table, so
+/// `PT_PHDR` ends up inside it and takes on the region's
+/// `p_vaddr - p_offset`. A linker only ever emits that table in the first
+/// `PT_LOAD`, and `patchelf` relies on it: to rewrite the table it moves it to
+/// file offset `sizeof(Elf64_Ehdr)` and computes the address to claim for it as
+/// `(PT_PHDR.p_vaddr - PT_PHDR.p_offset) + sizeof(Elf64_Ehdr)`. Read off a
+/// merged region with a different difference, that address is wrong by the
+/// difference — and since glibc takes the main map's load address to be
+/// `AT_PHDR - PT_PHDR.p_vaddr`, the binary `patchelf` produced relocated itself
+/// by that much and died before `main`. Every executable with a `.bss` was
+/// affected, the memory image outrunning the file by the size of it. Matching
+/// the executable's own difference costs that many zero bytes of unmapped
+/// padding in the file and nothing at runtime.
+pub fn merged_load_address(elf: &ElfFile64<'_>) -> u64 {
     use object::read::elf::ProgramHeader;
     let endian = elf.endian();
     let mut max_end: u64 = 0;
@@ -81,8 +125,10 @@ pub fn next_free_va(elf: &ElfFile64<'_>) -> u64 {
             max_end = end;
         }
     }
+    // The address the end of the file maps to if the image's difference holds.
+    let past_file_end = (elf.data().len() as u64).saturating_add(image_base_delta(elf));
     // Page-align upward (4 KiB pages)
-    (max_end + 0xfff) & !0xfff
+    (max_end.max(past_file_end) + 0xfff) & !0xfff
 }
 
 /// Validate that the input ELF is a supported target:

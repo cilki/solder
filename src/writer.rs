@@ -139,10 +139,26 @@ pub fn write_output(
         exe.elf_program_headers().to_vec();
     let phdr_entry_size = std::mem::size_of::<object::elf::ProgramHeader64<object::Endianness>>();
 
-    // File offset where the merged segment will start.
-    let seg_file_offset = patched_exe.len() as u64;
-    // Page-align the offset (required by the kernel for PT_LOAD).
-    let seg_file_offset = align_up(seg_file_offset, 0x1000);
+    // File offset where the merged segment will start. It is pinned to
+    // `load_address` so that `p_vaddr - p_offset` comes out the same for the
+    // merged mappings as for the executable's own — `PT_PHDR` lands inside the
+    // merged region, and tools read its difference as the whole image's (see
+    // `merged_load_address`). Everything between the end of the executable and
+    // here is unmapped zero padding.
+    let base_delta = crate::elf_reader::image_base_delta(&exe);
+    let seg_file_offset = plan
+        .load_address
+        .checked_sub(base_delta)
+        .filter(|offset| *offset >= patched_exe.len() as u64)
+        .with_context(|| {
+            format!(
+                "merged region at {:#x} would start at file offset {:#x}, inside the \
+                 {:#x}-byte executable (image base delta {base_delta:#x})",
+                plan.load_address,
+                plan.load_address.wrapping_sub(base_delta),
+                patched_exe.len()
+            )
+        })?;
 
     // Build the extended merged segment: original segment + any sections we
     // need to grow (.dynstr/.dynsym/.gnu.version when injecting new external
@@ -1330,6 +1346,66 @@ mod section_header_tests {
             let (_, sh_addr, _, sh_size) = section(&table, name);
             assert_eq!(*sh_addr, plan.load_address + start, "'{name}' is misplaced");
             assert_eq!(*sh_size, end - start, "'{name}' is the wrong size");
+        }
+    }
+
+    /// The merge rebuilds the program header table inside the merged region, so
+    /// `PT_PHDR` takes on that region's `p_vaddr - p_offset`. A linker only ever
+    /// puts that table in the first `PT_LOAD`, and `patchelf` relies on it:
+    /// rewriting the table, it moves it to file offset `sizeof(Elf64_Ehdr)` and
+    /// claims `(PT_PHDR.p_vaddr - PT_PHDR.p_offset) + sizeof(Elf64_Ehdr)` as its
+    /// address. With the merged region at the end of the memory image but its
+    /// bytes at the end of the file, those differed by the size of the
+    /// executable's `.bss` — so `patchelf --set-rpath` over a merged binary
+    /// produced a `PT_PHDR` that much too high, and glibc, which takes the main
+    /// map's load address to be `AT_PHDR - PT_PHDR.p_vaddr`, relocated the whole
+    /// executable by the error and crashed before `main`.
+    #[test]
+    fn the_rebuilt_program_header_table_keeps_the_executables_address_to_offset_difference() {
+        use object::read::elf::ProgramHeader;
+
+        let (plan, bytes) = merged_grep();
+        let out = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes)
+            .expect("parse the merged output");
+        let endian = out.endian();
+
+        // The input and the output agree on it: the merge appends mappings
+        // rather than touching the one that starts the image.
+        let expected = crate::elf_reader::image_base_delta(&out);
+        let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
+        assert_eq!(
+            expected,
+            crate::elf_reader::image_base_delta(&mapped.parse().expect("parse test/grep")),
+            "the merge moved the mapping that starts the image"
+        );
+
+        let phdr = out
+            .elf_program_headers()
+            .iter()
+            .find(|seg| seg.p_type(endian) == object::elf::PT_PHDR)
+            .expect("the merged output has no PT_PHDR");
+        assert_eq!(
+            phdr.p_vaddr(endian) - phdr.p_offset(endian),
+            expected,
+            "PT_PHDR at {:#x} maps file offset {:#x}",
+            phdr.p_vaddr(endian),
+            phdr.p_offset(endian)
+        );
+
+        // PT_PHDR inherits it from the merged region, so the region's own
+        // mappings carry it too — including the executable one, which is where
+        // `load_address` is.
+        for seg in out.elf_program_headers() {
+            let vaddr = seg.p_vaddr(endian);
+            if seg.p_type(endian) != object::elf::PT_LOAD || vaddr < plan.load_address {
+                continue;
+            }
+            assert_eq!(
+                vaddr - seg.p_offset(endian),
+                expected,
+                "a merged mapping at {vaddr:#x} maps file offset {:#x}",
+                seg.p_offset(endian)
+            );
         }
     }
 

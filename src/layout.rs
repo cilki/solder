@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use tracing::{debug, trace};
 
 use crate::elf_reader::file_offset_to_va;
-use crate::elf_reader::next_free_va;
+use crate::elf_reader::merged_load_address;
 use crate::types::{
     AssignedUnit, ExeInitFiniInfo, ExtractedUnit, GotPatch, InitFiniArrays, InitFiniPlan,
     MergePlan, NewExternalSym, RelocTarget, SectionKind, TrampolineStub,
@@ -23,7 +23,7 @@ pub fn plan_layout(
     lib_order: &[PathBuf],
     got_slot_fixups: Vec<crate::types::GotSlotFixup>,
 ) -> Result<MergePlan> {
-    let load_address = next_free_va(exe_elf);
+    let load_address = merged_load_address(exe_elf);
 
     // Separate units by section kind.
     let mut text: Vec<ExtractedUnit> = Vec::new();

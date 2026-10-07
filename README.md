@@ -153,6 +153,14 @@ that variant was built for is not knowable from here.
   symbol and relocation tables. Extracted read-only data only lands in the
   writable mapping when the dynamic loader still has to write to it — a
   pointer it rebases at startup, or a GOT slot it resolves
+- Places those mappings' bytes at the file offset that gives them the same
+  `p_vaddr - p_offset` the executable's own program header table has. The
+  rebuilt program header table lives in the merged region, and a linker only
+  ever emits that table in the first `PT_LOAD`, so tools that rewrite it —
+  `patchelf` among them — read its difference as the one that holds for the
+  start of the file. The merged region therefore starts past the end of the
+  memory image in the file as well as in memory, which leaves the executable's
+  `.bss` worth of unmapped zero padding in between
 - Patches GOT entries to point directly to the merged symbols
 - Removes the merged libraries from `DT_NEEDED`, and moves onto the executable
   any `DT_NEEDED` of theirs that still provides a symbol the extracted code
