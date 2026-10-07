@@ -92,6 +92,16 @@ pub fn parse_dynamic(elf: &ElfFile64<'_>, exe_path: &Path) -> Result<DynamicInfo
     Ok(info)
 }
 
+/// A `DT_NEEDED` entry solder considered merging, and the file it resolved to.
+pub struct MergedLibrary {
+    /// The soname exactly as the executable's `.dynstr` spells it, which is
+    /// what `remove_dt_needed` and `remove_verneed_entries` match against.
+    pub soname: String,
+    /// The library `resolve_library` found for that soname — the same path the
+    /// imports taken from it carry in `ImportedSymbol::source_library`.
+    pub path: PathBuf,
+}
+
 /// Collect all symbols the executable imports from shared libraries, resolving
 /// each to an absolute library path and a GOT file offset.
 /// Result of `collect_imports`: the symbols the executable imports, plus a
@@ -100,6 +110,34 @@ pub fn parse_dynamic(elf: &ElfFile64<'_>, exe_path: &Path) -> Result<DynamicInfo
 pub struct ImportInfo {
     pub imports: Vec<ImportedSymbol>,
     pub merged_lib_syms: std::collections::HashMap<String, PathBuf>,
+    /// Every `DT_NEEDED` entry that survived the exclusion list and the `-m`
+    /// filter, in the order the executable lists them.
+    pub merged_libs: Vec<MergedLibrary>,
+}
+
+impl ImportInfo {
+    /// The libraries that actually gave up at least one symbol, paired with
+    /// the soname that named them.
+    ///
+    /// Every reference the executable made into such a library is satisfied by
+    /// merged code once the merge lands, so its `DT_NEEDED` entry — and the
+    /// copy relocations against the data it exported — can go. A candidate
+    /// library the executable turned out not to import anything from keeps
+    /// both.
+    ///
+    /// This is the one place the soname ↔ path correspondence is decided.
+    /// Recovering it downstream by comparing a resolved library's file name
+    /// against a soname (which is what the callers used to do) guesses at
+    /// something already known here, and guesses wrong whenever one soname is
+    /// a prefix of another: merging `libfoo.so.1` dropped a sibling
+    /// `DT_NEEDED` on `libfoo.so` that nothing had been merged out of.
+    pub fn absorbed_libraries(&self) -> impl Iterator<Item = &MergedLibrary> {
+        self.merged_libs.iter().filter(|lib| {
+            self.imports
+                .iter()
+                .any(|imp| imp.source_library == lib.path)
+        })
+    }
 }
 
 /// Whether a `-m` filter entry selects the given DT_NEEDED soname. A filter
@@ -156,6 +194,7 @@ pub fn collect_imports(
     // and record which symbols it exports.  The first library providing a symbol wins.
     let mut sym_to_lib: std::collections::HashMap<String, PathBuf> =
         std::collections::HashMap::new();
+    let mut merged_libs: Vec<MergedLibrary> = Vec::new();
 
     let mut search_rpath = dyn_info.search_rpath().to_vec();
     search_rpath.extend_from_slice(extra_lib_paths);
@@ -177,6 +216,10 @@ pub fn collect_imports(
         for name in exported_symbols(&lib_path)? {
             sym_to_lib.entry(name).or_insert_with(|| lib_path.clone());
         }
+        merged_libs.push(MergedLibrary {
+            soname: needed.clone(),
+            path: lib_path,
+        });
     }
 
     // Now walk .rela.plt (all JUMP_SLOT) and the GLOB_DATs of .rela.dyn,
@@ -209,6 +252,7 @@ pub fn collect_imports(
     Ok(ImportInfo {
         imports,
         merged_lib_syms: sym_to_lib,
+        merged_libs,
     })
 }
 
@@ -615,6 +659,97 @@ mod inherited_needed_tests {
             &mut exports,
         );
         assert_eq!(inherited, names(&["libz.so.1"]));
+    }
+}
+
+#[cfg(test)]
+mod absorbed_library_tests {
+    use super::{ImportInfo, MergedLibrary};
+    use crate::types::{ImportKind, ImportedSymbol};
+    use std::path::PathBuf;
+
+    fn lib(soname: &str) -> MergedLibrary {
+        MergedLibrary {
+            soname: soname.to_owned(),
+            path: PathBuf::from("/usr/lib").join(soname),
+        }
+    }
+
+    fn import(name: &str, soname: &str) -> ImportedSymbol {
+        ImportedSymbol {
+            name: name.to_owned(),
+            source_library: PathBuf::from("/usr/lib").join(soname),
+            got_file_offset: 0,
+            kind: ImportKind::JumpSlot,
+        }
+    }
+
+    fn collected(libs: &[&str], imports: Vec<ImportedSymbol>) -> ImportInfo {
+        ImportInfo {
+            imports,
+            merged_lib_syms: Default::default(),
+            merged_libs: libs.iter().copied().map(lib).collect(),
+        }
+    }
+
+    fn absorbed(info: &ImportInfo) -> Vec<&str> {
+        info.absorbed_libraries()
+            .map(|l| l.soname.as_str())
+            .collect()
+    }
+
+    /// A candidate library the executable imports nothing from was never
+    /// merged, so its `DT_NEEDED` entry has to stay: dropping it would take
+    /// away a dependency whose code is still only in the library.
+    #[test]
+    fn a_library_nothing_was_taken_from_keeps_its_dt_needed_entry() {
+        let info = collected(
+            &["libpcre2-8.so.0", "libtinfo.so.6"],
+            vec![import("pcre2_compile_8", "libpcre2-8.so.0")],
+        );
+        assert_eq!(absorbed(&info), ["libpcre2-8.so.0"]);
+    }
+
+    /// The case that made the old basename heuristic
+    /// (`base.starts_with(soname) || soname.starts_with(base)`) wrong: a
+    /// library whose `DT_SONAME` carries no version suffix sits in `DT_NEEDED`
+    /// next to a versioned sibling, and each soname is a prefix of the other's
+    /// file name. Merging either one used to mark *both* removable, so the
+    /// patcher dropped the `DT_NEEDED` entry and unlinked the `Verneed` entry
+    /// of a library nothing had been merged out of — leaving the executable's
+    /// own references to it unresolvable, which under the `DF_BIND_NOW` solder
+    /// forces means the merged binary does not start at all.
+    #[test]
+    fn merging_a_library_does_not_drop_a_sibling_whose_soname_is_a_prefix() {
+        let info = collected(
+            &["libfoo.so.1", "libfoo.so"],
+            vec![import("foo_one", "libfoo.so.1")],
+        );
+        assert_eq!(absorbed(&info), ["libfoo.so.1"]);
+
+        // ...and the same the other way round, where the soname that was
+        // merged is the shorter of the two.
+        let info = collected(
+            &["libfoo.so.1", "libfoo.so"],
+            vec![import("foo_zero", "libfoo.so")],
+        );
+        assert_eq!(absorbed(&info), ["libfoo.so"]);
+    }
+
+    /// Sonames come back in `DT_NEEDED` order whatever order the imports were
+    /// found in: `remove_needed` and the merged-library dependency order are
+    /// both built from this, and neither should shift between runs.
+    #[test]
+    fn sonames_come_back_in_dt_needed_order() {
+        let info = collected(
+            &["liba.so.1", "libb.so.1", "libc_x.so.1"],
+            vec![
+                import("c_sym", "libc_x.so.1"),
+                import("a_sym", "liba.so.1"),
+                import("b_sym", "libb.so.1"),
+            ],
+        );
+        assert_eq!(absorbed(&info), ["liba.so.1", "libb.so.1", "libc_x.so.1"]);
     }
 }
 

@@ -107,15 +107,15 @@ fn run() -> Result<()> {
         &library_path,
         merge_filter,
     )?;
-    let imports = import_info.imports;
-    let merged_lib_syms = import_info.merged_lib_syms;
+    let imports = &import_info.imports;
+    let merged_lib_syms = &import_info.merged_lib_syms;
 
     if imports.is_empty() {
         warn!("No mergeable imported symbols found");
         return Ok(());
     }
 
-    for imp in &imports {
+    for imp in imports {
         info!(
             kind=?imp.kind,
             name=imp.name,
@@ -126,7 +126,7 @@ fn run() -> Result<()> {
 
     // ── Step 2: transitive closure extraction ────────────────────────────────
     let (units, init_fini, got_slot_fixups) =
-        extractor::extract_units(&imports, &exe_elf, &merged_lib_syms)?;
+        extractor::extract_units(imports, &exe_elf, merged_lib_syms)?;
 
     for u in &units {
         info!(
@@ -154,12 +154,10 @@ fn run() -> Result<()> {
     }
 
     // ── Step 2.5: topological ordering of merged libraries ────────────────────
-    let merged_libs: Vec<PathBuf> = imports
-        .iter()
-        .map(|i| i.source_library.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
+    // The libraries that actually gave up a symbol, in DT_NEEDED order, which
+    // is also exactly the set whose sonames the merge removes.
+    let absorbed: Vec<&symbol_analysis::MergedLibrary> = import_info.absorbed_libraries().collect();
+    let merged_libs: Vec<PathBuf> = absorbed.iter().map(|lib| lib.path.clone()).collect();
     let lib_order = dep_graph::topological_order(&merged_libs)?;
 
     // ── Step 2.6: parse executable's existing init/fini info ──────────────────
@@ -169,13 +167,17 @@ fn run() -> Result<()> {
     let mut plan = layout::plan_layout(
         units,
         &exe_elf,
-        &imports,
+        imports,
         is_pie,
         init_fini,
         exe_init_fini,
         &lib_order,
         got_slot_fixups,
     )?;
+
+    // Nothing in the executable reaches these libraries any more, so their
+    // DT_NEEDED entries (and the version requirements against them) go.
+    plan.remove_needed = absorbed.iter().map(|lib| lib.soname.clone()).collect();
 
     info!(
         load_address = format_args!("0x{:016x}", plan.load_address),
@@ -213,7 +215,7 @@ fn run() -> Result<()> {
             .chain(plan.got_imports.iter().map(|g| g.name.clone()))
             .collect();
 
-        let mut merged_lib_deps = Vec::with_capacity(lib_order.len());
+        let mut merged_lib_deps = Vec::with_capacity(merged_libs.len());
         for lib in &merged_libs {
             merged_lib_deps.push(dep_graph::parse_dt_needed(lib)?);
         }
@@ -237,7 +239,7 @@ fn run() -> Result<()> {
     info!(add_needed=?plan.add_needed, "DT_NEEDED entries to add");
 
     if cli.dry_run {
-        print_merge_plan(&cli.input, &plan, &imports, &dyn_info.needed);
+        print_merge_plan(&cli.input, &plan, imports, &dyn_info.needed);
         return Ok(());
     }
 
@@ -252,21 +254,14 @@ fn run() -> Result<()> {
             .context("finding JUMP_SLOT reloc offsets")?;
 
     // Neutralize copy relocations for data symbols exported by a library we are
-    // removing (e.g. ncurses' UP/PC/BC). Only symbols whose providing library's
-    // soname is in remove_needed are eligible, so a partially-merged library's
-    // copy relocations are left untouched.
+    // removing (e.g. ncurses' UP/PC/BC). Only symbols a library we are dropping
+    // provides are eligible, so a candidate library that stays in DT_NEEDED
+    // keeps its copy relocations.
+    let removed_libs: HashSet<&std::path::Path> =
+        absorbed.iter().map(|lib| lib.path.as_path()).collect();
     let removed_provided_syms: HashSet<String> = merged_lib_syms
         .iter()
-        .filter(|(_, lib)| {
-            lib.file_name()
-                .and_then(|n| n.to_str())
-                .map(|base| {
-                    plan.remove_needed
-                        .iter()
-                        .any(|soname| base.starts_with(soname.as_str()) || soname.starts_with(base))
-                })
-                .unwrap_or(false)
-        })
+        .filter(|(_, lib)| removed_libs.contains(lib.as_path()))
         .map(|(name, _)| name.clone())
         .collect();
     let copy_relocs = symbol_analysis::find_copy_reloc_offsets(&exe_elf, &removed_provided_syms)
