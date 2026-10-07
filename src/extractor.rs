@@ -1285,37 +1285,108 @@ fn find_existing_data_blob(addr: u64, state: &ExtractionState) -> Option<(UnitId
     None
 }
 
-/// Find the section containing a given virtual address and return its name,
-/// base vaddr, contents and kind.
+/// Find the section a given virtual address belongs to and return its name,
+/// base vaddr, contents and kind. The caller reaches the address itself through
+/// `addr - base`, which for the gap case below is past the end of `contents`.
+///
+/// An address that no section contains, but that a `PT_LOAD` still covers,
+/// belongs to the section it follows inside that segment. Such an address is
+/// inter-section alignment padding, and the end markers the linker defines
+/// there are referenced like any other symbol:
+///
+/// - `__TMC_LIST__` and `__TMC_END__` come from the empty `.tm_clone_table`
+///   section of `crtbeginS.o`/`crtendS.o`, which the default linker script
+///   places inside `.data` with 8-byte alignment. Both land on the first
+///   8-aligned address at or after the end of `.data`'s contents without adding
+///   anything to `sh_size`, so in `libtinfo.so.6` (contents ending at
+///   `0x354a4`) they sit at `0x354a8`, four bytes past the section.
+/// - `_edata` and `_end` are defined the same way, at the end of `.data` and
+///   `.bss` respectively.
+///
+/// Nothing dereferences these — `register_tm_clones` subtracts one from the
+/// other to find out whether there is a clone table to register — but the
+/// addresses do get loaded into registers, and a reference left unresolved
+/// keeps its library displacement, which now reaches whatever happens to sit
+/// that far from the unit's new home. Resolving them to the merged copy keeps
+/// the address meaningful, and the comparison between two of them exact.
+///
+/// Requiring one `PT_LOAD` to cover both the address and the end of the section
+/// it is attributed to is what keeps this from reaching across a segment
+/// boundary, and from attributing anything at all to an address outside the
+/// image — a decoding artifact from a unit that ran past the end of its
+/// function, say.
 fn find_section_for_address(
     elf: &object::read::elf::ElfFile64<'_>,
     addr: u64,
 ) -> Option<(String, u64, Vec<u8>, SectionKind)> {
+    let mut preceding: Option<(u64, object::read::elf::ElfSection64<'_, '_>)> = None;
+
     for section in elf.sections() {
         let sec_addr = section.address();
         let sec_size = section.size();
         if addr >= sec_addr && addr < sec_addr + sec_size {
-            let name = section.name().ok()?.to_string();
-            let kind = match section.kind() {
-                ObjSectionKind::Text => SectionKind::Text,
-                ObjSectionKind::ReadOnlyData | ObjSectionKind::ReadOnlyString => {
-                    SectionKind::ReadOnlyData
-                }
-                ObjSectionKind::Data | ObjSectionKind::UninitializedData => SectionKind::Data,
-                _ => return None, // Skip unsupported section types
-            };
-            // Handle NOBITS sections (.bss) which have no data in the file
-            let data =
-                if kind == SectionKind::Data && section.data().ok().is_none_or(|d| d.is_empty()) {
-                    // NOBITS section - create zero-filled data
-                    vec![0u8; sec_size as usize]
-                } else {
-                    section.data().ok()?.to_vec()
-                };
-            return Some((name, sec_addr, data, kind));
+            return describe_section(&section);
+        }
+        // Only loaded sections can precede the address: a non-allocated one
+        // (`.shstrtab`, `.gnu_debuglink`) reports address 0 and would otherwise
+        // claim an address by its size alone.
+        if sec_addr > addr || sec_size == 0 || !is_alloc(&section) {
+            continue;
+        }
+        // Nothing contains `addr`, so this section ends at or before it; keep
+        // the one that ends closest to it.
+        let sec_end = sec_addr + sec_size;
+        if preceding.as_ref().is_none_or(|(end, _)| sec_end > *end) {
+            preceding = Some((sec_end, section));
         }
     }
-    None
+
+    let (sec_end, section) = preceding?;
+    loaded_together(elf, addr, sec_end).then(|| describe_section(&section))?
+}
+
+/// Whether one `PT_LOAD` segment covers both addresses.
+fn loaded_together(elf: &object::read::elf::ElfFile64<'_>, a: u64, b: u64) -> bool {
+    use object::read::elf::ProgramHeader;
+    let endian = elf.endian();
+    elf.elf_program_headers().iter().any(|seg| {
+        if seg.p_type(endian) != object::elf::PT_LOAD {
+            return false;
+        }
+        let start = seg.p_vaddr(endian);
+        let end = start + seg.p_memsz(endian);
+        (start..=end).contains(&a) && (start..=end).contains(&b)
+    })
+}
+
+/// Whether a section is part of the loaded image (`SHF_ALLOC`).
+fn is_alloc(section: &object::read::elf::ElfSection64<'_, '_>) -> bool {
+    match section.flags() {
+        object::SectionFlags::Elf { sh_flags, .. } => (sh_flags & object::elf::SHF_ALLOC).0 != 0,
+        _ => false,
+    }
+}
+
+/// A section's name, base vaddr, contents and kind, or `None` if solder does
+/// not extract that kind of section.
+fn describe_section(
+    section: &object::read::elf::ElfSection64<'_, '_>,
+) -> Option<(String, u64, Vec<u8>, SectionKind)> {
+    let name = section.name().ok()?.to_string();
+    let kind = match section.kind() {
+        ObjSectionKind::Text => SectionKind::Text,
+        ObjSectionKind::ReadOnlyData | ObjSectionKind::ReadOnlyString => SectionKind::ReadOnlyData,
+        ObjSectionKind::Data | ObjSectionKind::UninitializedData => SectionKind::Data,
+        _ => return None, // Skip unsupported section types
+    };
+    // Handle NOBITS sections (.bss) which have no data in the file
+    let data = if kind == SectionKind::Data && section.data().ok().is_none_or(|d| d.is_empty()) {
+        // NOBITS section - create zero-filled data
+        vec![0u8; section.size() as usize]
+    } else {
+        section.data().ok()?.to_vec()
+    };
+    Some((name, section.address(), data, kind))
 }
 
 /// Collect dynamic relocations (.rela.dyn) that fall within
@@ -1831,6 +1902,145 @@ mod tests {
                 matches!(reloc.target, RelocTarget::DataBlobOffset(..)),
                 "slot {offset:#x} resolved to {:?}",
                 reloc.target
+            );
+        }
+    }
+
+    /// Every committed fixture library, so a trait of the linker's output is
+    /// checked against more than one build.
+    const TEST_LIBS: [&str; 3] = ["libtinfo.so.6", "libpcre2-8.so.0", "libcrypto.so.3"];
+
+    fn parse_lib(bytes: &[u8]) -> object::read::elf::ElfFile64<'_> {
+        match object::File::parse(bytes).expect("parse library") {
+            object::File::Elf64(elf64) => elf64,
+            _ => panic!("not ELF64"),
+        }
+    }
+
+    /// An address in the alignment padding between two allocated sections
+    /// belongs to the section it follows, since that is where the linker leaves
+    /// the end markers of the section's contents. An address inside a section
+    /// still belongs to that section, and one outside the image belongs to
+    /// nothing — anchoring that to whatever section happens to lie lowest would
+    /// turn a decoding artifact into a relocation.
+    #[test]
+    fn an_address_in_a_sections_trailing_gap_belongs_to_that_section() {
+        for name in TEST_LIBS {
+            let bytes = std::fs::read(test_lib(name)).expect("read library");
+            let elf = parse_lib(&bytes);
+
+            let data = elf.section_by_name(".data").expect(".data");
+            let data_end = data.address() + data.size();
+            let bss = elf.section_by_name(".bss").expect(".bss").address();
+            assert!(
+                bss > data_end,
+                "{name}: expected padding between .data and .bss"
+            );
+
+            for addr in [data_end, bss - 1] {
+                let (section, base, contents, kind) = find_section_for_address(&elf, addr)
+                    .unwrap_or_else(|| panic!("{name}: {addr:#x} resolved to no section"));
+                assert_eq!(section, ".data", "{name}: {addr:#x}");
+                assert_eq!(base, data.address(), "{name}: {addr:#x}");
+                assert_eq!(kind, SectionKind::Data, "{name}: {addr:#x}");
+                assert_eq!(contents.len() as u64, data.size(), "{name}: {addr:#x}");
+            }
+
+            let (section, ..) = find_section_for_address(&elf, bss).expect(".bss");
+            assert_eq!(section, ".bss", "{name}: containment must win over a gap");
+
+            let past_the_image = bss + elf.section_by_name(".bss").expect(".bss").size() + 0x1000;
+            assert!(
+                find_section_for_address(&elf, past_the_image).is_none(),
+                "{name}: {past_the_image:#x} is outside every section"
+            );
+
+            // The gap between the read-only and the writable segment is not
+            // padding of the section below it: the two are mapped separately,
+            // and the merged copies land in separate mappings too.
+            let eh_frame = elf.section_by_name(".eh_frame").expect(".eh_frame");
+            let ro_end = eh_frame.address() + eh_frame.size();
+            let rw_start = elf
+                .section_by_name(".init_array")
+                .expect(".init_array")
+                .address();
+            let between_segments = ro_end + (rw_start - ro_end) / 2;
+            assert!(
+                find_section_for_address(&elf, between_segments).is_none(),
+                "{name}: {between_segments:#x} spans a segment boundary"
+            );
+        }
+    }
+
+    /// `crtbeginS.o` puts `register_tm_clones` in the `.init_array` of every
+    /// shared library and `deregister_tm_clones` in its `.fini_array`, and both
+    /// compare `__TMC_LIST__` against `__TMC_END__` to decide whether there is a
+    /// transactional-memory clone table to register. The linker defines those
+    /// two markers in the alignment padding past the end of `.data`, so nothing
+    /// used to own their address and both `lea` displacements were copied
+    /// verbatim — pointing, once the unit had moved into the executable, at
+    /// whatever lay that far past its new home.
+    #[test]
+    fn the_crt_clone_table_markers_are_retargeted_at_the_merged_copy() {
+        for name in TEST_LIBS {
+            let lib = test_lib(name);
+            let bytes = std::fs::read(&lib).expect("read library");
+            let elf = parse_lib(&bytes);
+            let data_size = elf.section_by_name(".data").expect(".data").size();
+
+            let mut state = test_state();
+            let index = state.lib_index(&lib, &elf);
+            let arrays = extract_init_fini_arrays(&elf, &index, &lib).expect("init/fini arrays");
+            assert!(
+                !arrays.init_entries.is_empty() && !arrays.fini_entries.is_empty(),
+                "{name}: expected CRT glue in both arrays"
+            );
+
+            // The markers are referenced by the clone-table helpers the array
+            // entries call, so follow the entries' dependencies too.
+            let mut queue: VecDeque<UnitKey> = arrays
+                .init_entries
+                .iter()
+                .chain(&arrays.fini_entries)
+                .map(|entry| UnitKey {
+                    lib: lib.clone(),
+                    sym: entry.unit_name.clone(),
+                })
+                .collect();
+            let mut seen: HashSet<UnitKey> = queue.iter().cloned().collect();
+            while let Some(key) = queue.pop_front() {
+                let deps = process_symbol(&key, &mut state).expect("extract the CRT glue");
+                for dep in deps {
+                    if dep.lib == lib && seen.insert(dep.clone()) {
+                        queue.push_back(dep);
+                    }
+                }
+            }
+
+            let blob = state
+                .data_blobs
+                .get(&DataBlobKey {
+                    lib: lib.clone(),
+                    section: ".data".to_string(),
+                })
+                .expect(".data was not extracted")
+                .id;
+
+            // A marker sits at or past the last byte of `.data`, so the offset
+            // the markers resolve to is never inside the copied contents.
+            let markers = state
+                .units
+                .iter()
+                .flat_map(|u| &u.relocations)
+                .filter(|r| {
+                    matches!(r.target,
+                        RelocTarget::DataBlobOffset(id, off) if id == blob && off >= data_size)
+                })
+                .count();
+            assert!(
+                markers >= 2,
+                "{name}: expected the clone-table markers to be retargeted, \
+                 found {markers} such relocations"
             );
         }
     }
