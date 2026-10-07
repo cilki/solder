@@ -231,6 +231,15 @@ libraries and leave that one dynamic, or relink against a soname.
 - Carries the merged libraries' constructors and destructors onto the
   executable's `DT_PREINIT_ARRAY` and `DT_FINI_ARRAY` (see
   [Constructors and destructors](#constructors-and-destructors))
+- Recomputes the `.note.gnu.property` entries that describe the program as a
+  whole, the way a static link recomputes them across its inputs: the CET
+  features (`GNU_PROPERTY_X86_FEATURE_1_AND` — IBT and the shadow stack) become
+  the intersection of the executable's and those of every merged library, and
+  the required x86-64 ISA levels (`GNU_PROPERTY_X86_ISA_1_NEEDED`) their union.
+  Merging a library built without `-fcf-protection` otherwise leaves the
+  executable advertising control-flow protection its merged-in code does not
+  have, and the loader enables IBT over code with no `endbr64` where `solder`
+  routes calls into it through the GOT
 - Rewrites the section header table so it describes the result: the headers of
   the rebuilt `.dynsym`/`.dynstr`/`.gnu.version`/`.rela.dyn` are repointed at
   the copies the loader now reads, and `.solder.text`/`.solder.rodata`/
@@ -277,3 +286,6 @@ libraries and leave that one dynamic, or relink against a soname.
   so nothing asks the loader to resolve them — but it does mean the symbol
   tables are not a way to tell whether a merge worked. Read the
   `.solder.*` section headers, or `DT_NEEDED`, instead
+- `.note.gnu.property` is edited in place, so a property the executable does not
+  already carry can't be added. If a merged library needs an x86-64 ISA level
+  the executable has no entry for, you get a warning instead of a note entry
