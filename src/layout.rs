@@ -170,31 +170,6 @@ pub fn plan_layout(
         });
     }
 
-    // List of DT_NEEDED sonames to remove: those whose libraries were fully merged.
-    let remove_needed: Vec<String> = {
-        // We need the sonames, not paths. Re-derive from imports by finding what
-        // soname maps to each library. Use the DT_NEEDED list from the executable.
-        let exe_bytes = exe_elf.data();
-        let goblin = goblin::elf::Elf::parse(exe_bytes).context("goblin for needed list")?;
-        goblin
-            .libraries
-            .iter()
-            .filter(|soname| {
-                // If all imports from this soname's library are covered, remove it.
-                // Check: is there any import whose library path corresponds to this soname?
-                // We do a best-effort match by basename.
-                imports.iter().any(|imp| {
-                    imp.source_library
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.starts_with(*soname) || soname.starts_with(n))
-                        .unwrap_or(false)
-                })
-            })
-            .map(|s| s.to_string())
-            .collect()
-    };
-
     // Map (library, unit name) → assigned VA so init/fini entries can be
     // resolved unambiguously even if two libraries define same-named locals.
     let unit_vaddr_by_lib_name: HashMap<(&PathBuf, &str), u64> = text_units
@@ -257,8 +232,10 @@ pub fn plan_layout(
         got_patches,
         jump_slot_reloc_offsets: Vec::new(),
         copy_reloc_offsets: Vec::new(),
-        remove_needed,
-        // Filled in by the caller, once the injected symbol set is known.
+        // Which DT_NEEDED entries go and which arrive is decided by the
+        // caller: it holds the soname → library mapping `collect_imports`
+        // resolved, and the injected symbol set.
+        remove_needed: Vec::new(),
         add_needed: Vec::new(),
         relative_relocs: Vec::new(),
         new_externals,
