@@ -50,6 +50,15 @@ struct DataBlobInfo {
 struct ExtractionState {
     extracted: HashMap<UnitKey, UnitId>,
     units: Vec<ExtractedUnit>,
+    /// Where in `units` each registered unit lives. A unit is reached by its
+    /// `UnitId` from several places — the jump-table scanner appends
+    /// relocations to a `.rodata` blob, the second pass resolves placeholder
+    /// targets — and `units` is not in id order, because a data blob's
+    /// relocations can pull in another blob that gets pushed first. Scanning
+    /// `units` for a matching id instead made every one of those lookups
+    /// O(units); with ~10k units and ~69k placeholders to resolve (md5sum +
+    /// libcrypto.so.3) that was most of a second of pure comparisons.
+    unit_index: HashMap<UnitId, usize>,
     // Pending placeholder mappings: (UnitId, reloc_index) → target UnitKey
     pending: Vec<(UnitId, usize, UnitKey)>,
     next_id: u32,
@@ -88,6 +97,23 @@ impl ExtractionState {
         let id = UnitId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Register a finished unit so it can be found again by its id.
+    fn push_unit(&mut self, unit: ExtractedUnit) {
+        self.unit_index.insert(unit.id, self.units.len());
+        self.units.push(unit);
+    }
+
+    /// The registered unit with `id`.
+    ///
+    /// `None` while a unit is still being built: `ensure_data_blob_extracted`
+    /// publishes a blob's id before collecting its relocations, so that a
+    /// pointer leading back into the same section resolves to it instead of
+    /// being left stale.
+    fn unit_mut(&mut self, id: UnitId) -> Option<&mut ExtractedUnit> {
+        let idx = *self.unit_index.get(&id)?;
+        self.units.get_mut(idx)
     }
 
     /// Return the raw bytes of `lib`, reading and caching them on first use.
@@ -180,6 +206,7 @@ pub fn extract_units(
     let mut state = ExtractionState {
         extracted: HashMap::new(),
         units: Vec::new(),
+        unit_index: HashMap::new(),
         pending: Vec::new(),
         next_id: 0,
         external_syms: exe_dynsym_names,
@@ -217,39 +244,33 @@ pub fn extract_units(
         }
     }
 
-    // Second pass: resolve placeholder UnitIds in RelocTarget::MergedUnit
-    let pending = std::mem::take(&mut state.pending);
-    let mut unresolved_relocs: Vec<(UnitId, usize)> = Vec::new();
-
-    for (unit_id, reloc_idx, target_key) in pending {
-        let target_unit_id = match state.extracted.get(&target_key) {
-            Some(id) => *id,
-            None => {
-                warn!(
-                    target=target_key.sym,
-                    lib=%target_key.lib.display(),
-                    "Unresolved relocation, skipping"
-                );
-                unresolved_relocs.push((unit_id, reloc_idx));
-                continue;
-            }
+    // Second pass: point each placeholder at the unit that was in fact
+    // extracted for its target. A target nothing extracted leaves the
+    // relocation with nothing to aim at, so it is dropped.
+    let mut dropped: HashMap<UnitId, Vec<usize>> = HashMap::new();
+    for (unit_id, reloc_idx, target_key) in std::mem::take(&mut state.pending) {
+        let Some(&target) = state.extracted.get(&target_key) else {
+            warn!(
+                target=target_key.sym,
+                lib=%target_key.lib.display(),
+                "Unresolved relocation, skipping"
+            );
+            dropped.entry(unit_id).or_default().push(reloc_idx);
+            continue;
         };
-        let unit = state
-            .units
-            .iter_mut()
-            .find(|u| u.id == unit_id)
-            .expect("unit must exist");
-        unit.relocations[reloc_idx].target = RelocTarget::MergedUnit(target_unit_id);
+        let unit = state.unit_mut(unit_id).expect("pending unit is registered");
+        unit.relocations[reloc_idx].target = RelocTarget::MergedUnit(target);
     }
 
-    // Remove unresolved relocations (in reverse order to preserve indices)
-    for (unit_id, reloc_idx) in unresolved_relocs.iter().rev() {
-        let unit = state
-            .units
-            .iter_mut()
-            .find(|u| u.id == *unit_id)
-            .expect("unit must exist");
-        unit.relocations.remove(*reloc_idx);
+    // Removing a relocation shifts every later index, so take them from the
+    // back. Sorting here is what makes that safe: it used to rely on `pending`
+    // happening to list a unit's relocations in ascending index order.
+    for (unit_id, mut indices) in dropped {
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        let unit = state.unit_mut(unit_id).expect("pending unit is registered");
+        for idx in indices {
+            unit.relocations.remove(idx);
+        }
     }
 
     Ok((state.units, state.init_fini, state.got_slot_fixups))
@@ -706,13 +727,15 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                 for (idx, target_addr) in table.targets.iter().enumerate() {
                     let entry_offset_in_blob = (table.table_vaddr - blob_base) + (idx * 4) as u64;
 
+                    let Some(blob_unit) = state.unit_mut(blob_id) else {
+                        continue;
+                    };
                     // Skip if a relocation already exists at this offset (from another
                     // function detecting an overlapping table at the same .rodata address)
-                    if let Some(blob_unit) = state.units.iter().find(|u| u.id == blob_id)
-                        && blob_unit
-                            .relocations
-                            .iter()
-                            .any(|r| r.offset_within_unit == entry_offset_in_blob)
+                    if blob_unit
+                        .relocations
+                        .iter()
+                        .any(|r| r.offset_within_unit == entry_offset_in_blob)
                     {
                         continue;
                     }
@@ -737,31 +760,27 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                     let addend = offset_in_target + (idx * 4) as i64;
 
                     // 4. Add jump table entry relocation to the data blob
-                    // Find the blob unit and add the relocation
-                    if let Some(blob_unit) = state.units.iter_mut().find(|u| u.id == blob_id) {
-                        let reloc_idx = blob_unit.relocations.len();
+                    let reloc_idx = blob_unit.relocations.len();
+                    blob_unit.relocations.push(pcrel_reloc(
+                        entry_offset_in_blob,
+                        32,
+                        addend, // offset within target function, PC-relative
+                        RelocTarget::MergedUnit(UnitId(u32::MAX)), // placeholder
+                    ));
 
-                        blob_unit.relocations.push(pcrel_reloc(
-                            entry_offset_in_blob,
-                            32,
-                            addend, // offset within target function, PC-relative
-                            RelocTarget::MergedUnit(UnitId(u32::MAX)), // placeholder
-                        ));
-
-                        // The target is this very unit, which is already being
-                        // extracted, so there is no new dependency to enqueue —
-                        // only a pending resolution of the placeholder UnitId.
-                        // (Not `pending_relocs`: that one is for relocations of
-                        // the current unit, these belong to the blob.)
-                        state.pending.push((
-                            blob_id,
-                            reloc_idx,
-                            UnitKey {
-                                lib: key.lib.clone(),
-                                sym: key.sym.clone(),
-                            },
-                        ));
-                    }
+                    // The target is this very unit, which is already being
+                    // extracted, so there is no new dependency to enqueue —
+                    // only a pending resolution of the placeholder UnitId.
+                    // (Not `pending_relocs`: that one is for relocations of
+                    // the current unit, these belong to the blob.)
+                    state.pending.push((
+                        blob_id,
+                        reloc_idx,
+                        UnitKey {
+                            lib: key.lib.clone(),
+                            sym: key.sym.clone(),
+                        },
+                    ));
                 }
             }
         }
@@ -816,7 +835,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
 
     state.register_got_slot_fixups(id, &mut bytes, got_fixup_offsets);
 
-    state.units.push(ExtractedUnit {
+    state.push_unit(ExtractedUnit {
         id,
         name: key.sym.clone(),
         source_lib: key.lib.clone(),
@@ -1641,7 +1660,7 @@ fn ensure_data_blob_extracted(
         relocations,
     };
 
-    state.units.push(unit);
+    state.push_unit(unit);
 
     Ok(Some((id, sec_addr, new_deps)))
 }
@@ -1818,6 +1837,7 @@ mod tests {
         ExtractionState {
             extracted: HashMap::new(),
             units: Vec::new(),
+            unit_index: HashMap::new(),
             pending: Vec::new(),
             next_id: 0,
             external_syms: HashSet::new(),
