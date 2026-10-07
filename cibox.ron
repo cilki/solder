@@ -1,0 +1,17 @@
+(
+    rust_fmt: (
+        enabled: false,
+    ),
+    rust_clippy: (
+        enabled: false,
+    ),
+    rust_doc: (
+        enabled: false,
+    ),
+    rust_release: (
+        enabled: true,
+    ),
+    gitleaks: (
+        enabled: false,
+    ),
+)
