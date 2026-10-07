@@ -1,4 +1,7 @@
+use std::path::Path;
+
 use anyhow::{Context, Result, bail};
+use tracing::warn;
 
 use crate::elf_reader::{DYN_ENTRY_SIZE, DynamicTable, SectionTable};
 use crate::types::{MergePlan, RelativeReloc};
@@ -10,6 +13,8 @@ use crate::types::{MergePlan, RelativeReloc};
 ///   4. Remove version requirements (.gnu.version_r) for fully-merged libraries.
 ///   5. Force eager binding so the loader processes the zeroed (R_X86_64_NONE)
 ///      PLT relocations through the eager path, which accepts NONE.
+///   6. Re-derive the `.note.gnu.property` entries that describe the whole
+///      program over the merged-in code as well.
 ///
 /// For PIE executables, this also populates `plan.relative_relocs` with entries
 /// for the patched GOT slots that need R_X86_64_RELATIVE relocations.
@@ -20,6 +25,7 @@ pub fn apply_patches(exe_bytes: &mut [u8], plan: &mut MergePlan) -> Result<()> {
     remove_dt_needed(exe_bytes, plan)?;
     remove_verneed_entries(exe_bytes, plan)?;
     ensure_bind_now(exe_bytes)?;
+    update_gnu_properties(exe_bytes, plan)?;
     Ok(())
 }
 
@@ -176,6 +182,213 @@ fn ensure_bind_now(bytes: &mut [u8]) -> Result<()> {
     bytes[next..next + DYN_ENTRY_SIZE].fill(0);
 
     Ok(())
+}
+
+/// `NT_GNU_PROPERTY_TYPE_0`: the note type whose descriptor is the GNU
+/// property array.
+const NT_GNU_PROPERTY_TYPE_0: u32 = 5;
+/// `GNU_PROPERTY_X86_FEATURE_1_AND`: the CET features *every* object making up
+/// the process has to support before the loader turns them on.
+const GNU_PROPERTY_X86_FEATURE_1_AND: u32 = 0xc000_0002;
+/// `GNU_PROPERTY_X86_ISA_1_NEEDED`: the x86-64 ISA levels the code needs, which
+/// `ld.so` refuses to run on a CPU that lacks.
+const GNU_PROPERTY_X86_ISA_1_NEEDED: u32 = 0xc000_8002;
+/// The `GNU_PROPERTY_X86_FEATURE_1_*` bits, for naming the ones being dropped.
+const X86_FEATURE_1_BITS: [(u32, &str); 4] = [
+    (1 << 0, "IBT"),
+    (1 << 1, "SHSTK"),
+    (1 << 2, "LAM_U48"),
+    (1 << 3, "LAM_U57"),
+];
+/// A GNU property's `pr_data` is padded to this in an ELF64 object.
+const PROPERTY_ALIGN: usize = 8;
+
+/// Re-derive the `.note.gnu.property` entries that describe the program as a
+/// whole, now that code from the merged libraries is part of it.
+///
+/// Two properties stop being true the moment foreign code is merged in, and
+/// both are exactly what a static link recomputes across its inputs:
+///
+///   * `GNU_PROPERTY_X86_FEATURE_1_AND` advertises the CET features — IBT and
+///     the shadow stack — that the whole program supports, and `ld.so` turns
+///     them on for the process when the executable claims them. Merging a
+///     library built without `-fcf-protection` leaves the claim standing over
+///     code that never got an `endbr64`, and solder routes calls into that code
+///     through GOT slots, i.e. as indirect branches — precisely what IBT
+///     faults on. The claim is the AND of every contributing object's, so each
+///     feature the merged library does not have is cleared here.
+///   * `GNU_PROPERTY_X86_ISA_1_NEEDED` is the union of the ISA levels the code
+///     requires. Without the merged library's levels folded in, a binary
+///     carrying, say, AVX-512 library code looks runnable on a baseline CPU and
+///     dies with SIGILL there instead of `ld.so`'s "CPU ISA level is lower than
+///     required".
+///
+/// Both are a fixed-size `u32` inside an existing note, so they are patched in
+/// place. A property the executable does not already carry cannot be added
+/// without growing the note — there is nothing to grow into between the notes
+/// and the rest of the first mapping — so that case is reported instead.
+fn update_gnu_properties(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
+    let exe_features = find_property(bytes, GNU_PROPERTY_X86_FEATURE_1_AND)
+        .context("reading the executable's .note.gnu.property")?;
+    let exe_isa = find_property(bytes, GNU_PROPERTY_X86_ISA_1_NEEDED)
+        .context("reading the executable's .note.gnu.property")?;
+    if exe_features.is_none() && exe_isa.is_none() {
+        return Ok(());
+    }
+
+    let mut libs: Vec<&Path> = plan
+        .units
+        .iter()
+        .map(|au| au.unit.source_lib.as_path())
+        .collect();
+    libs.sort_unstable();
+    libs.dedup();
+
+    let mut features = exe_features.map_or(0, |(_, mask)| mask);
+    let mut isa = exe_isa.map_or(0, |(_, mask)| mask);
+    for lib in libs {
+        let data = std::fs::read(lib)
+            .with_context(|| format!("reading {} for its GNU property note", lib.display()))?;
+        let lib_features = find_property(&data, GNU_PROPERTY_X86_FEATURE_1_AND)
+            .with_context(|| format!("reading .note.gnu.property of {}", lib.display()))?
+            .map_or(0, |(_, mask)| mask);
+        let lib_isa = find_property(&data, GNU_PROPERTY_X86_ISA_1_NEEDED)
+            .with_context(|| format!("reading .note.gnu.property of {}", lib.display()))?
+            .map_or(0, |(_, mask)| mask);
+
+        if features & !lib_features != 0 {
+            warn!(
+                library = %lib.display(),
+                dropped = %feature_names(features & !lib_features),
+                "merged library does not support the CET features the executable \
+                 advertises; clearing them so the loader does not enable them over \
+                 code that cannot take them"
+            );
+        }
+        if lib_isa & !isa != 0 && exe_isa.is_none() {
+            warn!(
+                library = %lib.display(),
+                needed = format_args!("0x{:x}", lib_isa),
+                "merged library needs x86-64 ISA levels the executable's \
+                 .note.gnu.property has no entry to record; on a CPU without them \
+                 the merged code will fault instead of being refused by ld.so"
+            );
+        }
+
+        features &= lib_features;
+        isa |= lib_isa;
+    }
+
+    if let Some((at, mask)) = exe_features
+        && mask != features
+    {
+        bytes[at..at + 4].copy_from_slice(&features.to_le_bytes());
+    }
+    if let Some((at, mask)) = exe_isa
+        && mask != isa
+    {
+        bytes[at..at + 4].copy_from_slice(&isa.to_le_bytes());
+    }
+
+    Ok(())
+}
+
+/// Name the `GNU_PROPERTY_X86_FEATURE_1_*` bits set in `mask`.
+fn feature_names(mask: u32) -> String {
+    let mut names: Vec<String> = X86_FEATURE_1_BITS
+        .iter()
+        .filter(|(bit, _)| mask & bit != 0)
+        .map(|(_, name)| (*name).to_owned())
+        .collect();
+    let known: u32 = X86_FEATURE_1_BITS.iter().fold(0, |acc, (bit, _)| acc | bit);
+    if mask & !known != 0 {
+        names.push(format!("0x{:x}", mask & !known));
+    }
+    names.join(", ")
+}
+
+/// File offset of `pr_type`'s 4-byte value in `bytes`, and the value, if the
+/// object carries that property.
+///
+/// Only `PT_NOTE` segments are searched: those are the notes the loader itself
+/// reads, and a property note outside one would not reach it.
+fn find_property(bytes: &[u8], pr_type: u32) -> Result<Option<(usize, u32)>> {
+    let elf = goblin::elf::Elf::parse(bytes).context("goblin parse for GNU property notes")?;
+    for ph in &elf.program_headers {
+        if ph.p_type != goblin::elf::program_header::PT_NOTE {
+            continue;
+        }
+        let start = ph.p_offset as usize;
+        let Some(notes) = bytes.get(start..start.saturating_add(ph.p_filesz as usize)) else {
+            continue;
+        };
+        if let Some((at, value)) = find_property_in_notes(notes, ph.p_align as usize, pr_type) {
+            return Ok(Some((start + at, value)));
+        }
+    }
+    Ok(None)
+}
+
+/// Walk a note array, returning the offset *relative to `notes`* of the 4-byte
+/// value of property `pr_type`, together with that value.
+///
+/// `align` is the containing segment's `p_align`, which is what decides where
+/// each note's descriptor starts and where the next note begins — a GNU
+/// property note is 8-aligned where the build-id and ABI-tag notes beside it
+/// are 4-aligned. A malformed note ends the walk rather than failing the merge:
+/// an unreadable property is one we cannot say anything about, and the rest of
+/// the output does not depend on it.
+fn find_property_in_notes(notes: &[u8], align: usize, pr_type: u32) -> Option<(usize, u32)> {
+    let align = align.max(4);
+    let mut pos = 0usize;
+
+    while pos + 12 <= notes.len() {
+        let namesz = u32_at(notes, pos)? as usize;
+        let descsz = u32_at(notes, pos + 4)? as usize;
+        let n_type = u32_at(notes, pos + 8)?;
+        let name = notes.get(pos + 12..(pos + 12).checked_add(namesz)?)?;
+
+        // The name starts right after the 12-byte header and the descriptor
+        // starts after it, both padded out to `align`.
+        let desc_at =
+            pos.checked_add((12usize.checked_add(namesz)?).checked_next_multiple_of(align)?)?;
+        let next = desc_at.checked_add(descsz.checked_next_multiple_of(align)?)?;
+
+        if n_type == NT_GNU_PROPERTY_TYPE_0 && name == b"GNU\0" {
+            let props = notes.get(desc_at..desc_at.checked_add(descsz)?)?;
+            if let Some((at, value)) = find_in_property_array(props, pr_type) {
+                return Some((desc_at + at, value));
+            }
+        }
+
+        pos = next;
+    }
+
+    None
+}
+
+/// Walk one `NT_GNU_PROPERTY_TYPE_0` descriptor — a sequence of
+/// `(pr_type: u32, pr_datasz: u32, pr_data, padding to 8)` — for `pr_type`.
+fn find_in_property_array(props: &[u8], pr_type: u32) -> Option<(usize, u32)> {
+    let mut at = 0usize;
+    while at + 8 <= props.len() {
+        let this_type = u32_at(props, at)?;
+        let datasz = u32_at(props, at + 4)? as usize;
+        let data_at = at + 8;
+        if data_at.checked_add(datasz)? > props.len() {
+            return None;
+        }
+        if this_type == pr_type && datasz == 4 {
+            return Some((data_at, u32_at(props, data_at)?));
+        }
+        at = data_at.checked_add(datasz.checked_next_multiple_of(PROPERTY_ALIGN)?)?;
+    }
+    None
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    let field = bytes.get(at..at.checked_add(4)?)?;
+    Some(u32::from_le_bytes(field.try_into().expect("4 bytes")))
 }
 
 /// Remove version requirement entries (.gnu.version_r) for fully-merged libraries.
@@ -395,5 +608,251 @@ mod verneed_tests {
         let mut bytes = make_list(2);
         let (_head, count) = relink_verneed_list(&mut bytes, 0, &HashSet::from([0, 16]));
         assert_eq!(count, 0);
+    }
+}
+
+#[cfg(test)]
+mod gnu_property_tests {
+    use super::*;
+    use crate::types::{AssignedUnit, ExtractedUnit, SectionKind, UnitId};
+    use std::path::PathBuf;
+
+    const GREP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep");
+    /// Built without `-fcf-protection`, like every library in `test/libs`: it
+    /// carries no `.note.gnu.property` at all.
+    const PCRE2: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs/libpcre2-8.so.0");
+
+    const IBT: u32 = 1 << 0;
+    const SHSTK: u32 = 1 << 1;
+
+    /// One note: `namesz`/`descsz`/`n_type`, the name `GNU\0`, then `desc`
+    /// padded out to `align`.
+    fn note(n_type: u32, desc: &[u8], align: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+        out.extend_from_slice(&n_type.to_le_bytes());
+        out.extend_from_slice(b"GNU\0");
+        out.resize(16usize.next_multiple_of(align), 0);
+        out.extend_from_slice(desc);
+        out.resize(out.len().next_multiple_of(align), 0);
+        out
+    }
+
+    /// One `(pr_type, pr_datasz, pr_data)` property holding a `u32`, padded to
+    /// the 8-byte property alignment.
+    fn property(pr_type: u32, value: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&pr_type.to_le_bytes());
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+        out.resize(out.len().next_multiple_of(PROPERTY_ALIGN), 0);
+        out
+    }
+
+    /// The property note is not necessarily the first note in its segment, nor
+    /// the sought property the first in the note, and the preceding notes carry
+    /// descriptors of sizes that are not multiples of the alignment.
+    #[test]
+    fn a_property_is_found_behind_other_notes_and_properties() {
+        const NT_GNU_BUILD_ID: u32 = 3;
+        let mut desc = property(GNU_PROPERTY_X86_ISA_1_NEEDED, 0x4);
+        desc.extend_from_slice(&property(GNU_PROPERTY_X86_FEATURE_1_AND, IBT | SHSTK));
+
+        let mut notes = note(NT_GNU_BUILD_ID, &[0xab; 20], 4);
+        let property_note_at = notes.len();
+        notes.extend_from_slice(&note(NT_GNU_PROPERTY_TYPE_0, &desc, 4));
+
+        let (at, value) = find_property_in_notes(&notes, 4, GNU_PROPERTY_X86_FEATURE_1_AND)
+            .expect("the CET property is in there");
+        // Second property of the note: 16 bytes of note header and name, then
+        // the ISA property — 8 bytes of `pr_type`/`pr_datasz`, a `u32` and the
+        // padding out to 8 — then 8 bytes into the feature property.
+        assert_eq!(at, property_note_at + 16 + 16 + 8);
+        assert_eq!(value, IBT | SHSTK);
+
+        assert_eq!(
+            find_property_in_notes(&notes, 4, GNU_PROPERTY_X86_ISA_1_NEEDED),
+            Some((property_note_at + 16 + 8, 0x4))
+        );
+    }
+
+    /// A note whose sizes run past the end of the segment is where the walk
+    /// stops: the loader would not read it either, and a merge must not fall
+    /// over on it.
+    #[test]
+    fn a_truncated_note_ends_the_walk() {
+        let desc = property(GNU_PROPERTY_X86_FEATURE_1_AND, IBT);
+        let whole = note(NT_GNU_PROPERTY_TYPE_0, &desc, 8);
+        for cut in 1..whole.len() {
+            let truncated = &whole[..whole.len() - cut];
+            assert_eq!(
+                find_property_in_notes(truncated, 8, GNU_PROPERTY_X86_FEATURE_1_AND),
+                None,
+                "a note cut {cut} bytes short should not be read"
+            );
+        }
+
+        // A nonsense namesz must not be trusted to stay in bounds either.
+        let mut bogus = whole.clone();
+        bogus[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            find_property_in_notes(&bogus, 8, GNU_PROPERTY_X86_FEATURE_1_AND),
+            None
+        );
+    }
+
+    /// Anchor the segment walk against a real binary: `test/grep` carries a
+    /// single `GNU_PROPERTY_X86_ISA_1_NEEDED` property of `x86-64-baseline` and
+    /// no CET property.
+    #[test]
+    fn a_real_executables_property_is_located_in_its_note_segment() {
+        let bytes = std::fs::read(GREP).expect("read test/grep");
+        assert_eq!(
+            find_property(&bytes, GNU_PROPERTY_X86_ISA_1_NEEDED).expect("parse test/grep"),
+            Some((0x350, 1))
+        );
+        assert_eq!(
+            find_property(&bytes, GNU_PROPERTY_X86_FEATURE_1_AND).expect("parse test/grep"),
+            None
+        );
+        assert_eq!(
+            find_property(&std::fs::read(PCRE2).expect("read libpcre2"), 0xc000_0002)
+                .expect("parse libpcre2"),
+            None
+        );
+    }
+
+    /// A plan that merged one unit out of `lib`.
+    fn plan_merging(lib: &str) -> MergePlan {
+        MergePlan {
+            is_pie: true,
+            load_address: 0x10_0000,
+            exec_size: 0x1000,
+            rodata_end: 0x1000,
+            writable_end: 0x1000,
+            units: vec![AssignedUnit {
+                unit: ExtractedUnit {
+                    id: UnitId(0),
+                    name: "pcre2_match_8".to_owned(),
+                    source_lib: PathBuf::from(lib),
+                    bytes: vec![0x90; 16],
+                    section_kind: SectionKind::Text,
+                    alignment: 16,
+                    relocations: Vec::new(),
+                },
+                assigned_vaddr: 0x10_0000,
+            }],
+            trampoline_stubs: Vec::new(),
+            got_patches: Vec::new(),
+            jump_slot_reloc_offsets: Vec::new(),
+            copy_reloc_offsets: Vec::new(),
+            remove_needed: Vec::new(),
+            add_needed: Vec::new(),
+            relative_relocs: Vec::new(),
+            new_externals: Vec::new(),
+            got_imports: Vec::new(),
+            init_fini: None,
+        }
+    }
+
+    /// `test/grep` with its ISA property rewritten into a CET property claiming
+    /// IBT and the shadow stack — i.e. the binary a distribution that builds
+    /// with `-fcf-protection=full` ships.
+    fn grep_claiming_cet() -> (Vec<u8>, usize) {
+        let mut bytes = std::fs::read(GREP).expect("read test/grep");
+        let (at, _) = find_property(&bytes, GNU_PROPERTY_X86_ISA_1_NEEDED)
+            .expect("parse test/grep")
+            .expect("test/grep has an ISA property");
+        // Same shape, so the note keeps its size: only pr_type and the value
+        // change.
+        bytes[at - 8..at - 4].copy_from_slice(&GNU_PROPERTY_X86_FEATURE_1_AND.to_le_bytes());
+        bytes[at..at + 4].copy_from_slice(&(IBT | SHSTK).to_le_bytes());
+        (bytes, at)
+    }
+
+    /// The case this is all for: merging code that was built without CET into
+    /// an executable that advertises it has to withdraw the advertisement, or
+    /// the loader turns IBT on over code with no `endbr64` at the indirect
+    /// branch targets solder itself routes calls through.
+    #[test]
+    fn merging_a_library_without_cet_withdraws_the_cet_claim() {
+        let (mut bytes, at) = grep_claiming_cet();
+        update_gnu_properties(&mut bytes, &plan_merging(PCRE2)).expect("update properties");
+        assert_eq!(
+            find_property(&bytes, GNU_PROPERTY_X86_FEATURE_1_AND).expect("reparse"),
+            Some((at, 0)),
+            "the executable still claims CET features the merged code does not have"
+        );
+    }
+
+    /// The other half of the AND: a feature both sides support survives.
+    #[test]
+    fn a_feature_the_merged_library_also_has_is_kept() {
+        let (mut bytes, at) = grep_claiming_cet();
+        // Stand in for a CET-built library: the shadow stack but not IBT.
+        let (lib, _) = grep_claiming_cet();
+        let lib_path = tempfile::NamedTempFile::new().expect("tempfile");
+        let mut lib_bytes = lib;
+        let lib_at = find_property(&lib_bytes, GNU_PROPERTY_X86_FEATURE_1_AND)
+            .expect("parse")
+            .expect("property")
+            .0;
+        lib_bytes[lib_at..lib_at + 4].copy_from_slice(&SHSTK.to_le_bytes());
+        std::fs::write(lib_path.path(), &lib_bytes).expect("write library");
+
+        update_gnu_properties(
+            &mut bytes,
+            &plan_merging(lib_path.path().to_str().expect("utf-8 path")),
+        )
+        .expect("update properties");
+        assert_eq!(
+            find_property(&bytes, GNU_PROPERTY_X86_FEATURE_1_AND).expect("reparse"),
+            Some((at, SHSTK))
+        );
+    }
+
+    /// The ISA levels the merged code needs are the union, not the
+    /// executable's alone: a baseline binary that merges AVX-512 library code
+    /// must say so, so `ld.so` refuses to run it on a CPU without it instead of
+    /// letting it fault.
+    #[test]
+    fn the_isa_levels_of_merged_code_are_folded_in() {
+        const V4: u32 = 1 << 3;
+        let mut bytes = std::fs::read(GREP).expect("read test/grep");
+        let (at, baseline) = find_property(&bytes, GNU_PROPERTY_X86_ISA_1_NEEDED)
+            .expect("parse test/grep")
+            .expect("test/grep has an ISA property");
+
+        let mut lib_bytes = bytes.clone();
+        lib_bytes[at..at + 4].copy_from_slice(&V4.to_le_bytes());
+        let lib_path = tempfile::NamedTempFile::new().expect("tempfile");
+        std::fs::write(lib_path.path(), &lib_bytes).expect("write library");
+
+        update_gnu_properties(
+            &mut bytes,
+            &plan_merging(lib_path.path().to_str().expect("utf-8 path")),
+        )
+        .expect("update properties");
+        assert_eq!(
+            find_property(&bytes, GNU_PROPERTY_X86_ISA_1_NEEDED).expect("reparse"),
+            Some((at, baseline | V4))
+        );
+    }
+
+    /// An executable with no property note of its own is left alone: there is
+    /// nothing to intersect and no room to add a note.
+    #[test]
+    fn an_executable_without_properties_is_untouched() {
+        let mut bytes = std::fs::read(PCRE2).expect("read libpcre2");
+        let before = bytes.clone();
+        update_gnu_properties(&mut bytes, &plan_merging(GREP)).expect("update properties");
+        assert_eq!(bytes, before);
+    }
+
+    #[test]
+    fn dropped_features_are_named_in_the_warning() {
+        assert_eq!(feature_names(IBT | SHSTK), "IBT, SHSTK");
+        assert_eq!(feature_names(1 << 9), "0x200");
     }
 }
