@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use tracing::warn;
 
 use crate::elf_reader::{DynamicTable, va_to_file_offset};
 use crate::layout::align_up;
@@ -260,6 +261,17 @@ pub fn write_output(
         update_dynamic_entries(&mut out, plan, &dynamic, &ext_info)?;
     }
 
+    // Everything above describes the merge to the dynamic loader, which reads
+    // PT_DYNAMIC. Now describe it to everything that reads section headers.
+    rewrite_section_headers(
+        &mut out,
+        plan,
+        &ext_info,
+        seg_file_offset,
+        &regions,
+        total_seg_size,
+    )?;
+
     // `output_path` is the input executable, so read its mode before the write
     // replaces the file: the merge must not change who is allowed to read or
     // run the binary.
@@ -287,6 +299,173 @@ pub fn write_output(
             .with_context(|| format!("restoring mode on {}", output_path.display()))?;
     }
 
+    Ok(())
+}
+
+/// `Elf64_Shdr` is 64 bytes; these are the field offsets within one.
+const SHDR_SIZE: usize = 64;
+const SH_NAME: usize = 0;
+const SH_TYPE: usize = 4;
+const SH_FLAGS: usize = 8;
+const SH_ADDR: usize = 16;
+const SH_OFFSET: usize = 24;
+const SH_SIZE: usize = 32;
+const SH_ADDRALIGN: usize = 48;
+
+/// `SHN_XINDEX` / `SHN_LORESERVE`: section counts and `e_shstrndx` values at or
+/// above this are escapes into the extended-numbering fields of section 0.
+const SHN_LORESERVE: usize = 0xff00;
+
+/// Make the section header table describe the merged binary.
+///
+/// The merge moves `.dynstr`, `.dynsym`, `.gnu.version` and `.rela.dyn` into
+/// the merged region (rebuilt larger) and repoints the matching `DT_*` tags at
+/// the new copies, but their section headers kept describing the pre-merge
+/// file. Everything that reads section headers instead of `PT_DYNAMIC` — and
+/// that is every binutils tool, plus gdb and patchelf — therefore saw the
+/// executable as it was before the merge: the old relocation and symbol tables,
+/// and no trace at all of the merged code and data.
+///
+/// `solder` is itself one of those readers: `read_dynsym_tables` takes the
+/// `.dynsym` and `.gnu.version` sizes from their section headers, because
+/// `.dynamic` has no tag that gives them. Left stale, a second merge over an
+/// already-merged executable copied only as many symbols as the *first* merge
+/// started with, dropping the ones it had injected while the `GLOB_DAT`
+/// relocations still referenced them by index.
+///
+/// So: repoint the headers of the rebuilt sections, add one covering each
+/// mapping of the merged region, and write a fresh section header table and
+/// `.shstrtab` at the end of the file.
+fn rewrite_section_headers(
+    out: &mut Vec<u8>,
+    plan: &MergePlan,
+    ext: &ExtensionInfo,
+    seg_file_offset: u64,
+    regions: &[(u64, u32)],
+    total_seg_size: u64,
+) -> Result<()> {
+    use object::elf::{PF_W, PF_X, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS};
+
+    let e_shoff = read_u64_le(out, 0x28)? as usize;
+    let e_shentsize = read_u16_le(out, 0x3a)? as usize;
+    let e_shnum = read_u16_le(out, 0x3c)? as usize;
+    let e_shstrndx = read_u16_le(out, 0x3e)? as usize;
+
+    // An executable whose section header table was already stripped has nothing
+    // to keep in sync; the loader never needed it.
+    if e_shoff == 0 || e_shnum == 0 {
+        return Ok(());
+    }
+    if e_shentsize != SHDR_SIZE {
+        bail!("section header entries are {e_shentsize} bytes, expected {SHDR_SIZE}");
+    }
+    if e_shnum >= SHN_LORESERVE || e_shstrndx >= SHN_LORESERVE {
+        warn!(
+            sections = e_shnum,
+            "extended section numbering is not supported; leaving the section headers as they were"
+        );
+        return Ok(());
+    }
+    // Without a `.shstrtab` the existing headers have no names to match against
+    // and the new ones would have nowhere to put theirs.
+    if e_shstrndx == 0 {
+        warn!("executable has no .shstrtab; leaving the section headers as they were");
+        return Ok(());
+    }
+    let sht_end = e_shoff + e_shnum * SHDR_SIZE;
+    if sht_end > out.len() {
+        bail!("section header table extends past the end of the file");
+    }
+
+    let mut shdrs = out[e_shoff..sht_end].to_vec();
+    let shstrtab_hdr = e_shstrndx * SHDR_SIZE;
+    let old_names_off = read_u64_le(&shdrs, shstrtab_hdr + SH_OFFSET)? as usize;
+    let old_names_size = read_u64_le(&shdrs, shstrtab_hdr + SH_SIZE)? as usize;
+    if old_names_off + old_names_size > out.len() {
+        bail!(".shstrtab extends past the end of the file");
+    }
+    let mut names = out[old_names_off..old_names_off + old_names_size].to_vec();
+
+    // Repoint the sections the merge rebuilt. A section the executable does not
+    // have is skipped: nothing described the old table either.
+    let name_at = |names: &[u8], off: usize| -> Option<String> {
+        let rest = names.get(off..)?;
+        let end = rest.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(&rest[..end]).ok().map(str::to_owned)
+    };
+    let find_section = |shdrs: &[u8], names: &[u8], want: &str| -> Option<usize> {
+        (0..e_shnum).find(|i| {
+            read_u32_le(shdrs, i * SHDR_SIZE + SH_NAME)
+                .ok()
+                .and_then(|off| name_at(names, off as usize))
+                .is_some_and(|name| name == want)
+        })
+    };
+    for &(section, vaddr, size) in &ext.rebuilt_sections {
+        let Some(idx) = find_section(&shdrs, &names, section) else {
+            continue;
+        };
+        let base = idx * SHDR_SIZE;
+        write_u64_le(&mut shdrs, base + SH_ADDR, vaddr);
+        write_u64_le(
+            &mut shdrs,
+            base + SH_OFFSET,
+            seg_file_offset + (vaddr - plan.load_address),
+        );
+        write_u64_le(&mut shdrs, base + SH_SIZE, size);
+    }
+
+    // One section per mapping of the merged region, so tools that rebuild a
+    // file from its sections (`strip`, `objcopy`) carry the merged code and
+    // data along instead of dropping everything no section claimed. The last
+    // mapping is skipped: it holds the rebuilt tables repointed above plus the
+    // program header table, which no section describes in a linker's output
+    // either.
+    let append_name = |names: &mut Vec<u8>, s: &str| -> u32 {
+        let offset = names.len() as u32;
+        names.extend_from_slice(s.as_bytes());
+        names.push(0);
+        offset
+    };
+    let mut added = 0usize;
+    for (i, &(start, flags)) in regions.iter().enumerate().take(regions.len() - 1) {
+        let end = regions
+            .get(i + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(total_seg_size);
+        let (name, sh_flags) = if flags & PF_X.0 != 0 {
+            (".solder.text", (SHF_ALLOC | SHF_EXECINSTR).0)
+        } else if flags & PF_W.0 != 0 {
+            (".solder.data", (SHF_ALLOC | SHF_WRITE).0)
+        } else {
+            (".solder.rodata", SHF_ALLOC.0)
+        };
+        let name_off = append_name(&mut names, name);
+
+        let mut shdr = [0u8; SHDR_SIZE];
+        write_u32_le(&mut shdr, SH_NAME, name_off);
+        write_u32_le(&mut shdr, SH_TYPE, SHT_PROGBITS.0);
+        write_u64_le(&mut shdr, SH_FLAGS, sh_flags);
+        write_u64_le(&mut shdr, SH_ADDR, plan.load_address + start);
+        write_u64_le(&mut shdr, SH_OFFSET, seg_file_offset + start);
+        write_u64_le(&mut shdr, SH_SIZE, end - start);
+        write_u64_le(&mut shdr, SH_ADDRALIGN, crate::layout::PAGE_SIZE);
+        shdrs.extend_from_slice(&shdr);
+        added += 1;
+    }
+
+    // Lay the rebuilt `.shstrtab` and section header table past the last
+    // PT_LOAD, where a linker puts them: neither is mapped at runtime.
+    let names_offset = out.len() as u64;
+    write_u64_le(&mut shdrs, shstrtab_hdr + SH_OFFSET, names_offset);
+    write_u64_le(&mut shdrs, shstrtab_hdr + SH_SIZE, names.len() as u64);
+    out.extend_from_slice(&names);
+    pad_to(out, 8);
+    let new_shoff = out.len() as u64;
+    out.extend_from_slice(&shdrs);
+
+    write_u64_le(out, 0x28, new_shoff);
+    write_u16_le(out, 0x3c, (e_shnum + added) as u16);
     Ok(())
 }
 
@@ -351,6 +530,27 @@ fn write_u16_le(buf: &mut [u8], offset: usize, val: u16) {
     buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
 }
 
+fn read_u16_le(buf: &[u8], offset: usize) -> Result<u16> {
+    let bytes = buf
+        .get(offset..offset + 2)
+        .with_context(|| format!("reading 2 bytes at {offset:#x}: past end of file"))?;
+    Ok(u16::from_le_bytes(bytes.try_into().expect("2 bytes")))
+}
+
+fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
+    let bytes = buf
+        .get(offset..offset + 4)
+        .with_context(|| format!("reading 4 bytes at {offset:#x}: past end of file"))?;
+    Ok(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+}
+
+fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
+    let bytes = buf
+        .get(offset..offset + 8)
+        .with_context(|| format!("reading 8 bytes at {offset:#x}: past end of file"))?;
+    Ok(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+}
+
 /// R_X86_64_RELATIVE relocation type
 const R_X86_64_RELATIVE: u32 = 8;
 
@@ -368,6 +568,10 @@ struct ExtensionInfo {
     /// Offset into the rebuilt `.dynstr` of each `plan.add_needed` soname, in
     /// the same order, for the `DT_NEEDED` entries that reference them.
     needed_name_offsets: Vec<u32>,
+    /// `(section name, vaddr, size)` for each section rebuilt in the merged
+    /// region, so `rewrite_section_headers` can repoint its section header at
+    /// the copy the loader will actually read.
+    rebuilt_sections: Vec<(&'static str, u64, u64)>,
 }
 
 /// R_X86_64_GLOB_DAT relocation type.
@@ -505,11 +709,31 @@ fn build_extended_segment(
                 extended.extend_from_slice(&VER_NDX_GLOBAL.to_le_bytes());
             }
 
+            let dynsym_size = old_dynsym.len() + injects.len() * SYM_ENTRY_SIZE;
+            let versym_size = old_versym.len() + injects.len() * 2;
+
             info.dyn_updates.extend([
                 (DT_STRTAB, plan.load_address + dynstr_offset_in_seg as u64),
                 (DT_STRSZ, dynstr_size as u64),
                 (DT_SYMTAB, plan.load_address + dynsym_offset_in_seg as u64),
                 (DT_VERSYM, plan.load_address + versym_offset_in_seg as u64),
+            ]);
+            info.rebuilt_sections.extend([
+                (
+                    ".dynstr",
+                    plan.load_address + dynstr_offset_in_seg as u64,
+                    dynstr_size as u64,
+                ),
+                (
+                    ".dynsym",
+                    plan.load_address + dynsym_offset_in_seg as u64,
+                    dynsym_size as u64,
+                ),
+                (
+                    ".gnu.version",
+                    plan.load_address + versym_offset_in_seg as u64,
+                    versym_size as u64,
+                ),
             ]);
         }
     }
@@ -585,6 +809,11 @@ fn build_extended_segment(
             (DT_RELASZ, total_size as u64),
             (DT_RELACOUNT, new_count),
         ]);
+        info.rebuilt_sections.push((
+            ".rela.dyn",
+            plan.load_address + rela_offset_in_seg as u64,
+            total_size as u64,
+        ));
     }
 
     Ok((extended, info))
@@ -883,5 +1112,245 @@ mod runtime_write_tests {
             addend: 0,
         });
         check_runtime_writes_are_writable(&plan).expect("the executable's own GOT is writable");
+    }
+}
+
+#[cfg(test)]
+mod section_header_tests {
+    use super::*;
+    use crate::elf_reader::MappedElf;
+    use crate::layout::plan_layout;
+    use crate::types::{
+        ExeInitFiniInfo, ExtractedReloc, ExtractedUnit, InitFiniArrays, RelocTarget, SectionKind,
+        UnitId,
+    };
+    use std::path::{Path, PathBuf};
+
+    const GREP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep");
+
+    fn unit(
+        id: u32,
+        name: &str,
+        kind: SectionKind,
+        len: usize,
+        externals: &[&str],
+    ) -> ExtractedUnit {
+        ExtractedUnit {
+            id: UnitId(id),
+            name: name.to_owned(),
+            source_lib: PathBuf::from("/nonexistent/libtest.so.1"),
+            bytes: vec![0x90; len],
+            section_kind: kind,
+            alignment: 16,
+            relocations: externals
+                .iter()
+                .enumerate()
+                .map(|(i, sym)| ExtractedReloc {
+                    offset_within_unit: (i * 8) as u64,
+                    kind: object::RelocationKind::Relative,
+                    encoding: object::RelocationEncoding::Generic,
+                    size: 32,
+                    addend: -4,
+                    target: RelocTarget::External((*sym).to_owned()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Merge a code, a read-only and a data unit into a copy of `test/grep` and
+    /// return the plan alongside the bytes that were written.
+    ///
+    /// `solder_absent_symbol` is not in the executable's `.dynsym`, so the
+    /// writer has to rebuild `.dynstr`/`.dynsym`/`.gnu.version` to inject it —
+    /// which is what moves those tables out of the sections that described them.
+    fn merged_grep() -> (MergePlan, Vec<u8>) {
+        let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
+        let exe = mapped.parse().expect("parse test/grep");
+        let units = vec![
+            unit(
+                0,
+                "fn_a",
+                SectionKind::Text,
+                64,
+                &["memcpy", "solder_absent_symbol"],
+            ),
+            unit(1, "ro_a", SectionKind::ReadOnlyData, 32, &[]),
+            unit(2, "data_a", SectionKind::Data, 48, &[]),
+        ];
+        let mut plan = plan_layout(
+            units,
+            &exe,
+            &[],
+            true,
+            InitFiniArrays::default(),
+            ExeInitFiniInfo::default(),
+            &[],
+            Vec::new(),
+        )
+        .expect("plan layout");
+
+        let seg = build_merged_segment(&mut plan).expect("build merged segment");
+        let out = tempfile::NamedTempFile::new().expect("temp output");
+        std::fs::copy(GREP, out.path()).expect("seed the output with the fixture");
+        write_output(mapped.bytes(), &plan, &seg, out.path()).expect("write output");
+        let bytes = std::fs::read(out.path()).expect("read the merged output back");
+        (plan, bytes)
+    }
+
+    /// `(name, sh_addr, sh_offset, sh_size)` for every section in `bytes`.
+    fn section_table(bytes: &[u8]) -> Vec<(String, u64, u64, u64)> {
+        let shoff = read_u64_le(bytes, 0x28).expect("e_shoff") as usize;
+        let shnum = read_u16_le(bytes, 0x3c).expect("e_shnum") as usize;
+        let shstrndx = read_u16_le(bytes, 0x3e).expect("e_shstrndx") as usize;
+        assert!(
+            shoff != 0 && shnum != 0,
+            "the output has no section headers"
+        );
+
+        let names_hdr = shoff + shstrndx * SHDR_SIZE;
+        let names_off =
+            read_u64_le(bytes, names_hdr + SH_OFFSET).expect("shstrtab offset") as usize;
+        let names_size = read_u64_le(bytes, names_hdr + SH_SIZE).expect("shstrtab size") as usize;
+        let names = &bytes[names_off..names_off + names_size];
+
+        (0..shnum)
+            .map(|i| {
+                let base = shoff + i * SHDR_SIZE;
+                let name_off = read_u32_le(bytes, base + SH_NAME).expect("sh_name") as usize;
+                let end = name_off + names[name_off..].iter().position(|&b| b == 0).expect("NUL");
+                (
+                    String::from_utf8_lossy(&names[name_off..end]).into_owned(),
+                    read_u64_le(bytes, base + SH_ADDR).expect("sh_addr"),
+                    read_u64_le(bytes, base + SH_OFFSET).expect("sh_offset"),
+                    read_u64_le(bytes, base + SH_SIZE).expect("sh_size"),
+                )
+            })
+            .collect()
+    }
+
+    fn section<'t>(
+        table: &'t [(String, u64, u64, u64)],
+        name: &str,
+    ) -> &'t (String, u64, u64, u64) {
+        table
+            .iter()
+            .find(|(n, ..)| n == name)
+            .unwrap_or_else(|| panic!("the merged output has no '{name}' section"))
+    }
+
+    /// The tables the loader reads and the sections that claim to describe them
+    /// have to be the same bytes. They were not: the merge rebuilt the tables in
+    /// the merged region and repointed `DT_*` at them while the section headers
+    /// kept describing the pre-merge copies, so every section-header-based tool
+    /// reported the executable as it was before the merge.
+    #[test]
+    fn the_rebuilt_dynamic_tables_and_their_section_headers_agree() {
+        use goblin::elf::dynamic::{DT_RELA, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMTAB, DT_VERSYM};
+
+        let (_, bytes) = merged_grep();
+        let table = section_table(&bytes);
+        let dynamic = DynamicTable::parse(&bytes).expect("parse .dynamic of the merged output");
+
+        for (tag, name) in [
+            (DT_STRTAB, ".dynstr"),
+            (DT_SYMTAB, ".dynsym"),
+            (DT_VERSYM, ".gnu.version"),
+            (DT_RELA, ".rela.dyn"),
+        ] {
+            let va = dynamic.value_of(tag).expect("dynamic tag");
+            let (_, sh_addr, ..) = section(&table, name);
+            assert_eq!(
+                *sh_addr, va,
+                "'{name}' describes {sh_addr:#x} but the loader reads {va:#x}"
+            );
+        }
+
+        for (tag, name) in [(DT_STRSZ, ".dynstr"), (DT_RELASZ, ".rela.dyn")] {
+            let size = dynamic.value_of(tag).expect("dynamic size tag");
+            let (.., sh_size) = section(&table, name);
+            assert_eq!(*sh_size, size, "'{name}' is the wrong size");
+        }
+
+        // `.gnu.version` is one u16 per `.dynsym` entry, and the injected
+        // symbols have to be covered by both or ld.so reads a version index
+        // from past the end of the array.
+        let (.., dynsym_size) = section(&table, ".dynsym");
+        let (.., versym_size) = section(&table, ".gnu.version");
+        assert_eq!(
+            dynsym_size / SYM_ENTRY_SIZE as u64 * 2,
+            *versym_size,
+            ".gnu.version is not parallel to .dynsym"
+        );
+    }
+
+    /// `read_dynsym_tables` has to take the `.dynsym` and `.gnu.version` sizes
+    /// from their section headers — `.dynamic` carries no tag for either. So a
+    /// second merge over an already-merged executable reads back exactly what
+    /// the first one recorded: with stale headers it copied only the symbols the
+    /// first merge *started* with, silently dropping the ones it injected while
+    /// the `GLOB_DAT` relocations still referred to them by index.
+    #[test]
+    fn a_second_merge_sees_the_symbols_the_first_one_injected() {
+        let (_, bytes) = merged_grep();
+        let exe = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes)
+            .expect("parse the merged output");
+        let dynamic = DynamicTable::parse(&bytes).expect("parse .dynamic of the merged output");
+
+        let (dynstr, dynsym, versym) =
+            read_dynsym_tables(&bytes, &exe, &dynamic).expect("re-read the merged symbol tables");
+
+        let count = dynsym.len() / SYM_ENTRY_SIZE;
+        assert_eq!(versym.len(), count * 2, ".gnu.version is short of .dynsym");
+
+        let names: Vec<&str> = (0..count)
+            .map(|i| {
+                let off = read_u32_le(&dynsym, i * SYM_ENTRY_SIZE).expect("st_name") as usize;
+                let end = off + dynstr[off..].iter().position(|&b| b == 0).expect("NUL");
+                std::str::from_utf8(&dynstr[off..end]).expect("symbol name")
+            })
+            .collect();
+        assert!(
+            names.contains(&"solder_absent_symbol"),
+            "the injected symbol is missing from the re-read .dynsym ({count} symbols)"
+        );
+    }
+
+    /// Tools that rebuild a file from its sections (`strip`, `objcopy`) drop
+    /// anything no section claims, which was all of the merged code and data.
+    #[test]
+    fn each_mapping_of_the_merged_region_has_a_section() {
+        let (plan, bytes) = merged_grep();
+        let table = section_table(&bytes);
+
+        for (name, start, end) in [
+            (".solder.text", 0, plan.exec_size),
+            (".solder.rodata", plan.exec_size, plan.rodata_end),
+            (".solder.data", plan.rodata_end, plan.writable_end),
+        ] {
+            let (_, sh_addr, _, sh_size) = section(&table, name);
+            assert_eq!(*sh_addr, plan.load_address + start, "'{name}' is misplaced");
+            assert_eq!(*sh_size, end - start, "'{name}' is the wrong size");
+        }
+    }
+
+    /// Repointing a section header is only an improvement if the range it names
+    /// is actually in the file — including `.shstrtab` and the section header
+    /// table itself, which the merge moves to the end.
+    #[test]
+    fn every_section_stays_inside_the_file() {
+        let (_, bytes) = merged_grep();
+        for (name, _, sh_offset, sh_size) in section_table(&bytes) {
+            // `.bss` is SHT_NOBITS: it occupies no file bytes, and its
+            // sh_offset is only a hint at where it would have started.
+            if name == ".bss" {
+                continue;
+            }
+            assert!(
+                sh_offset + sh_size <= bytes.len() as u64,
+                "'{name}' runs to {:#x}, past the {:#x}-byte file",
+                sh_offset + sh_size,
+                bytes.len()
+            );
+        }
     }
 }

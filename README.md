@@ -157,6 +157,12 @@ that variant was built for is not knowable from here.
 - Removes the merged libraries from `DT_NEEDED`, and moves onto the executable
   any `DT_NEEDED` of theirs that still provides a symbol the extracted code
   calls (see [Inherited dependencies](#inherited-dependencies))
+- Rewrites the section header table so it describes the result: the headers of
+  the rebuilt `.dynsym`/`.dynstr`/`.gnu.version`/`.rela.dyn` are repointed at
+  the copies the loader now reads, and `.solder.text`/`.solder.rodata`/
+  `.solder.data` are added over the new mappings. `readelf`, `nm` and `gdb` read
+  section headers rather than `PT_DYNAMIC`, so without this the merged binary
+  still looks exactly like the input to all of them
 
 ## Limitations
 
