@@ -7,7 +7,9 @@ use object::{Object, ObjectSection};
 use tracing::{debug, warn};
 
 use crate::elf_reader::{DynamicTable, va_to_file_offset};
-use crate::lib_discovery::{LdsoCache, expand_dynamic_tokens, is_excluded, resolve_library};
+use crate::lib_discovery::{
+    LdsoCache, expand_dynamic_tokens, is_excluded, resolve_library, soname_base,
+};
 use crate::types::{ImportKind, ImportedSymbol};
 
 /// Parse the dynamic section of an ELF to extract DT_NEEDED, DT_RPATH, and DT_RUNPATH.
@@ -18,6 +20,10 @@ pub struct DynamicInfo {
     pub rpath: Vec<PathBuf>,
     /// `DT_RUNPATH`, with dynamic string tokens expanded.
     pub runpath: Vec<PathBuf>,
+    /// The directory holding the executable, with symlinks resolved — what
+    /// `$ORIGIN` means to the loader, and the base a path-valued `DT_NEEDED`
+    /// entry of the executable is resolved against.
+    pub origin: PathBuf,
 }
 
 impl DynamicInfo {
@@ -80,6 +86,7 @@ pub fn parse_dynamic(elf: &ElfFile64<'_>, exe_path: &Path) -> Result<DynamicInfo
             .collect(),
         rpath: search_list(DT_RPATH),
         runpath: search_list(DT_RUNPATH),
+        origin: origin.to_path_buf(),
     };
 
     if !info.runpath.is_empty() && !info.rpath.is_empty() {
@@ -140,11 +147,15 @@ impl ImportInfo {
     }
 }
 
-/// Whether a `-m` filter entry selects the given DT_NEEDED soname. A filter
+/// Whether a `-m` filter entry selects the given DT_NEEDED entry. A filter
 /// entry may be the full soname (`libz.so.1`) or a prefix of it (`libz.so`,
 /// `libz`), so that callers don't have to know the exact version suffix.
+///
+/// A path-valued DT_NEEDED entry is matched on its last component too, so
+/// `-m libfoo.so` selects `$ORIGIN/../lib/libfoo.so` without the user having
+/// to spell out the path the linker happened to record.
 fn filter_selects(filter_entry: &str, needed: &str) -> bool {
-    needed == filter_entry || needed.starts_with(filter_entry)
+    needed.starts_with(filter_entry) || soname_base(needed).starts_with(filter_entry)
 }
 
 /// Reject `-m` entries that cannot possibly take effect.
@@ -210,8 +221,14 @@ pub fn collect_imports(
             continue;
         }
 
-        let lib_path = resolve_library(needed, &search_rpath, search_runpath, ldso_cache)
-            .with_context(|| format!("resolving DT_NEEDED '{needed}'"))?;
+        let lib_path = resolve_library(
+            needed,
+            &search_rpath,
+            search_runpath,
+            ldso_cache,
+            &dyn_info.origin,
+        )
+        .with_context(|| format!("resolving DT_NEEDED '{needed}'"))?;
 
         for name in exported_symbols(&lib_path)? {
             sym_to_lib.entry(name).or_insert_with(|| lib_path.clone());

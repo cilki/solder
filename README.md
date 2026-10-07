@@ -38,7 +38,10 @@ you properly static link them at build time).
 - libgcc_s.so
 
 Those are matched as prefixes of the `DT_NEEDED` soname, so the `libc.so` entry
-excludes `libc.so.6` but leaves something like `libcrypto.so.3` mergeable.
+excludes `libc.so.6` but leaves something like `libcrypto.so.3` mergeable. A
+dependency recorded as a path rather than a soname is matched on its last
+component, so spelling glibc `/usr/lib64/libc.so.6` does not get it past the
+list.
 
 Only symbols that are actually used will be merged into the final executable.
 For example, `md5sum` is only about 56K, but it dynamically links
@@ -138,6 +141,21 @@ same way the loader skips it when it has no platform string.
 picked, and a `glibc-hwcaps` variant loses to the baseline library — whether
 the machine that will run the merged executable implements the instructions
 that variant was built for is not knowable from here.
+
+### Dependencies recorded as a path
+
+A `DT_NEEDED` entry containing a slash — what the linker writes when the
+library it was handed has no `DT_SONAME` — names a file rather than a soname,
+and the loader opens it directly instead of searching for it. `solder` does the
+same: none of the directories above are consulted for such an entry, it is only
+expanded for dynamic string tokens (`$ORIGIN` here being the directory of the
+object that declared the dependency) and used as given.
+
+A *relative* path entry is rejected with an error. The loader resolves it
+against the working directory of the running process, so which file it names is
+not something the merge can know; merging whatever `solder`'s own working
+directory happens to point at would be a guess. Use `-m` to merge the other
+libraries and leave that one dynamic, or relink against a soname.
 
 ## How It Works
 
