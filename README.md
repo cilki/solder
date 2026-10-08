@@ -200,3 +200,26 @@ libraries and leave that one dynamic, or relink against a soname.
 - A copy-relocated data symbol (`R_X86_64_COPY`) coming from a library we're
   removing has to be zero-initialized, since its initial value currently can't
   be carried over
+- Merged code carries no unwind information. A library's `.eh_frame` is read
+  during extraction — it is how a function's exact bounds are recovered when
+  the symbol table records no size for it — but none of it is written back
+  out. `.eh_frame_hdr` and `PT_GNU_EH_FRAME` come through the merge byte for
+  byte, still describing the executable's own code and nothing else, so no FDE
+  covers `.solder.text`: merging `libpcre2-8.so.0` into `test/grep` leaves 28K
+  of `libpcre2`'s `.eh_frame` behind. Anything that walks the stack through
+  `_Unwind_*` therefore gives up at the first merged frame — glibc's
+  `backtrace()` truncates there, a C++ exception propagating out of merged
+  code gets `_URC_FATAL_PHASE1_ERROR` and `std::terminate`, and a
+  `pthread_cancel` forced unwind cannot pass it. `gdb` is reduced to guessing
+  its way through that code from the prologues. Don't merge a library the
+  program unwinds through
+- Merged code carries no symbols either. Nothing names the extracted functions
+  in any symbol table, so a debugger or profiler sees `.solder.text` as one
+  unnamed blob. The names the executable *imported* from the merged library do
+  stay behind in `.dynsym`, as undefined entries that no relocation refers to
+  any more, so `nm -D` on a merged binary still lists exactly the symbols that
+  were merged in as undefined. That part is cosmetic rather than a load
+  failure — their GOT slots are pre-filled and their relocations neutralized,
+  so nothing asks the loader to resolve them — but it does mean the symbol
+  tables are not a way to tell whether a merge worked. Read the
+  `.solder.*` section headers, or `DT_NEEDED`, instead
