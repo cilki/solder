@@ -68,6 +68,32 @@ guessing it away risks an executable that will not load; you'll get a warning
 saying so. `--dry-run` lists whatever gets inherited, so you can see up front
 which dependencies survive the merge.
 
+### Constructors and destructors
+
+A library initializes itself from its `DT_INIT_ARRAY` and tears itself down from
+its `DT_FINI_ARRAY`, and the loader runs neither once the library is gone from
+`DT_NEEDED`. So the merge carries those entries over, in the dependency order of
+the libraries they came from, so a library that sets up state another one needs
+still goes first:
+
+- Constructors are appended to the executable's `DT_PREINIT_ARRAY`, behind
+  whatever it already had there, rather than to its `DT_INIT_ARRAY`. Either
+  array would run them ahead of the executable's own constructors, which is the
+  order the loader used, but only the preinit phase runs before `_dl_fini` is
+  registered with `__cxa_atexit`. That is what keeps `__cxa_atexit`-registered
+  C++ static destructors in the exit order they had while the library was
+  dynamic, since where they land in the exit-handler LIFO depends on which phase
+  registered them.
+- Destructors go in front of the executable's own in a rebuilt `DT_FINI_ARRAY`.
+  The loader walks that array backwards, so the executable still tears itself
+  down first, then each merged library, dependents before dependencies — the
+  same order as before the merge.
+
+Only the libraries that actually leave `DT_NEEDED` are treated this way. One the
+extraction reached into without removing — nothing imported a symbol from it
+directly, so its soname stays — keeps running its own constructors, and copying
+them here as well would run them twice.
+
 ### Nixpkgs
 
 For binaries built from [nixpkgs](https://github.com/NixOS/nixpkgs), you can
@@ -180,9 +206,22 @@ libraries and leave that one dynamic, or relink against a soname.
   memory image in the file as well as in memory, which leaves the executable's
   `.bss` worth of unmapped zero padding in between
 - Patches GOT entries to point directly to the merged symbols
-- Removes the merged libraries from `DT_NEEDED`, and moves onto the executable
-  any `DT_NEEDED` of theirs that still provides a symbol the extracted code
-  calls (see [Inherited dependencies](#inherited-dependencies))
+- Neutralizes the merged symbols' own relocations so the loader leaves those
+  slots alone: their `R_X86_64_JUMP_SLOT` entries become `R_X86_64_NONE`, and
+  eager binding is forced (`DF_BIND_NOW` in `DT_FLAGS`, unless the executable
+  already asked for it) because glibc's lazy PLT path rejects a type-0
+  relocation outright — "unexpected PLT reloc type 0x00" — while its eager path
+  treats it as the no-op it is. A merged binary therefore always binds eagerly,
+  even if the original did not
+- Removes the merged libraries from `DT_NEEDED` along with the
+  `.gnu.version_r` requirements recorded against them — a version requirement
+  naming a library that is no longer there aborts the loader on
+  `Assertion 'needed != NULL' failed` — and moves onto the executable any
+  `DT_NEEDED` of theirs that still provides a symbol the extracted code calls
+  (see [Inherited dependencies](#inherited-dependencies))
+- Carries the merged libraries' constructors and destructors onto the
+  executable's `DT_PREINIT_ARRAY` and `DT_FINI_ARRAY` (see
+  [Constructors and destructors](#constructors-and-destructors))
 - Rewrites the section header table so it describes the result: the headers of
   the rebuilt `.dynsym`/`.dynstr`/`.gnu.version`/`.rela.dyn` are repointed at
   the copies the loader now reads, and `.solder.text`/`.solder.rodata`/
