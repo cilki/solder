@@ -552,11 +552,19 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
         )?;
     }
 
+    // A text unit's bytes are the function plus whatever sits between its last
+    // instruction and the next bound, which is not code (see `code_extent`).
+    let code_len = if section_kind == SectionKind::Text {
+        code_extent(&bytes, sym_vaddr, &lib_index)
+    } else {
+        bytes.len()
+    };
+
     // Scan for RIP-relative references (calls, jumps, and data accesses).
     // Create synthetic relocations for each reference so they get patched correctly.
     if section_kind == SectionKind::Text {
         let plt_map = state.plt_map(&key.lib, Rc::clone(&lib_bytes));
-        let rip_refs = scan_rip_relative_refs(&bytes, sym_vaddr);
+        let rip_refs = scan_rip_relative_refs(&bytes[..code_len], sym_vaddr);
         for rip_ref in rip_refs {
             let target_addr = rip_ref.target_vaddr;
 
@@ -707,7 +715,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     // Jump table detection via symbolic execution
     if section_kind == SectionKind::Text
         && let Ok(jump_tables) =
-            crate::jump_table::detect_jump_tables(&bytes, sym_vaddr, &key.sym, elf64)
+            crate::jump_table::detect_jump_tables(&bytes[..code_len], sym_vaddr, &key.sym, elf64)
     {
         if !jump_tables.is_empty() {
             debug!(
@@ -1074,6 +1082,81 @@ fn anon_target_is_extractable(elf: &object::read::elf::ElfFile64<'_>, addr: u64)
         }
     }
     false
+}
+
+/// How many of a text unit's leading bytes are instructions of the function it
+/// was extracted for.
+///
+/// A unit covers the function plus everything the linker left between its last
+/// instruction and the bound extraction stopped at: alignment padding, and —
+/// in the hand-written assembly libcrypto is full of — the constants the module
+/// keeps in `.text` next to the code that uses them (CRYPTOGAMS' banner
+/// strings, RC4's option strings). Decoding that tail as code invents
+/// relocations, extraction dependencies and short-branch veneers out of
+/// constant data: `.solder.anon.0x20db00` in `test/libs/libcrypto.so.3` is a
+/// 0x63-byte function followed by 0x4d bytes of banner string, which decodes
+/// into seven bogus rel8 branches and a reference 0x20 MiB outside the library.
+/// One such invention — a rel8 branch with nowhere to put its veneer — is a
+/// hard error, so the fiction is not merely wasteful.
+///
+/// `.eh_frame` says where the function ends. Trust it only where the
+/// instruction stream agrees: the last instruction inside the FDE has to end
+/// exactly at the FDE's end and has to be one that does not fall through.
+/// Hand-written assembly whose unwind info covers only part of its function
+/// fails that test and keeps being scanned to the end of the unit, since
+/// missing a relocation in real code is far worse than inventing one in data.
+fn code_extent(bytes: &[u8], vaddr: u64, index: &LibIndex) -> usize {
+    // Only an FDE that starts where the unit starts describes the unit's
+    // function; one that merely contains `vaddr` belongs to a function the unit
+    // begins partway into, and says nothing about where the unit's code ends.
+    match index
+        .fdes
+        .containing(vaddr)
+        .filter(|&(start, _)| start == vaddr)
+    {
+        Some((_, fde_end)) => instruction_extent(bytes, vaddr, fde_end),
+        None => bytes.len(),
+    }
+}
+
+/// `bytes` cut at `fde_end`, but only if decoding agrees that the function ends
+/// there: the last instruction before `fde_end` has to end exactly on it and
+/// has to be one that does not fall through. Anything else — unwind info that
+/// stops mid-function, a byte range the decoder cannot walk — yields the whole
+/// of `bytes`, leaving the scan as wide as it was.
+fn instruction_extent(bytes: &[u8], vaddr: u64, fde_end: u64) -> usize {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
+
+    let Some(code_len) = fde_end
+        .checked_sub(vaddr)
+        .map(|len| len as usize)
+        .filter(|&len| len < bytes.len())
+    else {
+        return bytes.len();
+    };
+
+    let mut decoder = Decoder::with_ip(64, &bytes[..code_len], vaddr, DecoderOptions::NONE);
+    let mut instr = Instruction::default();
+    let mut last = Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instr);
+        last = instr;
+    }
+
+    let ends_the_function = !last.is_invalid()
+        && last.next_ip() == fde_end
+        && matches!(
+            last.flow_control(),
+            FlowControl::Return
+                | FlowControl::UnconditionalBranch
+                | FlowControl::IndirectBranch
+                | FlowControl::Exception
+        );
+    if ends_the_function {
+        code_len
+    } else {
+        bytes.len()
+    }
 }
 
 /// Find a run of at least `need` bytes of alignment padding starting at
@@ -2097,5 +2180,116 @@ mod tests {
             )),
             "no self-referential pointer resolved to the blob itself"
         );
+    }
+
+    /// `instruction_extent` is what keeps the instruction scanners off the
+    /// non-code tail of a text unit. It gets to cut only where the decode backs
+    /// the unwind table up.
+    mod instruction_extent_tests {
+        use super::super::instruction_extent;
+
+        const VA: u64 = 0x1000;
+
+        /// `ret` followed by the kind of string constant hand-written assembly
+        /// keeps next to its code. Everything after the `ret` is data.
+        #[test]
+        fn a_function_ending_in_ret_cuts_at_the_fde_end() {
+            let mut bytes = vec![0x31, 0xc0, 0xc3]; // xor eax, eax; ret
+            bytes.extend_from_slice(b"CRYPTOGAMS by <appro@openssl.org>\0");
+            assert_eq!(instruction_extent(&bytes, VA, VA + 3), 3);
+        }
+
+        /// A tail call is just as much the end of the function as a `ret`.
+        #[test]
+        fn a_function_ending_in_a_jump_cuts_at_the_fde_end() {
+            let mut bytes = vec![0xeb, 0x00]; // jmp .+0
+            bytes.extend_from_slice(&[0x11; 16]);
+            assert_eq!(instruction_extent(&bytes, VA, VA + 2), 2);
+        }
+
+        /// Unwind info that describes only a function's prologue — which
+        /// hand-written assembly does carry — must not cost the rest of the
+        /// function its relocations. A `ret` that reaches past the recorded end
+        /// is the giveaway that real code continues.
+        #[test]
+        fn unwind_info_stopping_mid_function_scans_the_whole_unit() {
+            // push rbp; mov rbp, rsp; ret — the FDE covers only the first two.
+            let bytes = vec![0x55, 0x48, 0x89, 0xe5, 0xc3];
+            assert_eq!(instruction_extent(&bytes, VA, VA + 4), bytes.len());
+        }
+
+        /// A fall-through last instruction means the function does not end at
+        /// the recorded end either, however well the boundary lines up.
+        #[test]
+        fn a_fall_through_last_instruction_is_not_an_ending() {
+            let bytes = vec![0x90, 0x90, 0x90, 0x90]; // nop * 4
+            assert_eq!(instruction_extent(&bytes, VA, VA + 2), bytes.len());
+        }
+
+        /// A boundary the decode cannot land on exactly — here it falls inside
+        /// the 4-byte `mov` — is not a boundary to cut on.
+        #[test]
+        fn a_boundary_inside_an_instruction_is_not_cut_on() {
+            let bytes = vec![0x48, 0x89, 0xe5, 0xc3, 0x00]; // mov rbp, rsp; ret
+            assert_eq!(instruction_extent(&bytes, VA, VA + 2), bytes.len());
+        }
+
+        /// An FDE that covers the unit (or more of it) leaves nothing to cut.
+        #[test]
+        fn an_fde_covering_the_whole_unit_changes_nothing() {
+            let bytes = vec![0x31, 0xc0, 0xc3];
+            assert_eq!(instruction_extent(&bytes, VA, VA + 3), bytes.len());
+            assert_eq!(instruction_extent(&bytes, VA, VA + 0x100), bytes.len());
+            assert_eq!(instruction_extent(&bytes, VA, VA - 1), bytes.len());
+        }
+    }
+
+    /// The constants hand-written assembly keeps in `.text` are not code, and
+    /// a unit's byte range runs from its function's entry to the next bound —
+    /// so it covers them. Decoding them produced relocations, extraction
+    /// dependencies and short-branch veneers out of a string constant.
+    ///
+    /// `libcrypto.so.3` has one at 0x20db00: an FDE covers 0x20db00..0x20db63,
+    /// the next starts at 0x20dbb0, and the 0x4d bytes in between are the
+    /// `"X25519 primitives for x86_64, CRYPTOGAMS by <appro@openssl.org>"`
+    /// banner. Decoded as instructions it yielded seven rel8 branches needing
+    /// veneers and a `xor dh, [rip+0x20393135]` pointing 0x20 MiB outside the
+    /// library. The bytes still have to be copied — the unit is the merged
+    /// binary's only copy of them — but nothing in them is a reference.
+    #[test]
+    fn constants_embedded_in_text_are_copied_but_not_decoded() {
+        const FUNC: u64 = 0x20db00;
+        const FUNC_END: u64 = 0x20db63;
+
+        let lib = test_lib("libcrypto.so.3");
+        let mut state = test_state();
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = parse_lib(&bytes);
+        let index = state.lib_index(&lib, &elf);
+        assert_eq!(
+            index.fdes.containing(FUNC),
+            Some((FUNC, FUNC_END)),
+            "fixture moved: no FDE for the X25519 primitive"
+        );
+
+        let key = UnitKey {
+            lib: lib.clone(),
+            sym: anon_unit_name(FUNC),
+        };
+        process_symbol(&key, &mut state).expect("extract the X25519 primitive");
+        let unit = state.units.last().expect("the extracted unit");
+
+        let code_len = (FUNC_END - FUNC) as usize;
+        assert!(
+            unit.bytes.len() > code_len,
+            "fixture moved: the unit stops at the function's last instruction"
+        );
+        for reloc in &unit.relocations {
+            assert!(
+                reloc.offset_within_unit < code_len as u64,
+                "relocation at {:#x} was decoded out of the banner string",
+                reloc.offset_within_unit
+            );
+        }
     }
 }
