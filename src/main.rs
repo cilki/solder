@@ -413,8 +413,13 @@ fn print_merge_plan(
         plan.new_externals.len()
     );
     if let Some(init_fini) = &plan.init_fini {
+        // Both arrays are rebuilt whole: the merged libraries' entries *and*
+        // whatever the executable already had in the corresponding array, which
+        // has to keep running. Calling the totals "merged" overstated how many
+        // constructors the merge is adding.
         println!(
-            "  merged constructors: {}, destructors: {}",
+            "  rebuilt preinit array entries: {}, fini array entries: {} \
+             (merged constructors and destructors, plus the executable's own)",
             init_fini.preinit_entries.len(),
             init_fini.combined_fini_entries.len()
         );
