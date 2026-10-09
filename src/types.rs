@@ -254,9 +254,15 @@ pub struct MergePlan {
     /// `.dynstr`/`.dynsym`/`.gnu.version`/`.rela.dyn` and the new program
     /// header table after it, in a read-only mapping.
     pub writable_end: u64,
-    pub text_units: Vec<AssignedUnit>,
-    pub rodata_units: Vec<AssignedUnit>,
-    pub data_units: Vec<AssignedUnit>,
+    /// Every extracted unit with the address it was assigned, in layout order:
+    /// the code units, then the merged constants, then everything the dynamic
+    /// loader writes to.
+    ///
+    /// Which run a unit ended up in is a fact about its address — compare it
+    /// against `exec_size`, `rodata_end` and `writable_end` — and a unit's
+    /// origin is `AssignedUnit::unit`'s own `section_kind`. Neither is a
+    /// reason to hold the units in more than one list.
+    pub units: Vec<AssignedUnit>,
     /// One stub per unique External symbol referenced by merged code.
     pub trampoline_stubs: Vec<TrampolineStub>,
     /// GOT entries in the executable to patch with merged symbol addresses.
@@ -291,21 +297,5 @@ impl MergePlan {
     /// padding that separates the executable, read-only and writable runs.
     pub fn segment_size(&self) -> usize {
         self.writable_end as usize
-    }
-
-    /// Iterate all assigned units across all section kinds.
-    pub fn all_units(&self) -> impl Iterator<Item = &AssignedUnit> {
-        self.text_units
-            .iter()
-            .chain(&self.rodata_units)
-            .chain(&self.data_units)
-    }
-
-    /// Iterate all assigned units mutably.
-    pub fn all_units_mut(&mut self) -> impl Iterator<Item = &mut AssignedUnit> {
-        self.text_units
-            .iter_mut()
-            .chain(&mut self.rodata_units)
-            .chain(&mut self.data_units)
     }
 }
