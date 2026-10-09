@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 
-use crate::elf_reader::{DYN_ENTRY_SIZE, DynamicTable};
+use crate::elf_reader::{DYN_ENTRY_SIZE, DynamicTable, SectionTable};
 use crate::types::{MergePlan, RelativeReloc};
 
 /// Apply all in-place patches to a mutable copy of the executable bytes:
@@ -178,18 +178,6 @@ fn ensure_bind_now(bytes: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// Find the file offset of an ELF section by name.
-/// Returns 0 if the section is not found.
-fn find_section_file_offset(bytes: &[u8], name: &str) -> Result<u64> {
-    let goblin_elf = goblin::elf::Elf::parse(bytes).context("goblin parse for section lookup")?;
-    for sh in &goblin_elf.section_headers {
-        if goblin_elf.shdr_strtab.get_at(sh.sh_name) == Some(name) {
-            return Ok(sh.sh_offset);
-        }
-    }
-    Ok(0)
-}
-
 /// Remove version requirement entries (.gnu.version_r) for fully-merged libraries.
 ///
 /// The .gnu.version_r section is a linked list of Verneed entries. Each entry
@@ -222,10 +210,13 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     let Some((verneed_dyn_idx, verneed_va)) = dynamic.entries_of(DT_VERNEED).next() else {
         return Ok(());
     };
-    let verneed_offset = find_section_file_offset(bytes, ".gnu.version_r")? as usize;
-    if verneed_offset == 0 {
+    // `.gnu.version_r` has no `DT_*` tag for its extent, so the only way to
+    // find the list is through its section header.
+    let verneed_offset = SectionTable::parse(bytes)?
+        .and_then(|sections| sections.by_name(".gnu.version_r").map(|s| s.offset));
+    let Some(verneed_offset) = verneed_offset.map(|off| off as usize) else {
         return Ok(());
-    }
+    };
 
     // Walk the Verneed linked list to find entries matching libraries to remove
     let mut removed: std::collections::HashSet<usize> = std::collections::HashSet::new();

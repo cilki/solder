@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail};
-use tracing::warn;
 
-use crate::elf_reader::{DynamicTable, va_to_file_offset};
+use crate::elf_reader::{
+    DynamicTable, SH_ADDR, SH_ADDRALIGN, SH_FLAGS, SH_NAME, SH_OFFSET, SH_SIZE, SH_TYPE, SHDR_SIZE,
+    SectionTable, va_to_file_offset,
+};
 use crate::layout::align_up;
 use crate::types::{MergePlan, RelativeReloc};
 
@@ -318,20 +320,6 @@ pub fn write_output(
     Ok(())
 }
 
-/// `Elf64_Shdr` is 64 bytes; these are the field offsets within one.
-const SHDR_SIZE: usize = 64;
-const SH_NAME: usize = 0;
-const SH_TYPE: usize = 4;
-const SH_FLAGS: usize = 8;
-const SH_ADDR: usize = 16;
-const SH_OFFSET: usize = 24;
-const SH_SIZE: usize = 32;
-const SH_ADDRALIGN: usize = 48;
-
-/// `SHN_XINDEX` / `SHN_LORESERVE`: section counts and `e_shstrndx` values at or
-/// above this are escapes into the extended-numbering fields of section 0.
-const SHN_LORESERVE: usize = 0xff00;
-
 /// Make the section header table describe the merged binary.
 ///
 /// The merge moves `.dynstr`, `.dynsym`, `.gnu.version` and `.rela.dyn` into
@@ -362,66 +350,25 @@ fn rewrite_section_headers(
 ) -> Result<()> {
     use object::elf::{PF_W, PF_X, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS};
 
-    let e_shoff = read_u64_le(out, 0x28)? as usize;
-    let e_shentsize = read_u16_le(out, 0x3a)? as usize;
-    let e_shnum = read_u16_le(out, 0x3c)? as usize;
-    let e_shstrndx = read_u16_le(out, 0x3e)? as usize;
-
     // An executable whose section header table was already stripped has nothing
     // to keep in sync; the loader never needed it.
-    if e_shoff == 0 || e_shnum == 0 {
+    let Some(table) = SectionTable::parse(out)? else {
         return Ok(());
-    }
-    if e_shentsize != SHDR_SIZE {
-        bail!("section header entries are {e_shentsize} bytes, expected {SHDR_SIZE}");
-    }
-    if e_shnum >= SHN_LORESERVE || e_shstrndx >= SHN_LORESERVE {
-        warn!(
-            sections = e_shnum,
-            "extended section numbering is not supported; leaving the section headers as they were"
-        );
-        return Ok(());
-    }
-    // Without a `.shstrtab` the existing headers have no names to match against
-    // and the new ones would have nowhere to put theirs.
-    if e_shstrndx == 0 {
-        warn!("executable has no .shstrtab; leaving the section headers as they were");
-        return Ok(());
-    }
-    let sht_end = e_shoff + e_shnum * SHDR_SIZE;
-    if sht_end > out.len() {
-        bail!("section header table extends past the end of the file");
-    }
+    };
 
-    let mut shdrs = out[e_shoff..sht_end].to_vec();
-    let shstrtab_hdr = e_shstrndx * SHDR_SIZE;
-    let old_names_off = read_u64_le(&shdrs, shstrtab_hdr + SH_OFFSET)? as usize;
-    let old_names_size = read_u64_le(&shdrs, shstrtab_hdr + SH_SIZE)? as usize;
-    if old_names_off + old_names_size > out.len() {
-        bail!(".shstrtab extends past the end of the file");
-    }
-    let mut names = out[old_names_off..old_names_off + old_names_size].to_vec();
+    let mut shdrs = out[table.byte_range()].to_vec();
+    let shstrtab_hdr = table.shstrndx * SHDR_SIZE;
+    let shstrtab = table.shstrtab();
+    let names_at = shstrtab.offset as usize;
+    let mut names = out[names_at..names_at + shstrtab.size as usize].to_vec();
 
     // Repoint the sections the merge rebuilt. A section the executable does not
     // have is skipped: nothing described the old table either.
-    let name_at = |names: &[u8], off: usize| -> Option<String> {
-        let rest = names.get(off..)?;
-        let end = rest.iter().position(|&b| b == 0)?;
-        std::str::from_utf8(&rest[..end]).ok().map(str::to_owned)
-    };
-    let find_section = |shdrs: &[u8], names: &[u8], want: &str| -> Option<usize> {
-        (0..e_shnum).find(|i| {
-            read_u32_le(shdrs, i * SHDR_SIZE + SH_NAME)
-                .ok()
-                .and_then(|off| name_at(names, off as usize))
-                .is_some_and(|name| name == want)
-        })
-    };
     for &(section, vaddr, size) in &ext.rebuilt_sections {
-        let Some(idx) = find_section(&shdrs, &names, section) else {
+        let Some(header) = table.by_name(section) else {
             continue;
         };
-        let base = idx * SHDR_SIZE;
+        let base = header.index * SHDR_SIZE;
         write_u64_le(&mut shdrs, base + SH_ADDR, vaddr);
         write_u64_le(
             &mut shdrs,
@@ -481,7 +428,7 @@ fn rewrite_section_headers(
     out.extend_from_slice(&shdrs);
 
     write_u64_le(out, 0x28, new_shoff);
-    write_u16_le(out, 0x3c, (e_shnum + added) as u16);
+    write_u16_le(out, 0x3c, (table.sections.len() + added) as u16);
     Ok(())
 }
 
@@ -546,25 +493,13 @@ fn write_u16_le(buf: &mut [u8], offset: usize, val: u16) {
     buf[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
 }
 
-fn read_u16_le(buf: &[u8], offset: usize) -> Result<u16> {
-    let bytes = buf
-        .get(offset..offset + 2)
-        .with_context(|| format!("reading 2 bytes at {offset:#x}: past end of file"))?;
-    Ok(u16::from_le_bytes(bytes.try_into().expect("2 bytes")))
-}
-
-fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
-    let bytes = buf
-        .get(offset..offset + 4)
-        .with_context(|| format!("reading 4 bytes at {offset:#x}: past end of file"))?;
-    Ok(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
-}
-
-fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
-    let bytes = buf
-        .get(offset..offset + 8)
-        .with_context(|| format!("reading 8 bytes at {offset:#x}: past end of file"))?;
-    Ok(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+/// Name of `.dynsym` entry `index`, resolved through `.dynstr`. `None` for an
+/// entry whose `st_name` is out of range or names the empty string, neither of
+/// which identifies a symbol.
+fn symbol_name<'s>(dynsym: &[u8], dynstr: &'s [u8], index: usize) -> Option<&'s str> {
+    let at = index * SYM_ENTRY_SIZE;
+    let st_name = u32::from_le_bytes(dynsym.get(at..at + 4)?.try_into().expect("4 bytes"));
+    crate::elf_reader::cstr_at(dynstr, st_name as usize).filter(|name| !name.is_empty())
 }
 
 /// R_X86_64_RELATIVE relocation type
@@ -649,14 +584,7 @@ fn build_extended_segment(
         new_sym_idx_base = old_num_syms;
 
         for i in 0..old_num_syms {
-            let st_name = u32::from_le_bytes(
-                old_dynsym[i * SYM_ENTRY_SIZE..i * SYM_ENTRY_SIZE + 4].try_into()?,
-            ) as usize;
-            if st_name < old_dynstr.len()
-                && let Some(end) = old_dynstr[st_name..].iter().position(|&b| b == 0)
-                && end > 0
-                && let Ok(name) = std::str::from_utf8(&old_dynstr[st_name..st_name + end])
-            {
+            if let Some(name) = symbol_name(&old_dynsym, &old_dynstr, i) {
                 existing_sym_idx.entry(name.to_owned()).or_insert(i);
             }
         }
@@ -861,21 +789,21 @@ fn read_dynsym_tables(
     let strtab_off =
         va_to_file_offset(exe, strtab_va).context("DT_STRTAB not in any PT_LOAD")? as usize;
 
-    // .dynsym size has to come from the section header — DT_SYMENT only gives
-    // the per-entry width, and there is no DT_SYMSZ.
-    let goblin_elf =
-        goblin::elf::Elf::parse(patched_exe).context("goblin parse for dynsym/versym sizes")?;
-    let mut dynsym_size: Option<usize> = None;
-    let mut versym_size: Option<usize> = None;
-    for sh in &goblin_elf.section_headers {
-        match goblin_elf.shdr_strtab.get_at(sh.sh_name) {
-            Some(".dynsym") => dynsym_size = Some(sh.sh_size as usize),
-            Some(".gnu.version") => versym_size = Some(sh.sh_size as usize),
-            _ => {}
-        }
-    }
-    let dynsym_size = dynsym_size.context(".dynsym section header not found")?;
-    let versym_size = versym_size.context(".gnu.version section header not found")?;
+    // The .dynsym and .gnu.version sizes have to come from their section
+    // headers — DT_SYMENT only gives the per-entry width, and there is no
+    // DT_SYMSZ or DT_VERSYMSZ at all.
+    let sections = SectionTable::parse(patched_exe)?.context(
+        "executable has no usable section header table, which is the only place the \
+                  .dynsym and .gnu.version sizes are recorded",
+    )?;
+    let size_of = |name: &str| -> Result<usize> {
+        Ok(sections
+            .by_name(name)
+            .with_context(|| format!("{name} section header not found"))?
+            .size as usize)
+    };
+    let dynsym_size = size_of(".dynsym")?;
+    let versym_size = size_of(".gnu.version")?;
 
     let symtab_off =
         va_to_file_offset(exe, symtab_va).context("DT_SYMTAB not in any PT_LOAD")? as usize;
@@ -1213,44 +1141,15 @@ mod section_header_tests {
         (plan, bytes)
     }
 
-    /// `(name, sh_addr, sh_offset, sh_size)` for every section in `bytes`.
-    fn section_table(bytes: &[u8]) -> Vec<(String, u64, u64, u64)> {
-        let shoff = read_u64_le(bytes, 0x28).expect("e_shoff") as usize;
-        let shnum = read_u16_le(bytes, 0x3c).expect("e_shnum") as usize;
-        let shstrndx = read_u16_le(bytes, 0x3e).expect("e_shstrndx") as usize;
-        assert!(
-            shoff != 0 && shnum != 0,
-            "the output has no section headers"
-        );
-
-        let names_hdr = shoff + shstrndx * SHDR_SIZE;
-        let names_off =
-            read_u64_le(bytes, names_hdr + SH_OFFSET).expect("shstrtab offset") as usize;
-        let names_size = read_u64_le(bytes, names_hdr + SH_SIZE).expect("shstrtab size") as usize;
-        let names = &bytes[names_off..names_off + names_size];
-
-        (0..shnum)
-            .map(|i| {
-                let base = shoff + i * SHDR_SIZE;
-                let name_off = read_u32_le(bytes, base + SH_NAME).expect("sh_name") as usize;
-                let end = name_off + names[name_off..].iter().position(|&b| b == 0).expect("NUL");
-                (
-                    String::from_utf8_lossy(&names[name_off..end]).into_owned(),
-                    read_u64_le(bytes, base + SH_ADDR).expect("sh_addr"),
-                    read_u64_le(bytes, base + SH_OFFSET).expect("sh_offset"),
-                    read_u64_le(bytes, base + SH_SIZE).expect("sh_size"),
-                )
-            })
-            .collect()
+    fn section_table(bytes: &[u8]) -> SectionTable {
+        SectionTable::parse(bytes)
+            .expect("read the output's section headers")
+            .expect("the output has no section headers")
     }
 
-    fn section<'t>(
-        table: &'t [(String, u64, u64, u64)],
-        name: &str,
-    ) -> &'t (String, u64, u64, u64) {
+    fn section<'t>(table: &'t SectionTable, name: &str) -> &'t crate::elf_reader::SectionHeader {
         table
-            .iter()
-            .find(|(n, ..)| n == name)
+            .by_name(name)
             .unwrap_or_else(|| panic!("the merged output has no '{name}' section"))
     }
 
@@ -1274,27 +1173,28 @@ mod section_header_tests {
             (DT_RELA, ".rela.dyn"),
         ] {
             let va = dynamic.value_of(tag).expect("dynamic tag");
-            let (_, sh_addr, ..) = section(&table, name);
+            let addr = section(&table, name).addr;
             assert_eq!(
-                *sh_addr, va,
-                "'{name}' describes {sh_addr:#x} but the loader reads {va:#x}"
+                addr, va,
+                "'{name}' describes {addr:#x} but the loader reads {va:#x}"
             );
         }
 
         for (tag, name) in [(DT_STRSZ, ".dynstr"), (DT_RELASZ, ".rela.dyn")] {
             let size = dynamic.value_of(tag).expect("dynamic size tag");
-            let (.., sh_size) = section(&table, name);
-            assert_eq!(*sh_size, size, "'{name}' is the wrong size");
+            assert_eq!(
+                section(&table, name).size,
+                size,
+                "'{name}' is the wrong size"
+            );
         }
 
         // `.gnu.version` is one u16 per `.dynsym` entry, and the injected
         // symbols have to be covered by both or ld.so reads a version index
         // from past the end of the array.
-        let (.., dynsym_size) = section(&table, ".dynsym");
-        let (.., versym_size) = section(&table, ".gnu.version");
         assert_eq!(
-            dynsym_size / SYM_ENTRY_SIZE as u64 * 2,
-            *versym_size,
+            section(&table, ".dynsym").size / SYM_ENTRY_SIZE as u64 * 2,
+            section(&table, ".gnu.version").size,
             ".gnu.version is not parallel to .dynsym"
         );
     }
@@ -1319,11 +1219,7 @@ mod section_header_tests {
         assert_eq!(versym.len(), count * 2, ".gnu.version is short of .dynsym");
 
         let names: Vec<&str> = (0..count)
-            .map(|i| {
-                let off = read_u32_le(&dynsym, i * SYM_ENTRY_SIZE).expect("st_name") as usize;
-                let end = off + dynstr[off..].iter().position(|&b| b == 0).expect("NUL");
-                std::str::from_utf8(&dynstr[off..end]).expect("symbol name")
-            })
+            .filter_map(|i| symbol_name(&dynsym, &dynstr, i))
             .collect();
         assert!(
             names.contains(&"solder_absent_symbol"),
@@ -1343,9 +1239,13 @@ mod section_header_tests {
             (".solder.rodata", plan.exec_size, plan.rodata_end),
             (".solder.data", plan.rodata_end, plan.writable_end),
         ] {
-            let (_, sh_addr, _, sh_size) = section(&table, name);
-            assert_eq!(*sh_addr, plan.load_address + start, "'{name}' is misplaced");
-            assert_eq!(*sh_size, end - start, "'{name}' is the wrong size");
+            let header = section(&table, name);
+            assert_eq!(
+                header.addr,
+                plan.load_address + start,
+                "'{name}' is misplaced"
+            );
+            assert_eq!(header.size, end - start, "'{name}' is the wrong size");
         }
     }
 
@@ -1415,16 +1315,17 @@ mod section_header_tests {
     #[test]
     fn every_section_stays_inside_the_file() {
         let (_, bytes) = merged_grep();
-        for (name, _, sh_offset, sh_size) in section_table(&bytes) {
+        for header in section_table(&bytes).sections {
             // `.bss` is SHT_NOBITS: it occupies no file bytes, and its
             // sh_offset is only a hint at where it would have started.
-            if name == ".bss" {
+            if header.name == ".bss" {
                 continue;
             }
+            let end = header.offset + header.size;
             assert!(
-                sh_offset + sh_size <= bytes.len() as u64,
-                "'{name}' runs to {:#x}, past the {:#x}-byte file",
-                sh_offset + sh_size,
+                end <= bytes.len() as u64,
+                "'{}' runs to {end:#x}, past the {:#x}-byte file",
+                header.name,
                 bytes.len()
             );
         }

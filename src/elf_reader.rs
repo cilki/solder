@@ -322,10 +322,7 @@ impl DynamicTable {
     /// The `.dynstr` string at `d_val`, for the tags whose value is a string
     /// table index (`DT_NEEDED`, `DT_RPATH`, `DT_RUNPATH`, `DT_SONAME`).
     pub fn string_at<'b>(&self, bytes: &'b [u8], d_val: u64) -> Option<&'b str> {
-        let start = self.strtab_offset?.checked_add(d_val as usize)?;
-        let rest = bytes.get(start..)?;
-        let end = rest.iter().position(|&b| b == 0)?;
-        std::str::from_utf8(&rest[..end]).ok()
+        cstr_at(bytes, self.strtab_offset?.checked_add(d_val as usize)?)
     }
 }
 
@@ -348,6 +345,142 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
         .get(offset..offset + 8)
         .with_context(|| format!("u64 at file offset {offset:#x} is past the end"))?;
     Ok(u64::from_le_bytes(raw.try_into().expect("8 bytes")))
+}
+
+/// `sizeof (Elf64_Shdr)`.
+pub const SHDR_SIZE: usize = 64;
+/// Field offsets within an `Elf64_Shdr`.
+pub const SH_NAME: usize = 0;
+pub const SH_TYPE: usize = 4;
+pub const SH_FLAGS: usize = 8;
+pub const SH_ADDR: usize = 16;
+pub const SH_OFFSET: usize = 24;
+pub const SH_SIZE: usize = 32;
+pub const SH_ADDRALIGN: usize = 48;
+
+/// `SHN_XINDEX` / `SHN_LORESERVE`: section counts and `e_shstrndx` values at or
+/// above this are escapes into the extended-numbering fields of section 0.
+const SHN_LORESERVE: usize = 0xff00;
+
+/// One entry of the section header table, with its name already resolved
+/// through `.shstrtab`.
+pub struct SectionHeader {
+    /// Index into the section header table, i.e. the section's number.
+    pub index: usize,
+    pub name: String,
+    /// `sh_addr`. Only the writer's tests read it, to check the headers of the
+    /// rebuilt sections against the addresses the loader is pointed at.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub addr: u64,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// The section header table of an ELF image, decoded from its raw bytes.
+///
+/// Section headers are what everything other than the dynamic loader reads:
+/// the writer repoints the headers of the tables it rebuilds and appends one
+/// per mapping of the merged region, the patcher locates `.gnu.version_r`
+/// through them, and the writer reads the `.dynsym`/`.gnu.version` sizes off
+/// them because `.dynamic` carries no tag for either. Each of those used to
+/// find a section by name its own way — two by parsing the whole file a second
+/// time with goblin, two by walking the raw headers — so this decodes the
+/// table once and a caller only names the section it is after.
+pub struct SectionTable {
+    /// File offset of the first `Elf64_Shdr`.
+    pub offset: usize,
+    /// `e_shstrndx`, the index of the `.shstrtab` header.
+    pub shstrndx: usize,
+    pub sections: Vec<SectionHeader>,
+}
+
+impl SectionTable {
+    /// Decode the table, or `Ok(None)` when the image has none this can work
+    /// with: an already-stripped table, extended section numbering, or no
+    /// `.shstrtab` to name the entries against.
+    pub fn parse(bytes: &[u8]) -> Result<Option<Self>> {
+        let offset = read_u64(bytes, 0x28)? as usize;
+        let entsize = read_u16(bytes, 0x3a)? as usize;
+        let shnum = read_u16(bytes, 0x3c)? as usize;
+        let shstrndx = read_u16(bytes, 0x3e)? as usize;
+
+        // A stripped executable has no section headers to read or to keep in
+        // sync; the loader never needed them.
+        if offset == 0 || shnum == 0 {
+            return Ok(None);
+        }
+        if entsize != SHDR_SIZE {
+            bail!("section header entries are {entsize} bytes, expected {SHDR_SIZE}");
+        }
+        if shnum >= SHN_LORESERVE || shstrndx >= SHN_LORESERVE {
+            tracing::warn!(
+                sections = shnum,
+                "extended section numbering is not supported; ignoring the section header table"
+            );
+            return Ok(None);
+        }
+        // Without a `.shstrtab` the headers have no names to match against.
+        if shstrndx == 0 {
+            tracing::warn!("executable has no .shstrtab; ignoring the section header table");
+            return Ok(None);
+        }
+        if shstrndx >= shnum {
+            bail!("e_shstrndx is {shstrndx} but the table holds {shnum} headers");
+        }
+        if offset + shnum * SHDR_SIZE > bytes.len() {
+            bail!("section header table extends past the end of the file");
+        }
+
+        let names_hdr = offset + shstrndx * SHDR_SIZE;
+        let names_at = read_u64(bytes, names_hdr + SH_OFFSET)? as usize;
+        let names_len = read_u64(bytes, names_hdr + SH_SIZE)? as usize;
+        let names = names_at
+            .checked_add(names_len)
+            .and_then(|end| bytes.get(names_at..end))
+            .context(".shstrtab extends past the end of the file")?;
+
+        let sections = (0..shnum)
+            .map(|index| {
+                let at = offset + index * SHDR_SIZE;
+                let name_at = read_u32(bytes, at + SH_NAME)? as usize;
+                Ok(SectionHeader {
+                    index,
+                    name: cstr_at(names, name_at).unwrap_or_default().to_owned(),
+                    addr: read_u64(bytes, at + SH_ADDR)?,
+                    offset: read_u64(bytes, at + SH_OFFSET)?,
+                    size: read_u64(bytes, at + SH_SIZE)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Some(Self {
+            offset,
+            shstrndx,
+            sections,
+        }))
+    }
+
+    /// The first header named `name`, if the image has one.
+    pub fn by_name(&self, name: &str) -> Option<&SectionHeader> {
+        self.sections.iter().find(|s| s.name == name)
+    }
+
+    /// The `.shstrtab` header, which `parse` has already checked exists.
+    pub fn shstrtab(&self) -> &SectionHeader {
+        &self.sections[self.shstrndx]
+    }
+
+    /// Bytes the table occupies in the file.
+    pub fn byte_range(&self) -> std::ops::Range<usize> {
+        self.offset..self.offset + self.sections.len() * SHDR_SIZE
+    }
+}
+
+/// The NUL-terminated string starting at `offset` in a string table.
+pub fn cstr_at(strings: &[u8], offset: usize) -> Option<&str> {
+    let rest = strings.get(offset..)?;
+    let end = rest.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&rest[..end]).ok()
 }
 
 /// Convert a file offset to a virtual address in a parsed ELF.
