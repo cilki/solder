@@ -269,34 +269,123 @@ pub fn write_output(
         total_seg_size,
     )?;
 
-    // `output_path` is the input executable, so read its mode before the write
-    // replaces the file: the merge must not change who is allowed to read or
-    // run the binary.
-    #[cfg(unix)]
-    let original_mode = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(output_path)
-            .map(|m| m.permissions().mode() & 0o7777)
-            .ok()
+    replace_file(output_path, &out)
+}
+
+/// Put `bytes` at `path`, which is the input executable, by writing a
+/// temporary file beside it and renaming that over the top.
+///
+/// Writing straight to the executable — `fs::write`, which truncates before it
+/// writes — means a write that fails partway leaves the input destroyed, and
+/// `solder` keeps no backup of it. Merging `test/grep` under `ulimit -f 500`
+/// turned the 198K fixture into 500K of garbage that no longer parsed as ELF.
+/// A rename, by contrast, either happened or did not: the path holds the merge
+/// or exactly what it held before.
+///
+/// It also leaves a copy that something is *running* alone, since the old inode
+/// stays alive as long as it is mapped instead of having the pages a live
+/// process executes from rewritten underneath it. The flip side is that a
+/// hard-linked executable keeps the pre-merge bytes under its other names,
+/// where rewriting in place would have changed what all of them name.
+fn replace_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    // A symlink only names the executable; the merge belongs to the file at the
+    // end of it, not to the link, so that is what the rename has to replace —
+    // and the temporary file has to be created in *that* file's directory, both
+    // because a rename cannot cross filesystems and so the two end up with the
+    // same ownership and SELinux context.
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
     };
+    let (temp, mut file) = create_temp_beside(dir, &target)?;
+    let written = (|| -> Result<()> {
+        file.write_all(bytes)
+            .with_context(|| format!("writing {}", temp.display()))?;
+        // The merged binary is worth more than the few milliseconds: a rename
+        // over unflushed data can leave the path naming a file of zeroes after
+        // a crash, which is the failure this function exists to rule out.
+        file.sync_all()
+            .with_context(|| format!("flushing {}", temp.display()))?;
+        drop(file);
 
-    // Write output file.
-    std::fs::write(output_path, &out)
-        .with_context(|| format!("writing output {}", output_path.display()))?;
+        // Carry over the mode, and the owner and group where we are allowed to.
+        // A fresh file is 0o600 and owned by whoever ran `solder`, so without
+        // this the merge would narrow who can run the executable and, under
+        // `sudo`, hand it to root. Owner-execute is added in case the input
+        // somehow lacked it; the mode is otherwise left exactly as it was,
+        // setuid and setgid bits included — widening a 0o700 binary to
+        // world-executable is not the merge's business either.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // Still the input's: nothing has replaced it yet.
+            let metadata = std::fs::metadata(&target).ok();
+            if let Some(m) = metadata.as_ref() {
+                // Only root may give a file away, so a failure here is the
+                // ordinary case of merging a file you own. This has to come
+                // first: `chown` clears the setuid and setgid bits.
+                let _ = std::os::unix::fs::chown(&temp, Some(m.uid()), Some(m.gid()));
+            }
+            let mode = metadata
+                .as_ref()
+                .map_or(0o755, |m| m.permissions().mode() & 0o7777)
+                | 0o100;
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("setting the mode of {}", temp.display()))?;
+        }
 
-    // Restore the mode the input had, adding owner-execute if it somehow
-    // lacked it. Unconditionally chmod'ing 0o755 here widened a 0o700 binary
-    // to world-readable and world-executable and silently dropped any
-    // setuid/setgid bit, neither of which is the merge's business.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = original_mode.unwrap_or(0o755) | 0o100;
-        std::fs::set_permissions(output_path, std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("restoring mode on {}", output_path.display()))?;
+        std::fs::rename(&temp, &target)
+            .with_context(|| format!("replacing {} with {}", target.display(), temp.display()))
+    })();
+
+    if written.is_err() {
+        // The rename never happened, so the temporary file is ours to remove.
+        let _ = std::fs::remove_file(&temp);
     }
+    written
+}
 
-    Ok(())
+/// Create a file for `target`'s replacement in `dir`, returning its path and an
+/// open handle. The name is hidden and carries the pid so two `solder` runs over
+/// the same directory cannot collide.
+fn create_temp_beside(
+    dir: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::fs::File)> {
+    use std::ffi::OsString;
+
+    let stem = target
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("solder.out"));
+    for attempt in 0..16u32 {
+        let mut name = OsString::from(".");
+        name.push(stem);
+        name.push(format!(".solder.{}.{attempt}", std::process::id()));
+        let candidate = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "creating {} to write the merged output to",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!(
+        "no free temporary file name for the merged output in {}",
+        dir.display()
+    )
 }
 
 /// Make the section header table describe the merged binary.
@@ -1080,6 +1169,16 @@ mod section_header_tests {
     /// writer has to rebuild `.dynstr`/`.dynsym`/`.gnu.version` to inject it —
     /// which is what moves those tables out of the sections that described them.
     fn merged_grep() -> (MergePlan, Vec<u8>) {
+        let out = tempfile::NamedTempFile::new().expect("temp output");
+        std::fs::copy(GREP, out.path()).expect("seed the output with the fixture");
+        let plan = merge_grep_over(out.path());
+        let bytes = std::fs::read(out.path()).expect("read the merged output back");
+        (plan, bytes)
+    }
+
+    /// Merge the same three units over whatever copy of `test/grep` already
+    /// sits at `dest`, which is how `solder` is used: the input is the output.
+    fn merge_grep_over(dest: &Path) -> MergePlan {
         let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
         let exe = mapped.parse().expect("parse test/grep");
         let units = vec![
@@ -1105,11 +1204,8 @@ mod section_header_tests {
         .expect("plan layout");
 
         let seg = build_merged_segment(&mut plan).expect("build merged segment");
-        let out = tempfile::NamedTempFile::new().expect("temp output");
-        std::fs::copy(GREP, out.path()).expect("seed the output with the fixture");
-        write_output(mapped.bytes(), &plan, &seg, out.path()).expect("write output");
-        let bytes = std::fs::read(out.path()).expect("read the merged output back");
-        (plan, bytes)
+        write_output(mapped.bytes(), &plan, &seg, dest).expect("write output");
+        plan
     }
 
     fn section_table(bytes: &[u8]) -> SectionTable {
@@ -1300,5 +1396,94 @@ mod section_header_tests {
                 bytes.len()
             );
         }
+    }
+
+    /// The merge rewrites the executable it was handed and keeps no backup of
+    /// it, so the bytes of the input must never be the thing being written: a
+    /// write that stops partway — a full disk, an exceeded file size limit —
+    /// would leave the user with neither the input nor the output. Merging
+    /// `test/grep` under `ulimit -f 500` did exactly that, replacing the 198K
+    /// fixture with 500K of garbage that no longer parsed as ELF.
+    ///
+    /// A hard link to the input pins the inode the input lives in, so this
+    /// pins the guarantee: the merged output has to arrive as a *different*
+    /// file, leaving the one the input was in untouched.
+    #[test]
+    fn the_merge_never_writes_over_the_input_it_was_handed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = dir.path().join("grep");
+        std::fs::copy(GREP, &exe).expect("seed the input");
+        let pinned = dir.path().join("grep.pinned");
+        std::fs::hard_link(&exe, &pinned).expect("hard link the input");
+
+        merge_grep_over(&exe);
+
+        let fixture = std::fs::read(GREP).expect("read the fixture");
+        assert_eq!(
+            std::fs::read(&pinned).expect("read the pinned input"),
+            fixture,
+            "the merge wrote over the inode the input was in"
+        );
+        assert_ne!(
+            std::fs::read(&exe).expect("read the merged output").len(),
+            fixture.len(),
+            "the output is not the merged binary"
+        );
+    }
+
+    /// The merge must not change who may read or run the executable. Writing
+    /// the output as a fresh file beside the input makes that a live risk: a
+    /// newly created file is 0o600, so without carrying the mode over, merging
+    /// a 0o755 binary would leave it runnable only by its owner.
+    #[cfg(unix)]
+    #[test]
+    fn the_input_mode_survives_the_merge() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        for mode in [0o755, 0o700, 0o4755] {
+            let exe = dir.path().join(format!("grep.{mode:o}"));
+            std::fs::copy(GREP, &exe).expect("seed the input");
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(mode))
+                .expect("set the input mode");
+
+            merge_grep_over(&exe);
+
+            let got = std::fs::metadata(&exe)
+                .expect("stat the merged output")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(got, mode, "mode {mode:o} became {got:o}");
+        }
+    }
+
+    /// A symlink names the executable; the file it points at is the executable.
+    /// Replacing the link instead would leave the binary everything else on the
+    /// system reaches through its real name unmerged.
+    #[cfg(unix)]
+    #[test]
+    fn merging_through_a_symlink_replaces_the_file_it_points_at() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let exe = dir.path().join("grep");
+        std::fs::copy(GREP, &exe).expect("seed the input");
+        let link = dir.path().join("grep-link");
+        std::os::unix::fs::symlink(&exe, &link).expect("symlink the input");
+
+        merge_grep_over(&link);
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat the link")
+                .file_type()
+                .is_symlink(),
+            "the merge replaced the symlink with a regular file"
+        );
+        let fixture_len = std::fs::metadata(GREP).expect("stat the fixture").len();
+        assert_ne!(
+            std::fs::metadata(&exe).expect("stat the target").len(),
+            fixture_len,
+            "the file the link points at was not merged"
+        );
     }
 }

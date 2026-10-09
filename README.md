@@ -128,8 +128,17 @@ A `-m` entry that matches no `DT_NEEDED` soname, or that matches only
 never-mergeable ones, is an error rather than a silent no-op — quietly merging
 a subset of what you asked for is almost never what you wanted.
 
-The executable is rewritten in place and no backup is kept, so hold on to a
-copy of anything you can't rebuild.
+The executable is replaced in place and no backup is kept, so hold on to a copy
+of anything you can't rebuild. The replacement itself is atomic — the merged
+output is written beside the executable and renamed over it — so a merge that
+fails for any reason, `solder`'s own errors included, leaves the input exactly
+as it was. Two consequences worth knowing about:
+
+- A copy of the executable that is already running is unaffected, since the
+  rename gives the path a new file rather than rewriting the one that process is
+  executing from.
+- A hard-linked executable is only merged under the name you passed. The other
+  names keep pointing at the original file.
 
 ### Library resolution
 
