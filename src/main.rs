@@ -160,9 +160,6 @@ fn run() -> Result<()> {
     let merged_libs: Vec<PathBuf> = absorbed.iter().map(|lib| lib.path.clone()).collect();
     let lib_order = dep_graph::topological_order(&merged_libs)?;
 
-    // ── Step 2.6: parse executable's existing init/fini info ──────────────────
-    let exe_init_fini = parse_exe_init_fini(&exe_elf)?;
-
     // ── Step 3: layout planning ───────────────────────────────────────────────
     let mut plan = layout::plan_layout(
         units,
@@ -170,7 +167,6 @@ fn run() -> Result<()> {
         imports,
         is_pie,
         init_fini,
-        exe_init_fini,
         &lib_order,
         got_slot_fixups,
     )?;
@@ -420,28 +416,9 @@ fn print_merge_plan(
         println!(
             "  rebuilt preinit array entries: {}, fini array entries: {} \
              (merged constructors and destructors, plus the executable's own)",
-            init_fini.preinit_entries.len(),
-            init_fini.combined_fini_entries.len()
+            init_fini.preinit.entries.len(),
+            init_fini.fini.entries.len()
         );
     }
     println!("Dry run: {} left unchanged", input.display());
-}
-
-/// Parse the executable's existing init/fini array info from .dynamic.
-fn parse_exe_init_fini(
-    exe_elf: &object::read::elf::ElfFile64<'_>,
-) -> Result<types::ExeInitFiniInfo> {
-    use goblin::elf::dynamic::{
-        DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ,
-    };
-
-    let dynamic = elf_reader::DynamicTable::parse(exe_elf.data())
-        .context("reading .dynamic for init/fini arrays")?;
-
-    Ok(types::ExeInitFiniInfo {
-        preinit_array_vaddr: dynamic.value_of(DT_PREINIT_ARRAY),
-        preinit_array_size: dynamic.value_of(DT_PREINIT_ARRAYSZ).unwrap_or(0),
-        fini_array_vaddr: dynamic.value_of(DT_FINI_ARRAY),
-        fini_array_size: dynamic.value_of(DT_FINI_ARRAYSZ).unwrap_or(0),
-    })
 }

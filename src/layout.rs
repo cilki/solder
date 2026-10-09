@@ -7,8 +7,8 @@ use tracing::{debug, trace};
 use crate::elf_reader::file_offset_to_va;
 use crate::elf_reader::merged_load_address;
 use crate::types::{
-    AssignedUnit, ExeInitFiniInfo, ExtractedUnit, GotPatch, InitFiniArrays, InitFiniPlan,
-    MergePlan, NewExternalSym, RelocTarget, SectionKind, TrampolineStub,
+    AssignedUnit, ExtractedUnit, GotPatch, InitFiniArrays, InitFiniKind, InitFiniPlan, MergePlan,
+    MergedArray, NewExternalSym, RelocTarget, SectionKind, TrampolineStub,
 };
 
 /// Plan the virtual address layout of all extracted units and trampolines,
@@ -19,7 +19,6 @@ pub fn plan_layout(
     imports: &[crate::types::ImportedSymbol],
     is_pie: bool,
     init_fini: InitFiniArrays,
-    exe_init_fini: ExeInitFiniInfo,
     lib_order: &[PathBuf],
     got_slot_fixups: Vec<crate::types::GotSlotFixup>,
 ) -> Result<MergePlan> {
@@ -183,7 +182,6 @@ pub fn plan_layout(
     let init_fini_plan = plan_init_fini_arrays(
         exe_elf,
         &init_fini,
-        &exe_init_fini,
         lib_order,
         &unit_vaddr_by_lib_name,
         load_address,
@@ -327,21 +325,24 @@ fn build_exe_got_map(elf: &object::read::elf::ElfFile64<'_>) -> Result<HashMap<S
 fn plan_init_fini_arrays(
     exe_elf: &object::read::elf::ElfFile64<'_>,
     init_fini: &InitFiniArrays,
-    exe_init_fini: &ExeInitFiniInfo,
     lib_order: &[PathBuf],
     unit_vaddrs: &HashMap<(&PathBuf, &str), u64>,
     load_address: u64,
     offset: &mut u64,
 ) -> Result<Option<InitFiniPlan>> {
     let exe_bytes = exe_elf.data();
+    let exe_dynamic = crate::elf_reader::DynamicTable::parse(exe_bytes)
+        .context("reading .dynamic for the executable's own init/fini arrays")?;
 
     // Copy the executable's existing entries verbatim — their functions stay
     // at their original addresses.
-    let read_exe_entries = |array_vaddr: Option<u64>, array_size: u64| -> Result<Vec<u64>> {
+    let read_exe_entries = |kind: InitFiniKind| -> Result<Vec<u64>> {
+        let (array_tag, size_tag) = kind.dynamic_tags();
         let mut entries = Vec::new();
-        let Some(va) = array_vaddr else {
+        let Some(va) = exe_dynamic.value_of(array_tag) else {
             return Ok(entries);
         };
+        let array_size = exe_dynamic.value_of(size_tag).unwrap_or(0);
         if array_size == 0 {
             return Ok(entries);
         }
@@ -408,10 +409,7 @@ fn plan_init_fini_arrays(
     // _dl_init's order: exe preinit, then library constructors).
     let mut preinit_entries = Vec::new();
     if !lib_init_entries.is_empty() {
-        preinit_entries = read_exe_entries(
-            exe_init_fini.preinit_array_vaddr,
-            exe_init_fini.preinit_array_size,
-        )?;
+        preinit_entries = read_exe_entries(InitFiniKind::Preinit)?;
         preinit_entries.extend(lib_init_entries);
     }
 
@@ -419,27 +417,23 @@ fn plan_init_fini_arrays(
     // backward, so the exe's destructors still run first at exit.
     let mut combined_fini_entries = lib_fini_entries;
     if !combined_fini_entries.is_empty() {
-        combined_fini_entries.extend(read_exe_entries(
-            exe_init_fini.fini_array_vaddr,
-            exe_init_fini.fini_array_size,
-        )?);
+        combined_fini_entries.extend(read_exe_entries(InitFiniKind::Fini)?);
     }
 
-    // Allocate space for the arrays in the merged segment
-    // Align to 8 bytes (pointer size)
-    *offset = align_up(*offset, 8);
-    let preinit_vaddr = load_address + *offset;
-    *offset += (preinit_entries.len() * 8) as u64;
-
-    *offset = align_up(*offset, 8);
-    let combined_fini_vaddr = load_address + *offset;
-    *offset += (combined_fini_entries.len() * 8) as u64;
+    // Place each array in the merged segment, aligned to the pointer size.
+    let mut place = |entries: Vec<u64>| {
+        *offset = align_up(*offset, 8);
+        let array = MergedArray {
+            vaddr: load_address + *offset,
+            entries,
+        };
+        *offset += array.size();
+        array
+    };
 
     Ok(Some(InitFiniPlan {
-        preinit_vaddr,
-        preinit_entries,
-        combined_fini_vaddr,
-        combined_fini_entries,
+        preinit: place(preinit_entries),
+        fini: place(combined_fini_entries),
     }))
 }
 
@@ -504,7 +498,6 @@ mod tests {
             &[],
             is_pie,
             InitFiniArrays::default(),
-            ExeInitFiniInfo::default(),
             &[],
             Vec::new(),
         )

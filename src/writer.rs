@@ -62,42 +62,21 @@ pub fn build_merged_segment(plan: &mut MergePlan) -> Result<Vec<u8>> {
         // reserves 14-byte trampolines stays correct.)
     }
 
-    // Write preinit/fini arrays if present
-    if let Some(ref init_fini) = plan.init_fini {
-        // Write preinit array entries
-        if !init_fini.preinit_entries.is_empty() {
-            let base_off = (init_fini.preinit_vaddr - plan.load_address) as usize;
-            for (i, &func_va) in init_fini.preinit_entries.iter().enumerate() {
-                let off = base_off + i * 8;
+    // Write the preinit and fini arrays if present. Each entry is a link-time
+    // VA in the output image, so under PIE each one also needs an
+    // R_X86_64_RELATIVE relocation for ld.so to rebase it.
+    if let Some(init_fini) = &plan.init_fini {
+        for (kind, array) in init_fini.arrays() {
+            for (i, &func_va) in array.entries.iter().enumerate() {
+                let vaddr = array.vaddr + (i * 8) as u64;
+                let off = (vaddr - plan.load_address) as usize;
                 if off + 8 > seg.len() {
-                    bail!("preinit array entry {} overflows segment", i);
+                    bail!("{} entry {i} overflows segment", kind.name());
                 }
                 seg[off..off + 8].copy_from_slice(&func_va.to_le_bytes());
-
-                // For PIE: each function pointer needs an R_X86_64_RELATIVE relocation
                 if plan.is_pie {
                     plan.relative_relocs.push(RelativeReloc {
-                        vaddr: init_fini.preinit_vaddr + (i * 8) as u64,
-                        addend: func_va as i64,
-                    });
-                }
-            }
-        }
-
-        // Write fini_array entries
-        if !init_fini.combined_fini_entries.is_empty() {
-            let base_off = (init_fini.combined_fini_vaddr - plan.load_address) as usize;
-            for (i, &func_va) in init_fini.combined_fini_entries.iter().enumerate() {
-                let off = base_off + i * 8;
-                if off + 8 > seg.len() {
-                    bail!("fini_array entry {} overflows segment", i);
-                }
-                seg[off..off + 8].copy_from_slice(&func_va.to_le_bytes());
-
-                // For PIE: each function pointer needs an R_X86_64_RELATIVE relocation
-                if plan.is_pie {
-                    plan.relative_relocs.push(RelativeReloc {
-                        vaddr: init_fini.combined_fini_vaddr + (i * 8) as u64,
+                        vaddr,
                         addend: func_va as i64,
                     });
                 }
@@ -964,9 +943,7 @@ fn update_dynamic_entries(
     dynamic: &DynamicTable,
     ext: &ExtensionInfo,
 ) -> Result<()> {
-    use goblin::elf::dynamic::{
-        DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_NEEDED, DT_NULL, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ,
-    };
+    use goblin::elf::dynamic::{DT_NEEDED, DT_NULL};
 
     // New entries are appended at the DT_NULL terminator, pushing it down.
     // The last slot must stay DT_NULL so ld.so's scan terminates.
@@ -999,19 +976,17 @@ fn update_dynamic_entries(
         Ok(())
     };
 
+    // Point each rebuilt array's DT_* pair at the merged copy, creating the
+    // pair if the executable did not have one (a binary with no constructors
+    // of its own has no DT_PREINIT_ARRAY to update).
     if let Some(init_fini) = &plan.init_fini {
-        // Update or create DT_PREINIT_ARRAY entries for merged constructors
-        if !init_fini.preinit_entries.is_empty() {
-            let size = (init_fini.preinit_entries.len() * 8) as u64;
-            set_dyn_entry(out, DT_PREINIT_ARRAY, init_fini.preinit_vaddr, false)?;
-            set_dyn_entry(out, DT_PREINIT_ARRAYSZ, size, false)?;
-        }
-
-        // Update or create DT_FINI_ARRAY entries
-        if !init_fini.combined_fini_entries.is_empty() {
-            let size = (init_fini.combined_fini_entries.len() * 8) as u64;
-            set_dyn_entry(out, DT_FINI_ARRAY, init_fini.combined_fini_vaddr, false)?;
-            set_dyn_entry(out, DT_FINI_ARRAYSZ, size, false)?;
+        for (kind, array) in init_fini.arrays() {
+            if array.entries.is_empty() {
+                continue;
+            }
+            let (array_tag, size_tag) = kind.dynamic_tags();
+            set_dyn_entry(out, array_tag, array.vaddr, false)?;
+            set_dyn_entry(out, size_tag, array.size(), false)?;
         }
     }
 
@@ -1137,8 +1112,7 @@ mod section_header_tests {
     use crate::elf_reader::MappedElf;
     use crate::layout::plan_layout;
     use crate::types::{
-        ExeInitFiniInfo, ExtractedReloc, ExtractedUnit, InitFiniArrays, RelocTarget, SectionKind,
-        UnitId,
+        ExtractedReloc, ExtractedUnit, InitFiniArrays, RelocTarget, SectionKind, UnitId,
     };
     use std::path::{Path, PathBuf};
 
@@ -1199,7 +1173,6 @@ mod section_header_tests {
             &[],
             true,
             InitFiniArrays::default(),
-            ExeInitFiniInfo::default(),
             &[],
             Vec::new(),
         )
