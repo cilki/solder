@@ -4,18 +4,12 @@ use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 use object::read::elf::ElfFile64;
 
-/// A memory-mapped ELF file kept alive by its Mmap.
+/// A memory-mapped ELF file. Everything that reads it borrows from `&self`,
+/// so the mapping outlives every view handed out of it.
 pub struct MappedElf {
-    // Must be kept alive as long as `elf` borrows from it.
-    _mmap: Mmap,
-    pub path: PathBuf,
-    elf_ptr: *const u8,
-    elf_len: usize,
+    mmap: Mmap,
+    path: PathBuf,
 }
-
-// SAFETY: Mmap is Send+Sync, and we only access elf_ptr while holding &self.
-unsafe impl Send for MappedElf {}
-unsafe impl Sync for MappedElf {}
 
 impl MappedElf {
     pub fn open(path: &Path) -> Result<Self> {
@@ -23,20 +17,16 @@ impl MappedElf {
             std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("cannot mmap {}", path.display()))?;
-        let ptr = mmap.as_ptr();
-        let len = mmap.len();
         Ok(Self {
-            _mmap: mmap,
+            mmap,
             path: path.to_owned(),
-            elf_ptr: ptr,
-            elf_len: len,
         })
     }
 
-    /// Borrow the raw bytes.
+    /// Borrow the mapped bytes. `Mmap` derefs to them, and the borrow is tied
+    /// to `&self`, so the mapping cannot go away while they are held.
     pub fn bytes(&self) -> &[u8] {
-        // SAFETY: ptr+len were derived from the Mmap which is still alive.
-        unsafe { std::slice::from_raw_parts(self.elf_ptr, self.elf_len) }
+        &self.mmap
     }
 
     /// Parse as a 64-bit ELF file.
@@ -46,24 +36,47 @@ impl MappedElf {
     }
 }
 
+/// Where one `PT_LOAD` segment lives, in the file and in memory.
+#[derive(Debug, Clone, Copy)]
+pub struct Load {
+    pub vaddr: u64,
+    pub offset: u64,
+    /// Bytes the segment occupies in the file. The address translations below
+    /// are bounded by this rather than by `memsz`: the tail of a segment whose
+    /// memory image outruns its file contents (`.bss`) has no file offset to
+    /// translate to.
+    pub filesz: u64,
+    /// Bytes the segment occupies in memory, `filesz` plus any zero-fill.
+    pub memsz: u64,
+}
+
+/// Every `PT_LOAD` segment of a parsed ELF, in program-header order.
+///
+/// Five callers want the loaded segments and nothing else — the two address
+/// translations below, the image's base delta and end, and the extractor's
+/// check that two addresses share a mapping. Each used to filter
+/// `elf_program_headers()` itself and pull the fields out through the
+/// `ProgramHeader` trait, which is five copies of the same six lines.
+pub fn pt_loads<'a>(elf: &'a ElfFile64<'a>) -> impl Iterator<Item = Load> + 'a {
+    use object::read::elf::ProgramHeader;
+    let endian = elf.endian();
+    elf.elf_program_headers()
+        .iter()
+        .filter(move |seg| seg.p_type(endian) == object::elf::PT_LOAD)
+        .map(move |seg| Load {
+            vaddr: seg.p_vaddr(endian),
+            offset: seg.p_offset(endian),
+            filesz: seg.p_filesz(endian),
+            memsz: seg.p_memsz(endian),
+        })
+}
+
 /// Convert a virtual address in a parsed ELF to a file offset.
 /// Returns None if the VA is not covered by any PT_LOAD segment.
 pub fn va_to_file_offset(elf: &ElfFile64<'_>, va: u64) -> Option<u64> {
-    use object::read::elf::ProgramHeader;
-    let endian = elf.endian();
-    for seg in elf.elf_program_headers() {
-        let p_type = seg.p_type(endian);
-        if p_type != object::elf::PT_LOAD {
-            continue;
-        }
-        let p_vaddr = seg.p_vaddr(endian);
-        let p_filesz = seg.p_filesz(endian);
-        let p_offset = seg.p_offset(endian);
-        if va >= p_vaddr && va < p_vaddr + p_filesz {
-            return Some(va - p_vaddr + p_offset);
-        }
-    }
-    None
+    pt_loads(elf)
+        .find(|seg| (seg.vaddr..seg.vaddr + seg.filesz).contains(&va))
+        .map(|seg| va - seg.vaddr + seg.offset)
 }
 
 /// `p_vaddr - p_offset` of the `PT_LOAD` that starts the image — the one
@@ -75,15 +88,10 @@ pub fn va_to_file_offset(elf: &ElfFile64<'_>, va: u64) -> Option<u64> {
 /// difference that holds for the program header table, which is what makes it
 /// the one the merged region has to reproduce (see `merged_load_address`).
 pub fn image_base_delta(elf: &ElfFile64<'_>) -> u64 {
-    use object::read::elf::ProgramHeader;
-    let endian = elf.endian();
-    elf.elf_program_headers()
-        .iter()
-        .filter(|seg| seg.p_type(endian) == object::elf::PT_LOAD)
-        .min_by_key(|seg| seg.p_vaddr(endian))
+    pt_loads(elf)
+        .min_by_key(|seg| seg.vaddr)
         .map(|seg| {
-            seg.p_vaddr(endian)
-                .saturating_sub(seg.p_offset(endian))
+            seg.vaddr.saturating_sub(seg.offset)
                 // Mappings are congruent modulo the page size, so the
                 // difference is a whole number of pages; truncate anything
                 // else rather than carry it into the merged region's address.
@@ -113,22 +121,14 @@ pub fn image_base_delta(elf: &ElfFile64<'_>) -> u64 {
 /// the executable's own difference costs that many zero bytes of unmapped
 /// padding in the file and nothing at runtime.
 pub fn merged_load_address(elf: &ElfFile64<'_>) -> u64 {
-    use object::read::elf::ProgramHeader;
-    let endian = elf.endian();
-    let mut max_end: u64 = 0;
-    for seg in elf.elf_program_headers() {
-        if seg.p_type(endian) != object::elf::PT_LOAD {
-            continue;
-        }
-        let end = seg.p_vaddr(endian).saturating_add(seg.p_memsz(endian));
-        if end > max_end {
-            max_end = end;
-        }
-    }
+    let image_end = pt_loads(elf)
+        .map(|seg| seg.vaddr.saturating_add(seg.memsz))
+        .max()
+        .unwrap_or(0);
     // The address the end of the file maps to if the image's difference holds.
     let past_file_end = (elf.data().len() as u64).saturating_add(image_base_delta(elf));
     // Page-align upward (4 KiB pages)
-    (max_end.max(past_file_end) + 0xfff) & !0xfff
+    (image_end.max(past_file_end) + 0xfff) & !0xfff
 }
 
 /// Validate that the input ELF is a supported target:
@@ -486,21 +486,9 @@ pub fn cstr_at(strings: &[u8], offset: usize) -> Option<&str> {
 /// Convert a file offset to a virtual address in a parsed ELF.
 /// Returns None if the offset is not covered by any PT_LOAD segment.
 pub fn file_offset_to_va(elf: &ElfFile64<'_>, offset: u64) -> Option<u64> {
-    use object::read::elf::ProgramHeader;
-    let endian = elf.endian();
-    for seg in elf.elf_program_headers() {
-        let p_type = seg.p_type(endian);
-        if p_type != object::elf::PT_LOAD {
-            continue;
-        }
-        let p_offset = seg.p_offset(endian);
-        let p_filesz = seg.p_filesz(endian);
-        let p_vaddr = seg.p_vaddr(endian);
-        if offset >= p_offset && offset < p_offset + p_filesz {
-            return Some(offset - p_offset + p_vaddr);
-        }
-    }
-    None
+    pt_loads(elf)
+        .find(|seg| (seg.offset..seg.offset + seg.filesz).contains(&offset))
+        .map(|seg| offset - seg.offset + seg.vaddr)
 }
 
 #[cfg(test)]
