@@ -353,7 +353,7 @@ fn print_merge_plan(
             .or_default()
             .symbols += 1;
     }
-    for au in plan.all_units() {
+    for au in &plan.units {
         let stats = per_lib.entry(au.unit.source_lib.as_path()).or_default();
         stats.units += 1;
         stats.bytes += au.unit.bytes.len();

@@ -14,7 +14,7 @@ use crate::types::{
 /// Plan the virtual address layout of all extracted units and trampolines,
 /// producing a `MergePlan` ready for relocation application.
 pub fn plan_layout(
-    mut units: Vec<ExtractedUnit>,
+    extracted: Vec<ExtractedUnit>,
     exe_elf: &object::read::elf::ElfFile64<'_>,
     imports: &[crate::types::ImportedSymbol],
     is_pie: bool,
@@ -30,7 +30,7 @@ pub fn plan_layout(
     let mut rodata: Vec<ExtractedUnit> = Vec::new();
     let mut data: Vec<ExtractedUnit> = Vec::new();
 
-    for unit in units.drain(..) {
+    for unit in extracted {
         match unit.section_kind {
             SectionKind::Text => text.push(unit),
             SectionKind::ReadOnlyData => rodata.push(unit),
@@ -65,7 +65,7 @@ pub fn plan_layout(
     // We need these to populate the trampoline stubs.
     let exe_got_vas = build_exe_got_map(exe_elf)?;
 
-    let text_units = assign_addresses(load_address, &mut offset, text);
+    let mut units: Vec<AssignedUnit> = assign_addresses(load_address, &mut offset, text);
 
     // Assign VA to each trampoline stub (14 bytes: FF 25 00 00 00 00 + 8 byte addr).
     //
@@ -119,14 +119,14 @@ pub fn plan_layout(
         "Read-only data units by mapping"
     );
 
-    let mut rodata_units = assign_addresses(load_address, &mut offset, const_rodata);
+    units.extend(assign_addresses(load_address, &mut offset, const_rodata));
 
     // End of the read-only run, for the same page-boundary reason.
     offset = align_up(offset, PAGE_SIZE);
     let rodata_end = offset;
 
-    rodata_units.extend(assign_addresses(load_address, &mut offset, rebased_rodata));
-    let data_units = assign_addresses(load_address, &mut offset, data);
+    units.extend(assign_addresses(load_address, &mut offset, rebased_rodata));
+    units.extend(assign_addresses(load_address, &mut offset, data));
 
     // Fresh GOT slots for the externals the executable does not already
     // import, plus the NewExternalSym records the writer turns into .dynsym
@@ -140,23 +140,31 @@ pub fn plan_layout(
         new_externals.push(NewExternalSym { name, got_vaddr });
     }
 
-    // Build GOT patches: one per imported symbol.
-    // The patch value is the assigned_vaddr of the corresponding extracted unit.
-    let unit_vaddr_by_name: HashMap<String, u64> = text_units
+    // Map (library, unit name) → assigned VA. The library is part of the key
+    // because a unit name on its own does not identify a unit: two merged
+    // libraries can each define a symbol of the same name, and so can a
+    // library and the anonymous units synthesized for another. Every lookup
+    // below knows which library it means — an import carries the library it
+    // was resolved from, an init/fini entry the library whose array it came
+    // out of — so nothing needs the ambiguous form.
+    let unit_vaddrs: HashMap<(&PathBuf, &str), u64> = units
         .iter()
-        .chain(&rodata_units)
-        .chain(&data_units)
-        .map(|au| (au.unit.name.clone(), au.assigned_vaddr))
+        .map(|au| ((&au.unit.source_lib, au.unit.name.as_str()), au.assigned_vaddr))
         .collect();
 
+    // Build GOT patches: one per imported symbol.
+    // The patch value is the assigned_vaddr of the corresponding extracted unit.
     let mut got_patches: Vec<GotPatch> = Vec::new();
     for imp in imports {
-        let vaddr = unit_vaddr_by_name.get(&imp.name).with_context(|| {
-            format!(
-                "imported symbol '{}' was not extracted — internal error",
-                imp.name
-            )
-        })?;
+        let vaddr = unit_vaddrs
+            .get(&(&imp.source_library, imp.name.as_str()))
+            .with_context(|| {
+                format!(
+                    "imported symbol '{}' was not extracted from {} — internal error",
+                    imp.name,
+                    imp.source_library.display()
+                )
+            })?;
         let got_vaddr = file_offset_to_va(exe_elf, imp.got_file_offset).with_context(|| {
             format!(
                 "GOT file offset 0x{:x} for '{}' is not in any PT_LOAD segment",
@@ -170,22 +178,13 @@ pub fn plan_layout(
         });
     }
 
-    // Map (library, unit name) → assigned VA so init/fini entries can be
-    // resolved unambiguously even if two libraries define same-named locals.
-    let unit_vaddr_by_lib_name: HashMap<(&PathBuf, &str), u64> = text_units
-        .iter()
-        .chain(&rodata_units)
-        .chain(&data_units)
-        .map(|au| ((&au.unit.source_lib, au.unit.name.as_str()), au.assigned_vaddr))
-        .collect();
-
     // Plan init/fini arrays if there are any entries to merge
     let init_fini_plan = plan_init_fini_arrays(
         exe_elf,
         &init_fini,
         &exe_init_fini,
         lib_order,
-        &unit_vaddr_by_lib_name,
+        &unit_vaddrs,
         load_address,
         &mut offset,
     )?;
@@ -196,10 +195,8 @@ pub fn plan_layout(
     let writable_end = offset;
 
     // Resolve copied-GOT-slot fixups now that every unit has an assigned VA.
-    let unit_vaddr_by_id: HashMap<crate::types::UnitId, u64> = text_units
+    let unit_vaddr_by_id: HashMap<crate::types::UnitId, u64> = units
         .iter()
-        .chain(&rodata_units)
-        .chain(&data_units)
         .map(|au| (au.unit.id, au.assigned_vaddr))
         .collect();
     let mut got_imports = Vec::with_capacity(got_slot_fixups.len());
@@ -225,9 +222,7 @@ pub fn plan_layout(
         exec_size,
         rodata_end,
         writable_end,
-        text_units,
-        rodata_units,
-        data_units,
+        units,
         trampoline_stubs,
         got_patches,
         jump_slot_reloc_offsets: Vec::new(),
@@ -559,12 +554,17 @@ mod tests {
             au.assigned_vaddr >= start && au.assigned_vaddr + au.unit.bytes.len() as u64 <= end
         };
         let named = |name: &str| {
-            plan.all_units()
+            plan.units
+                .iter()
                 .find(|au| au.unit.name == name)
                 .unwrap_or_else(|| panic!("unit '{name}' is missing from the plan"))
         };
 
-        for au in &plan.text_units {
+        for au in plan
+            .units
+            .iter()
+            .filter(|au| au.unit.section_kind == SectionKind::Text)
+        {
             assert!(
                 within(au, plan.load_address, code_end),
                 "text unit '{}' is not inside the executable run",
@@ -621,7 +621,8 @@ mod tests {
         let plan = plan_for(units, false);
 
         let au = plan
-            .all_units()
+            .units
+            .iter()
             .find(|au| au.unit.name == "ro_rebased")
             .expect("the rodata unit");
         assert!(

@@ -16,7 +16,7 @@ pub fn build_merged_segment(plan: &mut MergePlan) -> Result<Vec<u8>> {
     let size = plan.segment_size();
     let mut seg = vec![0u8; size];
 
-    for au in plan.all_units() {
+    for au in &plan.units {
         let off = (au.assigned_vaddr - plan.load_address) as usize;
         let end = off + au.unit.bytes.len();
         if end > seg.len() {
@@ -1055,9 +1055,7 @@ mod runtime_write_tests {
             exec_size: EXEC_END - LOAD,
             rodata_end: RODATA_END - LOAD,
             writable_end: WRITABLE_END - LOAD,
-            text_units: Vec::new(),
-            rodata_units: Vec::new(),
-            data_units: Vec::new(),
+            units: Vec::new(),
             trampoline_stubs: Vec::new(),
             got_patches: Vec::new(),
             jump_slot_reloc_offsets: Vec::new(),

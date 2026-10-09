@@ -14,7 +14,8 @@ pub fn apply_all_relocations(plan: &mut MergePlan) -> Result<()> {
     // Collect the lookup tables we need before borrowing plan mutably for iteration.
     // (unit_id → vaddr, trampoline_name → vaddr)
     let id_to_vaddr: std::collections::HashMap<crate::types::UnitId, u64> = plan
-        .all_units()
+        .units
+        .iter()
         .map(|au| (au.unit.id, au.assigned_vaddr))
         .collect();
 
@@ -26,7 +27,7 @@ pub fn apply_all_relocations(plan: &mut MergePlan) -> Result<()> {
 
     let is_pie = plan.is_pie;
     let mut new_relative: Vec<RelativeReloc> = Vec::new();
-    for au in plan.all_units_mut() {
+    for au in &mut plan.units {
         apply_unit_relocations(au, &id_to_vaddr, &tramp_to_vaddr, is_pie, &mut new_relative)
             .with_context(|| format!("applying relocations to '{}'", au.unit.name))?;
     }
