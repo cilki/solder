@@ -1187,10 +1187,12 @@ mod section_header_tests {
             unit(1, "ro_a", SectionKind::ReadOnlyData, 32, &[]),
             unit(2, "data_a", SectionKind::Data, 48, &[]),
         ];
+        let rela = crate::symbol_analysis::RelaTables::read(&exe).expect("test/grep .rela tables");
         let mut plan = plan_layout(
             units,
             &exe,
             &[],
+            &rela.got_slot_vas(),
             true,
             InitFiniArrays::default(),
             &[],

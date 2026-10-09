@@ -13,10 +13,16 @@ use crate::types::{
 
 /// Plan the virtual address layout of all extracted units and trampolines,
 /// producing a `MergePlan` ready for relocation application.
+///
+/// `exe_got_vas` maps an external symbol the executable already imports to the
+/// GOT slot ld.so resolves it into (see `RelaTables::got_slot_vas`); a
+/// trampoline for such a symbol reuses that slot instead of allocating one.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_layout(
     extracted: Vec<ExtractedUnit>,
     exe_elf: &object::read::elf::ElfFile64<'_>,
     imports: &[crate::types::ImportedSymbol],
+    exe_got_vas: &HashMap<String, u64>,
     is_pie: bool,
     init_fini: InitFiniArrays,
     lib_order: &[PathBuf],
@@ -59,10 +65,6 @@ pub fn plan_layout(
             }
         }
     }
-
-    // Build a map: external symbol name → GOT VA in the executable.
-    // We need these to populate the trampoline stubs.
-    let exe_got_vas = build_exe_got_map(exe_elf)?;
 
     let mut units: Vec<AssignedUnit> = assign_addresses(load_address, &mut offset, text);
 
@@ -274,42 +276,6 @@ pub fn align_up(value: u64, align: u64) -> u64 {
     (value + align - 1) & !(align - 1)
 }
 
-/// Build a map from symbol name → GOT virtual address for all JUMP_SLOT and GLOB_DAT
-/// relocations in the executable.  This is how we find the GOT slot VA for external
-/// symbols that merged library code calls through (we'll create trampolines that
-/// jump to these GOT slots at load time after ld.so fills them).
-fn build_exe_got_map(elf: &object::read::elf::ElfFile64<'_>) -> Result<HashMap<String, u64>> {
-    let bytes = elf.data();
-    let goblin_exe = goblin::elf::Elf::parse(bytes).context("goblin for GOT map")?;
-
-    let dynidx_to_name: HashMap<usize, String> = goblin_exe
-        .dynsyms
-        .iter()
-        .enumerate()
-        .filter_map(|(i, sym)| {
-            goblin_exe
-                .dynstrtab
-                .get_at(sym.st_name)
-                .map(|n| (i, n.to_owned()))
-        })
-        .collect();
-
-    let mut map: HashMap<String, u64> = HashMap::new();
-
-    for rela in goblin_exe
-        .pltrelocs
-        .iter()
-        .chain(goblin_exe.dynrelas.iter())
-    {
-        let sym_idx = rela.r_sym;
-        if let Some(name) = dynidx_to_name.get(&sym_idx) {
-            map.entry(name.clone()).or_insert(rela.r_offset);
-        }
-    }
-
-    Ok(map)
-}
-
 /// Plan the preinit array (merged constructors) and combined fini array for
 /// the merged segment. See `InitFiniPlan` for why constructors go into
 /// DT_PREINIT_ARRAY rather than the executable's init_array: both run library
@@ -487,10 +453,12 @@ mod tests {
         let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep"));
         let mapped = MappedElf::open(path).expect("open test/grep");
         let exe = mapped.parse().expect("parse test/grep");
+        let rela = crate::symbol_analysis::RelaTables::read(&exe).expect("test/grep .rela tables");
         plan_layout(
             units,
             &exe,
             &[],
+            &rela.got_slot_vas(),
             is_pie,
             InitFiniArrays::default(),
             &[],

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -196,6 +196,7 @@ fn validate_merge_filter(needed: &[String], filter: &[String]) -> Result<()> {
 
 pub fn collect_imports(
     elf: &ElfFile64<'_>,
+    rela: &RelaTables,
     dyn_info: &DynamicInfo,
     ldso_cache: &LdsoCache,
     extra_lib_paths: &[PathBuf],
@@ -252,7 +253,7 @@ pub fn collect_imports(
     let mut imports: Vec<ImportedSymbol> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    for (entry, kind) in RelaTables::read(elf)?.imports() {
+    for (entry, kind) in rela.imports() {
         // A symbol no mergeable library provides is external (glibc etc.).
         let Some(source_library) = sym_to_lib.get(&entry.symbol) else {
             continue;
@@ -305,7 +306,12 @@ struct RelaEntry {
 /// parsed relocation list because every caller needs an entry's *file offset*,
 /// which a parsed relocation does not carry. A missing section is an empty
 /// table.
-struct RelaTables {
+///
+/// Read once, by the caller that drives the merge, and shared: four stages want
+/// something out of these two tables, and each one used to decode them again
+/// from scratch — three through this type and a fourth (the trampoline GOT map,
+/// now [`RelaTables::got_slot_vas`]) through its own copy of the walk.
+pub struct RelaTables {
     /// `.rela.plt`, which holds nothing but JUMP_SLOTs.
     jump_slot: Vec<RelaEntry>,
     /// `.rela.dyn`, which mixes GLOB_DAT with RELATIVE, COPY and TLS entries.
@@ -313,7 +319,7 @@ struct RelaTables {
 }
 
 impl RelaTables {
-    fn read(elf: &ElfFile64<'_>) -> Result<Self> {
+    pub fn read(elf: &ElfFile64<'_>) -> Result<Self> {
         // Relocation symbol indices address .dynsym, so resolve them there.
         let goblin_elf =
             goblin::elf::Elf::parse(elf.data()).context("goblin parse of executable")?;
@@ -347,6 +353,28 @@ impl RelaTables {
                 self.dynamic_of_type(R_X86_64_GLOB_DAT)
                     .map(|e| (e, ImportKind::GlobDat)),
             )
+    }
+
+    /// Symbol name → the virtual address of the GOT slot ld.so resolves it
+    /// into, for every symbol the executable already imports.
+    ///
+    /// This is how `layout` finds a slot for a trampoline to `jmp` through: the
+    /// merged code calls an external symbol by jumping to a stub that reads the
+    /// function pointer out of such a slot, so an external the executable
+    /// already imports needs no new slot of its own.
+    ///
+    /// Only the import entries qualify. A `.rela.dyn` entry of any other type
+    /// also names a symbol, but its `r_offset` is not a slot holding that
+    /// symbol's address — a `COPY` points at the executable's own `.bss` copy
+    /// of the data, a TLS entry at a module/offset pair — so a trampoline
+    /// jumping through one would land wherever those bytes happen to lead.
+    pub fn got_slot_vas(&self) -> HashMap<String, u64> {
+        let mut map: HashMap<String, u64> = HashMap::new();
+        for (entry, _) in self.imports() {
+            map.entry(entry.symbol.clone())
+                .or_insert(entry.target_vaddr);
+        }
+        map
     }
 }
 
@@ -498,14 +526,13 @@ pub fn inherited_needed<'a>(
 ///
 /// JUMP_SLOT relocations are in .rela.plt, GLOB_DAT relocations are in .rela.dyn.
 pub fn find_jump_slot_reloc_offsets(
-    elf: &ElfFile64<'_>,
+    rela: &RelaTables,
     imported_names: &HashSet<String>,
-) -> Result<Vec<u64>> {
-    Ok(RelaTables::read(elf)?
-        .imports()
+) -> Vec<u64> {
+    rela.imports()
         .filter(|(entry, _)| imported_names.contains(&entry.symbol))
         .map(|(entry, _)| entry.r_info_offset)
-        .collect())
+        .collect()
 }
 
 /// Find the file offsets of R_X86_64_COPY relocations in `.rela.dyn` whose symbol
@@ -517,16 +544,15 @@ pub fn find_jump_slot_reloc_offsets(
 /// reserves the storage in its own `.bss`, so neutralizing the relocation is
 /// sufficient for the common case where the source value is zero-initialized.
 pub fn find_copy_reloc_offsets(
-    elf: &ElfFile64<'_>,
+    rela: &RelaTables,
     removed_provided_syms: &HashSet<String>,
-) -> Result<Vec<(u64, String)>> {
+) -> Vec<(u64, String)> {
     use goblin::elf64::reloc::R_X86_64_COPY;
 
-    Ok(RelaTables::read(elf)?
-        .dynamic_of_type(R_X86_64_COPY)
+    rela.dynamic_of_type(R_X86_64_COPY)
         .filter(|e| removed_provided_syms.contains(&e.symbol))
         .map(|e| (e.r_info_offset, e.symbol.clone()))
-        .collect())
+        .collect()
 }
 
 /// Whether the named defined symbol in `lib_path` is zero-initialized — either
