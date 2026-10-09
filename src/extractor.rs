@@ -1449,15 +1449,9 @@ fn find_section_for_address(
 
 /// Whether one `PT_LOAD` segment covers both addresses.
 fn loaded_together(elf: &object::read::elf::ElfFile64<'_>, a: u64, b: u64) -> bool {
-    use object::read::elf::ProgramHeader;
-    let endian = elf.endian();
-    elf.elf_program_headers().iter().any(|seg| {
-        if seg.p_type(endian) != object::elf::PT_LOAD {
-            return false;
-        }
-        let start = seg.p_vaddr(endian);
-        let end = start + seg.p_memsz(endian);
-        (start..=end).contains(&a) && (start..=end).contains(&b)
+    crate::elf_reader::pt_loads(elf).any(|seg| {
+        let mapped = seg.vaddr..=seg.vaddr + seg.memsz;
+        mapped.contains(&a) && mapped.contains(&b)
     })
 }
 
