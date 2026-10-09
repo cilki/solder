@@ -16,15 +16,6 @@ pub struct InitFiniArrays {
     pub fini_entries: Vec<InitFiniEntry>,
 }
 
-/// Info about the executable's existing init/fini arrays.
-#[derive(Debug, Clone, Default)]
-pub struct ExeInitFiniInfo {
-    pub preinit_array_vaddr: Option<u64>,
-    pub preinit_array_size: u64,
-    pub fini_array_vaddr: Option<u64>,
-    pub fini_array_size: u64,
-}
-
 /// Plan for running merged library constructors/destructors.
 ///
 /// Constructor timing is subtle: glibc runs shared library constructors in
@@ -43,17 +34,74 @@ pub struct ExeInitFiniInfo {
 /// dependencies).
 #[derive(Debug, Clone)]
 pub struct InitFiniPlan {
-    /// VA of the preinit array in the merged segment. Entries: the exe's
-    /// existing preinit entries first, then merged library constructors in
-    /// dependency order. Empty when no library constructors are merged.
-    pub preinit_vaddr: u64,
-    pub preinit_entries: Vec<u64>,
-    /// VA of the new combined fini_array in the merged segment. Entries:
-    /// merged library destructors in dependency order (original array order
-    /// within each library), then the exe's original entries. Empty when no
-    /// library destructors are merged.
-    pub combined_fini_vaddr: u64,
-    pub combined_fini_entries: Vec<u64>,
+    /// The preinit array. Entries: the exe's existing preinit entries first,
+    /// then merged library constructors in dependency order. Empty when no
+    /// library constructors are merged.
+    pub preinit: MergedArray,
+    /// The combined fini_array. Entries: merged library destructors in
+    /// dependency order (original array order within each library), then the
+    /// exe's original entries. Empty when no library destructors are merged.
+    pub fini: MergedArray,
+}
+
+impl InitFiniPlan {
+    /// Both arrays, each tagged with which one it is. Laying an array out,
+    /// writing its pointers into the merged segment and repointing `.dynamic`
+    /// at it is the same work either way, so each of those is done once over
+    /// this list instead of once per array.
+    pub fn arrays(&self) -> [(InitFiniKind, &MergedArray); 2] {
+        [
+            (InitFiniKind::Preinit, &self.preinit),
+            (InitFiniKind::Fini, &self.fini),
+        ]
+    }
+}
+
+/// Which of an [`InitFiniPlan`]'s two arrays a [`MergedArray`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitFiniKind {
+    Preinit,
+    Fini,
+}
+
+impl InitFiniKind {
+    /// The `DT_*` pair giving the array's address and its size in bytes. The
+    /// same pair is read out of the executable (for the entries the merge has
+    /// to keep running) and written back (pointing at the rebuilt array), so
+    /// it is spelled out once here.
+    pub fn dynamic_tags(self) -> (u64, u64) {
+        use goblin::elf::dynamic::{
+            DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ,
+        };
+        match self {
+            Self::Preinit => (DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ),
+            Self::Fini => (DT_FINI_ARRAY, DT_FINI_ARRAYSZ),
+        }
+    }
+
+    /// How the array is named in diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Preinit => "preinit array",
+            Self::Fini => "fini array",
+        }
+    }
+}
+
+/// A function-pointer array laid out in the merged segment.
+#[derive(Debug, Clone)]
+pub struct MergedArray {
+    /// VA of the array in the merged segment.
+    pub vaddr: u64,
+    /// The function pointers, in the order the loader will read them.
+    pub entries: Vec<u64>,
+}
+
+impl MergedArray {
+    /// Size in bytes, for the matching `DT_*_ARRAYSZ`.
+    pub fn size(&self) -> u64 {
+        (self.entries.len() * 8) as u64
+    }
 }
 
 /// A runtime relocation (R_X86_64_RELATIVE) to be added to .rela.dyn for PIE executables.
