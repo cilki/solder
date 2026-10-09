@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use elf_reader::MappedElf;
 use lib_discovery::{LdsoCache, resolve_library};
-use symbol_analysis::{collect_imports, parse_dynamic};
+use symbol_analysis::{RelaTables, collect_imports, parse_dynamic};
 
 #[derive(Parser)]
 #[command(
@@ -100,8 +100,15 @@ fn run() -> Result<()> {
 
     let ldso_cache = LdsoCache::load();
 
+    // The executable's `.rela.plt` and `.rela.dyn`, decoded once: which symbols
+    // it imports and through which GOT slot, which JUMP_SLOT and COPY entries
+    // the patcher has to neutralize, and which slots a trampoline can reuse all
+    // come out of these two tables.
+    let rela = RelaTables::read(&exe_elf).context("reading the executable's .rela tables")?;
+
     let import_info = collect_imports(
         &exe_elf,
+        &rela,
         &dyn_info,
         &ldso_cache,
         &library_path,
@@ -164,6 +171,7 @@ fn run() -> Result<()> {
         units,
         &exe_elf,
         imports,
+        &rela.got_slot_vas(),
         is_pie,
         init_fini,
         &lib_order,
@@ -265,8 +273,7 @@ fn run() -> Result<()> {
     // Find JUMP_SLOT reloc file offsets for the merged symbols.
     let merged_names: HashSet<String> = imports.iter().map(|i| i.name.clone()).collect();
     plan.jump_slot_reloc_offsets =
-        symbol_analysis::find_jump_slot_reloc_offsets(&exe_elf, &merged_names)
-            .context("finding JUMP_SLOT reloc offsets")?;
+        symbol_analysis::find_jump_slot_reloc_offsets(&rela, &merged_names);
 
     // Neutralize copy relocations for data symbols exported by a library we are
     // removing (e.g. ncurses' UP/PC/BC). Only symbols a library we are dropping
@@ -279,8 +286,7 @@ fn run() -> Result<()> {
         .filter(|(_, lib)| removed_libs.contains(lib.as_path()))
         .map(|(name, _)| name.clone())
         .collect();
-    let copy_relocs = symbol_analysis::find_copy_reloc_offsets(&exe_elf, &removed_provided_syms)
-        .context("finding COPY reloc offsets")?;
+    let copy_relocs = symbol_analysis::find_copy_reloc_offsets(&rela, &removed_provided_syms);
     for (off, name) in copy_relocs {
         if let Some(lib) = merged_lib_syms.get(&name)
             && !symbol_analysis::symbol_is_zero_initialized(lib, &name)?
