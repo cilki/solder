@@ -157,8 +157,7 @@ fn run() -> Result<()> {
     // The libraries that actually gave up a symbol, in DT_NEEDED order, which
     // is also exactly the set whose sonames the merge removes.
     let absorbed: Vec<&symbol_analysis::MergedLibrary> = import_info.absorbed_libraries().collect();
-    let merged_libs: Vec<PathBuf> = absorbed.iter().map(|lib| lib.path.clone()).collect();
-    let lib_order = dep_graph::topological_order(&merged_libs)?;
+    let lib_order = dep_graph::topological_order(&absorbed)?;
 
     // ── Step 3: layout planning ───────────────────────────────────────────────
     let mut plan = layout::plan_layout(
@@ -211,21 +210,16 @@ fn run() -> Result<()> {
             .chain(plan.got_imports.iter().map(|g| g.name.clone()))
             .collect();
 
-        let mut merged_lib_deps = Vec::with_capacity(merged_libs.len());
         // `$ORIGIN` in a path-valued DT_NEEDED entry means the directory of the
         // object that declared it, so a dependency of a merged library resolves
         // against that library's directory rather than the executable's.
-        let mut dep_origin: HashMap<String, PathBuf> = HashMap::new();
-        for lib in &merged_libs {
-            let deps = dep_graph::parse_dt_needed(lib)?;
-            if let Some(dir) = lib.parent() {
-                for dep in &deps {
-                    dep_origin
-                        .entry(dep.clone())
-                        .or_insert_with(|| dir.to_path_buf());
+        let mut dep_origin: HashMap<&str, &std::path::Path> = HashMap::new();
+        for lib in &absorbed {
+            if let Some(dir) = lib.path.parent() {
+                for dep in &lib.needed {
+                    dep_origin.entry(dep.as_str()).or_insert(dir);
                 }
             }
-            merged_lib_deps.push(deps);
         }
 
         let mut search_rpath = dyn_info.search_rpath().to_vec();
@@ -233,7 +227,7 @@ fn run() -> Result<()> {
         let mut resolve_exports = |soname: &str| {
             let origin = dep_origin
                 .get(soname)
-                .map(PathBuf::as_path)
+                .copied()
                 .unwrap_or(dyn_info.origin.as_path());
             resolve_library(
                 soname,
@@ -242,12 +236,15 @@ fn run() -> Result<()> {
                 &ldso_cache,
                 origin,
             )
-            .and_then(|path| symbol_analysis::exported_symbols(&path))
+            .and_then(|path| symbol_analysis::read_library_dynamic(&path))
+            .map(|lib| lib.defined)
             .ok()
         };
 
         symbol_analysis::inherited_needed(
-            &merged_lib_deps,
+            absorbed
+                .iter()
+                .flat_map(|lib| lib.needed.iter().map(String::as_str)),
             &dyn_info.needed,
             &plan.remove_needed,
             &injected,
