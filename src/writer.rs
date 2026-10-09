@@ -134,9 +134,11 @@ pub fn write_output(
     // Read .dynamic from the ORIGINAL exe before we modify headers.
     let dynamic = DynamicTable::parse(patched_exe).context("reading .dynamic for output")?;
 
-    // Collect existing program headers.
-    let old_phdrs: Vec<object::elf::ProgramHeader64<object::Endianness>> =
-        exe.elf_program_headers().to_vec();
+    // The existing program headers, as the parsed entries and as the bytes
+    // they were parsed from — both are wanted below, and `bytes_of_slice` is
+    // the one view of the other.
+    let old_phdrs = exe.elf_program_headers();
+    let old_pht = object::bytes_of_slice(old_phdrs);
     let phdr_entry_size = std::mem::size_of::<object::elf::ProgramHeader64<object::Endianness>>();
 
     // File offset where the merged segment will start. It is pinned to
@@ -223,23 +225,21 @@ pub fn write_output(
     // Build the new PHT at its location within the segment.
     let pht_start = pht_file_offset as usize;
 
-    // Copy old entries, updating PT_PHDR to point to the new PHT location.
-    let mut written = 0usize;
-    for phdr in &old_phdrs {
-        let dst = pht_start + written;
-        let entry_bytes: &[u8] = as_bytes(phdr);
-        out[dst..dst + phdr_entry_size].copy_from_slice(entry_bytes);
+    // The old entries go over byte for byte; only PT_PHDR changes, to describe
+    // the table in its new home.
+    out[pht_start..pht_start + old_pht.len()].copy_from_slice(old_pht);
+    let mut written = old_pht.len();
 
-        // Update PT_PHDR to point to the new PHT location
-        if phdr.p_type(endian) == PT_PHDR {
-            write_u64_le(&mut out, dst + 8, pht_file_offset); // p_offset
-            write_u64_le(&mut out, dst + 16, pht_vaddr); // p_vaddr
-            write_u64_le(&mut out, dst + 24, pht_vaddr); // p_paddr
-            write_u64_le(&mut out, dst + 32, pht_size); // p_filesz
-            write_u64_le(&mut out, dst + 40, pht_size); // p_memsz
-        }
-
-        written += phdr_entry_size;
+    if let Some(i) = old_phdrs
+        .iter()
+        .position(|phdr| phdr.p_type(endian) == PT_PHDR)
+    {
+        let dst = pht_start + i * phdr_entry_size;
+        write_u64_le(&mut out, dst + 8, pht_file_offset); // p_offset
+        write_u64_le(&mut out, dst + 16, pht_vaddr); // p_vaddr
+        write_u64_le(&mut out, dst + 24, pht_vaddr); // p_paddr
+        write_u64_le(&mut out, dst + 32, pht_size); // p_filesz
+        write_u64_le(&mut out, dst + 40, pht_size); // p_memsz
     }
 
     // Write one PT_LOAD per mapping of the merged region. The last one runs to
@@ -527,11 +527,6 @@ fn check_runtime_writes_are_writable(plan: &MergePlan) -> Result<()> {
     }
 
     Ok(())
-}
-
-// Helper: view a value as bytes.
-fn as_bytes<T: Sized>(val: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(val as *const T as *const u8, std::mem::size_of::<T>()) }
 }
 
 fn write_u64_le(buf: &mut [u8], offset: usize, val: u64) {
