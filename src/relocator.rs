@@ -131,9 +131,12 @@ pub fn apply_one_reloc(
     // the values its field can hold — `None` for a 64-bit field, which holds
     // anything the formula can produce.
     let (name, note, pc_relative, field_range) = match (kind, size) {
-        // R_X86_64_64. `Unknown` covers the RELATIVE/GLOB_DAT entries lifted
-        // out of a library's own .rela.dyn, which the `object` crate does not
-        // name but which are absolute 64-bit slots all the same.
+        // R_X86_64_64. `Unknown` covers the RELATIVE/GLOB_DAT/JUMP_SLOT entries
+        // lifted out of a library's own .rela.dyn, which the `object` crate
+        // does not name but which are absolute 64-bit slots all the same. It is
+        // `extractor::reject_unliftable_dynamic_reloc` that keeps the other
+        // unnamed types — the TLS family, IRELATIVE, SIZE64 — from arriving
+        // here and being patched as if they were addresses.
         (Absolute | Unknown, 64) => ("R_X86_64_64", "", false, None),
         // R_X86_64_32S is sign-extended, R_X86_64_32 unsigned — the one place
         // the encoding rather than the kind and width picks the form.

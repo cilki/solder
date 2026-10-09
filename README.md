@@ -239,6 +239,12 @@ libraries and leave that one dynamic, or relink against a soname.
 - A copy-relocated data symbol (`R_X86_64_COPY`) coming from a library we're
   removing has to be zero-initialized, since its initial value currently can't
   be carried over
+- We can't merge a library that uses thread-local storage, or one that defines
+  an ifunc that extracted code reaches. Both are dynamic relocations whose slot
+  is not an address — a TLS slot holds a module id or an offset from the thread
+  pointer, and an `R_X86_64_IRELATIVE` slot holds the address of a resolver
+  only `ld.so` can call — so there is nothing the merge can write into them.
+  `solder` refuses the merge when one turns up inside extracted code or data
 - Merged code carries no unwind information. A library's `.eh_frame` is read
   during extraction — it is how a function's exact bounds are recovered when
   the symbol table records no size for it — but none of it is written back

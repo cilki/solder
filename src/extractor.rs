@@ -333,6 +333,133 @@ fn reject_got_reloc(
     Ok(())
 }
 
+/// The `r_type` of a relocation the `object` crate read out of an ELF file.
+fn elf_r_type(reloc: &object::Relocation) -> Option<u32> {
+    match reloc.flags() {
+        object::RelocationFlags::Elf { r_type } => Some(r_type.0),
+        _ => None,
+    }
+}
+
+/// The x86-64 name of a dynamic relocation type solder cannot lift, and what
+/// the loader was supposed to put in its slot.
+fn describe_unliftable_reloc(r_type: u32) -> (String, &'static str) {
+    use object::elf::{
+        R_X86_64_COPY, R_X86_64_DTPMOD64, R_X86_64_DTPOFF32, R_X86_64_DTPOFF64,
+        R_X86_64_GOTPC32_TLSDESC, R_X86_64_GOTTPOFF, R_X86_64_IRELATIVE, R_X86_64_SIZE32,
+        R_X86_64_SIZE64, R_X86_64_TLSDESC, R_X86_64_TLSDESC_CALL, R_X86_64_TLSGD, R_X86_64_TLSLD,
+        R_X86_64_TPOFF32, R_X86_64_TPOFF64,
+    };
+
+    const TLS: &str = ": the slot holds a module id or an offset from the thread \
+                       pointer, not an address. Merging a library that uses \
+                       thread-local storage needs its PT_TLS block merged into the \
+                       executable's and an offset assigned in it, which solder does \
+                       not do yet — exclude this library from the merge";
+    const IFUNC: &str = ": the slot holds the address of an ifunc resolver that only \
+                         ld.so can call, and what belongs in it is whatever that \
+                         resolver returns — exclude this library from the merge";
+    const SIZE: &str = ": the slot holds the symbol's size, not its address";
+    const COPY: &str = ": a copy relocation only appears in an executable, never in a \
+                         shared library";
+
+    let named: &[(u32, &str, &str)] = &[
+        (R_X86_64_DTPMOD64.0, "R_X86_64_DTPMOD64", TLS),
+        (R_X86_64_DTPOFF64.0, "R_X86_64_DTPOFF64", TLS),
+        (R_X86_64_TPOFF64.0, "R_X86_64_TPOFF64", TLS),
+        (R_X86_64_TLSGD.0, "R_X86_64_TLSGD", TLS),
+        (R_X86_64_TLSLD.0, "R_X86_64_TLSLD", TLS),
+        (R_X86_64_DTPOFF32.0, "R_X86_64_DTPOFF32", TLS),
+        (R_X86_64_GOTTPOFF.0, "R_X86_64_GOTTPOFF", TLS),
+        (R_X86_64_TPOFF32.0, "R_X86_64_TPOFF32", TLS),
+        (R_X86_64_GOTPC32_TLSDESC.0, "R_X86_64_GOTPC32_TLSDESC", TLS),
+        (R_X86_64_TLSDESC_CALL.0, "R_X86_64_TLSDESC_CALL", TLS),
+        (R_X86_64_TLSDESC.0, "R_X86_64_TLSDESC", TLS),
+        (R_X86_64_IRELATIVE.0, "R_X86_64_IRELATIVE", IFUNC),
+        (R_X86_64_SIZE32.0, "R_X86_64_SIZE32", SIZE),
+        (R_X86_64_SIZE64.0, "R_X86_64_SIZE64", SIZE),
+        (R_X86_64_COPY.0, "R_X86_64_COPY", COPY),
+    ];
+
+    named
+        .iter()
+        .find(|(t, ..)| *t == r_type)
+        .map(|(_, name, note)| ((*name).to_string(), *note))
+        .unwrap_or_else(|| (format!("relocation type {r_type}"), ""))
+}
+
+/// Refuse a dynamic relocation whose slot is not something solder can fill in
+/// by writing `S + A` into eight bytes.
+///
+/// Everything lifted out of a library's `.rela.dyn`/`.rela.plt` ends up in
+/// `relocator::apply_one_reloc`, which computes `S + A` and truncates it into
+/// the field. For `R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT` and
+/// `R_X86_64_RELATIVE` that is exactly right — all three name a 64-bit slot
+/// holding the target's address, which is why `collect_dynamic_range_relocs`
+/// forces their reported width to 64 bits.
+///
+/// The catch is that the `object` crate's x86-64 table names none of those
+/// three, so they arrive as `RelocationKind::Unknown` with a reported size of
+/// 0 — and so does every *other* dynamic relocation type, none of which is a
+/// pointer slot. Widening those to 64 bits as well made the relocator patch
+/// them as `R_X86_64_64`, silently and with no diagnostic:
+///
+///   * a TLS slot (`R_X86_64_DTPMOD64`/`DTPOFF64`/`TPOFF64`, or a `TLSDESC`
+///     pair) received a link-time address where ld.so was meant to store a
+///     module id or an offset from the thread pointer. The merged code then
+///     indexed `%fs` by that address, so the first access to the thread-local
+///     read or wrote whatever happened to be that far from the thread
+///     pointer.
+///   * an `R_X86_64_IRELATIVE` slot received the address of the ifunc
+///     *resolver* rather than the implementation the resolver picks, so every
+///     indirect call through it called the resolver in its place — a call that
+///     returns a function pointer where the caller expects the function's own
+///     result.
+///
+/// Neither is a matter of patching the slot differently: TLS needs the
+/// library's `PT_TLS` block merged into the executable's, and `IRELATIVE`
+/// needs ld.so to run the resolver. Failing the merge keeps the problem at
+/// merge time instead of turning it into a wild access in the merged binary.
+///
+/// `ctx` names the symbol or section being extracted.
+fn reject_unliftable_dynamic_reloc(
+    kind: object::RelocationKind,
+    r_type: Option<u32>,
+    ctx: &str,
+    lib: &Path,
+) -> Result<()> {
+    use object::elf::{R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE};
+
+    // Anything the `object` crate does name carries a real kind and width, and
+    // `apply_one_reloc` either implements that form or rejects it by name.
+    if kind != object::RelocationKind::Unknown {
+        return Ok(());
+    }
+    // A non-ELF relocation cannot reach here; solder only reads ELF.
+    let Some(r_type) = r_type else {
+        return Ok(());
+    };
+    if [
+        R_X86_64_GLOB_DAT.0,
+        R_X86_64_JUMP_SLOT.0,
+        R_X86_64_RELATIVE.0,
+    ]
+    .contains(&r_type)
+    {
+        return Ok(());
+    }
+
+    let (name, note) = describe_unliftable_reloc(r_type);
+    bail!(
+        "'{}' in {}: {} is not a 64-bit pointer slot, so the merged copy cannot \
+         reproduce it{}",
+        ctx,
+        lib.display(),
+        name,
+        note
+    )
+}
+
 /// Process a single symbol: extract its bytes, parse its relocations, and
 /// return new symbols to enqueue.
 fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet<UnitKey>> {
@@ -1532,6 +1659,7 @@ fn collect_dynamic_range_relocs(
         let kind = reloc.kind();
         let encoding = reloc.encoding();
         reject_got_reloc(kind, encoding, ctx, lib)?;
+        reject_unliftable_dynamic_reloc(kind, elf_r_type(&reloc), ctx, lib)?;
 
         // Resolve the relocation target symbol. Dynamic relocation symbol
         // indices refer to .dynsym, not .symtab.
@@ -1626,8 +1754,11 @@ fn collect_dynamic_range_relocs(
             }
         };
 
-        // For RELATIVE relocations, the size might be reported as 0 by the object crate
-        // but we know it's always 64 bits (8 bytes) for R_X86_64_RELATIVE
+        // The `object` crate does not name R_X86_64_RELATIVE/GLOB_DAT/JUMP_SLOT
+        // and reports a size of 0 for them, but all three describe a 64-bit
+        // slot. `reject_unliftable_dynamic_reloc` above is what makes widening
+        // the 0 sound: it is the only reason the unnamed types reaching here
+        // are those three and not, say, a TLS offset.
         let reloc_size = if reloc.size() == 0 { 64 } else { reloc.size() };
 
         relocations.push(ExtractedReloc {
@@ -2006,6 +2137,109 @@ mod tests {
                 "slot {offset:#x} resolved to {:?}",
                 reloc.target
             );
+        }
+    }
+
+    /// `test/libs/libtinfo.so.6` with the first `.rela.dyn` entry inside
+    /// `strnames` retyped to `r_type`, written to a temporary file.
+    ///
+    /// No committed fixture uses thread-local storage or an ifunc, and both
+    /// show up in a library's dynamic relocation table as nothing but an
+    /// `r_type` — so retyping one entry of a table solder is known to extract
+    /// reproduces exactly the input that used to be patched as a pointer.
+    fn lib_with_retyped_strnames_reloc(r_type: u32) -> tempfile::NamedTempFile {
+        use object::read::elf::SectionHeader;
+
+        let mut bytes = std::fs::read(test_lib("libtinfo.so.6")).expect("read libtinfo.so.6");
+        let entry_offset = {
+            let elf = parse_lib(&bytes);
+            let endian = elf.endian();
+            let sym = elf
+                .symbols()
+                .chain(elf.dynamic_symbols())
+                .find(|s| s.name() == Ok("strnames") && s.size() > 0)
+                .expect("strnames");
+            let range = sym.address()..sym.address() + sym.size();
+
+            elf.elf_section_table()
+                .iter()
+                .filter(|sec| sec.sh_type(endian) == object::elf::SHT_RELA)
+                .find_map(|sec| {
+                    let (relas, _) = sec.rela(endian, bytes.as_slice()).ok()??;
+                    let i = relas
+                        .iter()
+                        .position(|r| range.contains(&r.r_offset.get(endian)))?;
+                    // Elf64_Rela is r_offset(8) + r_info(8) + r_addend(8).
+                    Some(sec.sh_offset(endian) as usize + i * 24 + 8)
+                })
+                .expect("a .rela.dyn entry inside strnames")
+        };
+
+        // r_info is (r_sym << 32) | r_type, and the entry found above is an
+        // R_X86_64_RELATIVE with no symbol, so the whole field is the type.
+        bytes[entry_offset..entry_offset + 8].copy_from_slice(&u64::from(r_type).to_le_bytes());
+
+        let out = tempfile::Builder::new()
+            .suffix(".so.6")
+            .tempfile()
+            .expect("temp library");
+        std::fs::write(out.path(), &bytes).expect("write the retyped library");
+        out
+    }
+
+    /// A relocation type that is not a 64-bit pointer slot has to fail the
+    /// merge rather than be patched as if it were an address.
+    ///
+    /// The `object` crate names none of x86-64's dynamic relocation types, so
+    /// a TLS slot and an ifunc slot reach the extractor looking exactly like
+    /// the `R_X86_64_RELATIVE` entries it does lift — `RelocationKind::Unknown`
+    /// with a reported size of 0. Widening that 0 to 64 bits turned both into
+    /// `R_X86_64_64`: the TLS slot got a link-time address where ld.so was to
+    /// store an offset from the thread pointer, so the merged code indexed
+    /// `%fs` by it, and the ifunc slot got the resolver's address instead of
+    /// the implementation it returns.
+    #[test]
+    fn a_relocation_that_is_not_a_pointer_slot_is_refused() {
+        for (r_type, expected) in [
+            (object::elf::R_X86_64_TPOFF64.0, "R_X86_64_TPOFF64"),
+            (object::elf::R_X86_64_DTPMOD64.0, "R_X86_64_DTPMOD64"),
+            (object::elf::R_X86_64_IRELATIVE.0, "R_X86_64_IRELATIVE"),
+        ] {
+            let lib = lib_with_retyped_strnames_reloc(r_type);
+            let key = UnitKey {
+                lib: lib.path().to_path_buf(),
+                sym: "strnames".to_string(),
+            };
+            let err = match process_symbol(&key, &mut test_state()) {
+                Err(e) => e,
+                Ok(_) => panic!("{expected} is not a pointer slot but extraction succeeded"),
+            };
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(expected),
+                "{expected} was not named in the error: {msg}"
+            );
+        }
+    }
+
+    /// The three types solder does lift are reported the same way as the ones
+    /// it refuses, so the gate has to let them through — including
+    /// `R_X86_64_JUMP_SLOT`, which `.rela.plt` is full of and which a copied
+    /// `.got.plt` range therefore runs into.
+    #[test]
+    fn the_pointer_slot_relocations_still_extract() {
+        for r_type in [
+            object::elf::R_X86_64_RELATIVE.0,
+            object::elf::R_X86_64_GLOB_DAT.0,
+            object::elf::R_X86_64_JUMP_SLOT.0,
+        ] {
+            let lib = lib_with_retyped_strnames_reloc(r_type);
+            let key = UnitKey {
+                lib: lib.path().to_path_buf(),
+                sym: "strnames".to_string(),
+            };
+            process_symbol(&key, &mut test_state())
+                .unwrap_or_else(|e| panic!("r_type {r_type} should still extract: {e:#}"));
         }
     }
 
