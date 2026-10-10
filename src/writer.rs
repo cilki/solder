@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::elf_reader::{
     DynamicTable, SH_ADDR, SH_ADDRALIGN, SH_FLAGS, SH_NAME, SH_OFFSET, SH_SIZE, SH_TYPE, SHDR_SIZE,
-    SectionTable, va_to_file_offset,
+    SectionTable, VER_NDX_GLOBAL, va_to_file_offset,
 };
 use crate::layout::align_up;
 use crate::types::{MergePlan, RelativeReloc};
@@ -656,8 +656,6 @@ const ST_INFO_GLOBAL_FUNC: u8 = (1 << 4) | 2;
 /// STB_WEAK | STT_FUNC — for injected symbols that may legitimately stay
 /// unresolved (their GOT slots then hold 0, which the code null-checks).
 const ST_INFO_WEAK_FUNC: u8 = (2 << 4) | 2;
-/// VER_NDX_GLOBAL — accept any version of the symbol.
-const VER_NDX_GLOBAL: u16 = 1;
 
 /// Build the merged segment with any extended sections appended. The result
 /// always covers the existing PIE-rela extension; when `plan.new_externals` is

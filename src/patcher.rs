@@ -3,7 +3,10 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use tracing::warn;
 
-use crate::elf_reader::{DYN_ENTRY_SIZE, DynamicTable, SectionTable};
+use crate::elf_reader::{
+    DYN_ENTRY_SIZE, DynamicTable, SH_ADDR, SH_INFO, SH_OFFSET, SH_SIZE, SHDR_SIZE, SectionTable,
+    VER_NDX_GLOBAL,
+};
 use crate::types::{MergePlan, RelativeReloc};
 
 /// Apply all in-place patches to a mutable copy of the executable bytes:
@@ -391,6 +394,29 @@ fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(field.try_into().expect("4 bytes")))
 }
 
+/// `sizeof (Elf64_Verneed)`, one entry of the `.gnu.version_r` list:
+///   vn_version: u16  (offset 0)
+///   vn_cnt:     u16  (offset 2) - Vernaux entries hanging off this one
+///   vn_file:    u32  (offset 4) - offset into .dynstr for the library name
+///   vn_aux:     u32  (offset 8) - offset to first Vernaux, relative to here
+///   vn_next:    u32  (offset 12) - offset to next Verneed, relative to here,
+///                                  0 if last
+const VERNEED_SIZE: usize = 16;
+
+/// `sizeof (Elf64_Vernaux)`, one version required of the library its Verneed
+/// names:
+///   vna_hash:  u32  (offset 0)
+///   vna_flags: u16  (offset 4)
+///   vna_other: u16  (offset 6) - the version index `.gnu.version` uses
+///   vna_name:  u32  (offset 8) - offset into .dynstr for the version name
+///   vna_next:  u32  (offset 12) - offset to next Vernaux, relative to here,
+///                                 0 if last
+const VERNAUX_SIZE: usize = 16;
+
+/// `VERSYM_HIDDEN`, the top bit of a `.gnu.version` entry; the index is the
+/// rest.
+const VERSYM_HIDDEN: u16 = 0x8000;
+
 /// Remove version requirement entries (.gnu.version_r) for fully-merged libraries.
 ///
 /// The .gnu.version_r section is a linked list of Verneed entries. Each entry
@@ -402,20 +428,17 @@ fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
 /// 1. Find entries to remove by matching vn_file against plan.remove_needed
 /// 2. Update vn_next pointers to skip removed entries (linked list surgery)
 /// 3. Decrement DT_VERNEEDNUM in .dynamic
+/// 4. Point every `.gnu.version` index that named one of the unlinked entries'
+///    versions at `VER_NDX_GLOBAL`, so no symbol is left requiring a version
+///    that is no longer described
+/// 5. Keep `.gnu.version_r`'s own section header describing the list the loader
+///    now walks, so section-header-based tools see the same requirements
 fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     use goblin::elf::dynamic::{DT_DEBUG, DT_VERNEED, DT_VERNEEDNUM};
 
     if plan.remove_needed.is_empty() {
         return Ok(());
     }
-
-    // Verneed entry structure (16 bytes):
-    //   vn_version: u16  (offset 0)
-    //   vn_cnt:     u16  (offset 2)
-    //   vn_file:    u32  (offset 4) - offset into .dynstr for library name
-    //   vn_aux:     u32  (offset 8) - offset to first Vernaux (relative to this entry)
-    //   vn_next:    u32  (offset 12) - offset to next Verneed (relative to this entry), 0 if last
-    const VERNEED_SIZE: usize = 16;
 
     let dynamic = DynamicTable::parse(bytes).context("reading .dynamic for verneed removal")?;
 
@@ -424,12 +447,22 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
         return Ok(());
     };
     // `.gnu.version_r` has no `DT_*` tag for its extent, so the only way to
-    // find the list is through its section header.
-    let verneed_offset = SectionTable::parse(bytes)?
-        .and_then(|sections| sections.by_name(".gnu.version_r").map(|s| s.offset));
-    let Some(verneed_offset) = verneed_offset.map(|off| off as usize) else {
+    // find the list — and the header that has to keep describing it — is
+    // through the section header table. `.gnu.version` is reached the same way
+    // rather than through `DT_VERSYM`, so that the array being rewritten and
+    // the header naming it cannot be two different ranges.
+    let Some(sections) = SectionTable::parse(bytes)? else {
         return Ok(());
     };
+    let Some(verneed) = sections.by_name(".gnu.version_r") else {
+        return Ok(());
+    };
+    let verneed_offset = verneed.offset as usize;
+    let verneed_hdr_at = sections.offset + verneed.index * SHDR_SIZE;
+    let verneed_extent = verneed.size;
+    let versym = sections
+        .by_name(".gnu.version")
+        .map(|s| (s.offset as usize, s.size as usize));
 
     // Walk the Verneed linked list to find entries matching libraries to remove
     let mut removed: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -454,6 +487,11 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     if removed.is_empty() {
         return Ok(());
     }
+
+    // The versions those entries required, before the surgery takes them off
+    // the list: every `.gnu.version` index naming one of them is about to
+    // describe nothing.
+    let dropped_versions = required_version_indices(bytes, &removed);
 
     // Now perform the linked list surgery.
     //
@@ -485,7 +523,105 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
         bytes[at..at + 8].copy_from_slice(&(kept_count as u64).to_le_bytes());
     }
 
+    // The symbols that required those versions came from the merged-away
+    // library, so they are undefined and unreferenced now: every relocation
+    // against them has been rewritten to R_X86_64_NONE. Their version indices,
+    // though, still name Vernaux entries no longer on the list, which is what
+    // `readelf` reports as `sym@@<corrupt>` and what leaves glibc sizing
+    // `l_versions` around a slot it never fills in. VER_NDX_GLOBAL — "no
+    // version required" — is what the writer stamps on the externals it
+    // injects, and the right answer for these too.
+    //
+    // The writer rebuilds `.gnu.version` in the merged region by copying the
+    // array from here, so fixing the original fixes the copy the loader reads.
+    if let Some((versym_at, versym_size)) = versym {
+        clear_dropped_versyms(bytes, versym_at, versym_size, &dropped_versions);
+    }
+
+    // Finally, keep `.gnu.version_r`'s section header describing what
+    // DT_VERNEED and DT_VERNEEDNUM now say. `sh_info` is the entry count, and
+    // the extent has to start at the first entry still on the list: otherwise
+    // every tool that reads section headers rather than PT_DYNAMIC goes on
+    // reporting a requirement against a library that is no longer needed.
+    let head_delta = (new_head - verneed_offset) as u64;
+    let (extent, addr_delta) = if kept_count == 0 {
+        (0, 0)
+    } else {
+        (verneed_extent.saturating_sub(head_delta), head_delta)
+    };
+    let hdr = &mut bytes[verneed_hdr_at..verneed_hdr_at + SHDR_SIZE];
+    for (field, value) in [
+        (SH_ADDR, verneed.addr + addr_delta),
+        (SH_OFFSET, verneed.offset + addr_delta),
+        (SH_SIZE, extent),
+    ] {
+        hdr[field..field + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    hdr[SH_INFO..SH_INFO + 4].copy_from_slice(&(kept_count as u32).to_le_bytes());
+
     Ok(())
+}
+
+/// The version indices the Verneed entries at `offsets` require: the
+/// `vna_other` of every Vernaux hanging off each of them.
+///
+/// `vn_cnt` bounds the walk along with `vna_next`, so a chain that lies about
+/// its own length cannot run past the entries it claims.
+fn required_version_indices(
+    bytes: &[u8],
+    offsets: &std::collections::HashSet<usize>,
+) -> std::collections::HashSet<u16> {
+    let mut indices = std::collections::HashSet::new();
+    for &verneed_at in offsets {
+        let Some(entry) = bytes.get(verneed_at..verneed_at + VERNEED_SIZE) else {
+            continue;
+        };
+        let vn_cnt = u16::from_le_bytes(entry[2..4].try_into().expect("2 bytes"));
+        let vn_aux = u32::from_le_bytes(entry[8..12].try_into().expect("4 bytes")) as usize;
+
+        let mut at = verneed_at + vn_aux;
+        for _ in 0..vn_cnt {
+            let Some(aux) = bytes.get(at..at + VERNAUX_SIZE) else {
+                break;
+            };
+            indices.insert(u16::from_le_bytes(aux[6..8].try_into().expect("2 bytes")));
+            let vna_next = u32::from_le_bytes(aux[12..16].try_into().expect("4 bytes")) as usize;
+            if vna_next == 0 {
+                break;
+            }
+            at += vna_next;
+        }
+    }
+    indices
+}
+
+/// Rewrite every entry of the `.gnu.version` array at `versym_at` whose index
+/// is in `dropped` to `VER_NDX_GLOBAL`, and return how many were rewritten.
+///
+/// The array is one `u16` per `.dynsym` entry: the index of the version that
+/// symbol requires, with `VERSYM_HIDDEN` set when the symbol is not to be
+/// matched by an unversioned reference. A dropped version takes the hidden bit
+/// with it — an undefined symbol with no version requirement left has nothing
+/// to hide.
+fn clear_dropped_versyms(
+    bytes: &mut [u8],
+    versym_at: usize,
+    versym_size: usize,
+    dropped: &std::collections::HashSet<u16>,
+) -> usize {
+    if dropped.is_empty() {
+        return 0;
+    }
+    let end = (versym_at + versym_size).min(bytes.len());
+    let mut cleared = 0;
+    for at in (versym_at..end.saturating_sub(1)).step_by(2) {
+        let entry = u16::from_le_bytes(bytes[at..at + 2].try_into().expect("2 bytes"));
+        if dropped.contains(&(entry & !VERSYM_HIDDEN)) {
+            bytes[at..at + 2].copy_from_slice(&VER_NDX_GLOBAL.to_le_bytes());
+            cleared += 1;
+        }
+    }
+    cleared
 }
 
 /// Rewrite the Verneed linked list in `bytes` starting at `verneed_offset`,
@@ -501,8 +637,6 @@ fn relink_verneed_list(
     verneed_offset: usize,
     removed: &std::collections::HashSet<usize>,
 ) -> (usize, usize) {
-    const VERNEED_SIZE: usize = 16;
-
     // Pass 1: collect every entry offset in list order.
     let mut all_offsets: Vec<usize> = Vec::new();
     let mut offset = verneed_offset;
@@ -537,8 +671,15 @@ fn relink_verneed_list(
 
 #[cfg(test)]
 mod verneed_tests {
-    use super::relink_verneed_list;
+    use super::*;
     use std::collections::HashSet;
+
+    /// `test/bash` requires `NCURSES6_TINFO_5.0.19991023` of
+    /// `libtinfo.so.6` — the first entry of its `.gnu.version_r` list — so
+    /// merging libtinfo away is the case where both the head of the list and
+    /// the version indices pointing into it have to be dealt with.
+    const BASH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/bash");
+    const TINFO: &str = "libtinfo.so.6";
 
     /// Build `n` consecutive 16-byte Verneed entries. `vn_file` (byte +4) is set
     /// to the entry index so entries are distinguishable; `vn_next` chains them.
@@ -608,6 +749,279 @@ mod verneed_tests {
         let mut bytes = make_list(2);
         let (_head, count) = relink_verneed_list(&mut bytes, 0, &HashSet::from([0, 16]));
         assert_eq!(count, 0);
+    }
+
+    /// One Verneed entry at `at` requiring each of `versions`, one Vernaux
+    /// behind it per index. `vn_aux` and `vna_next` are offsets relative to the
+    /// entry they sit in, which is the part worth getting wrong.
+    fn make_entry_with_aux(at: usize, versions: &[u16]) -> Vec<u8> {
+        let mut bytes = vec![0u8; at + VERNEED_SIZE + versions.len() * VERNAUX_SIZE];
+        bytes[at + 2..at + 4].copy_from_slice(&(versions.len() as u16).to_le_bytes()); // vn_cnt
+        bytes[at + 8..at + 12].copy_from_slice(&(VERNEED_SIZE as u32).to_le_bytes()); // vn_aux
+        for (i, &index) in versions.iter().enumerate() {
+            let aux = at + VERNEED_SIZE + i * VERNAUX_SIZE;
+            bytes[aux + 6..aux + 8].copy_from_slice(&index.to_le_bytes()); // vna_other
+            let vna_next = if i + 1 < versions.len() {
+                VERNAUX_SIZE as u32
+            } else {
+                0
+            };
+            bytes[aux + 12..aux + 16].copy_from_slice(&vna_next.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// A library can be required at more than one version, so unlinking its
+    /// entry drops every index on its Vernaux chain, not just the first.
+    #[test]
+    fn every_version_an_entry_requires_is_collected() {
+        let bytes = make_entry_with_aux(32, &[4, 7, 9]);
+        assert_eq!(
+            required_version_indices(&bytes, &HashSet::from([32])),
+            HashSet::from([4, 7, 9])
+        );
+        // An entry that is not being removed contributes nothing.
+        assert!(required_version_indices(&bytes, &HashSet::new()).is_empty());
+    }
+
+    /// `vn_cnt` and `vna_next` both bound the walk, and neither may be trusted
+    /// to stay inside the file: a chain that claims more entries than are there
+    /// must not panic the merge.
+    #[test]
+    fn a_vernaux_chain_running_past_the_end_is_not_followed() {
+        let mut bytes = make_entry_with_aux(0, &[4, 7]);
+        bytes[2..4].copy_from_slice(&9u16.to_le_bytes()); // vn_cnt lies: 9 entries
+        assert_eq!(
+            required_version_indices(&bytes, &HashSet::from([0])),
+            HashSet::from([4, 7]),
+            "the walk read past the entries that are there"
+        );
+
+        // A truncated entry is not read at all, nor is one past the end.
+        let short = &bytes[..VERNEED_SIZE - 1];
+        assert!(required_version_indices(short, &HashSet::from([0])).is_empty());
+        assert!(required_version_indices(&bytes, &HashSet::from([0x1000])).is_empty());
+    }
+
+    /// The hidden bit is part of the entry but not of the index, so a hidden
+    /// symbol's dropped version has to be recognised — and loses the bit along
+    /// with the requirement.
+    #[test]
+    fn a_dropped_version_is_cleared_through_the_hidden_bit() {
+        let versym: Vec<u16> = vec![0, 1, 2, 6, 6 | VERSYM_HIDDEN, 7];
+        let mut bytes: Vec<u8> = versym.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let size = bytes.len();
+
+        assert_eq!(
+            clear_dropped_versyms(&mut bytes, 0, size, &HashSet::from([6])),
+            2
+        );
+        let after: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes(c.try_into().expect("2 bytes")))
+            .collect();
+        assert_eq!(after, vec![0, 1, 2, VER_NDX_GLOBAL, VER_NDX_GLOBAL, 7]);
+    }
+
+    /// The array's size bounds the rewrite: `.gnu.version` is parallel to
+    /// `.dynsym`, and whatever follows it in the file is somebody else's.
+    #[test]
+    fn clearing_stays_inside_the_array() {
+        let mut bytes = vec![6u8, 0, 6, 0, 6, 0];
+        assert_eq!(
+            clear_dropped_versyms(&mut bytes, 0, 2, &HashSet::from([6])),
+            1
+        );
+        assert_eq!(bytes, vec![1u8, 0, 6, 0, 6, 0]);
+
+        // No dropped version, and a size running past the end: both leave the
+        // bytes alone rather than reading out of bounds.
+        let before = bytes.clone();
+        assert_eq!(clear_dropped_versyms(&mut bytes, 0, 6, &HashSet::new()), 0);
+        assert_eq!(
+            clear_dropped_versyms(&mut bytes, 4, 0x1000, &HashSet::new()),
+            0
+        );
+        assert_eq!(bytes, before);
+    }
+
+    /// A plan that merges `soname` away entirely, which is what puts its
+    /// soname on `remove_needed`.
+    fn plan_removing(soname: &str) -> MergePlan {
+        MergePlan {
+            is_pie: true,
+            load_address: 0x10_0000,
+            exec_size: 0x1000,
+            rodata_end: 0x1000,
+            writable_end: 0x1000,
+            units: Vec::new(),
+            trampoline_stubs: Vec::new(),
+            got_patches: Vec::new(),
+            jump_slot_reloc_offsets: Vec::new(),
+            copy_reloc_offsets: Vec::new(),
+            remove_needed: vec![soname.to_owned()],
+            add_needed: Vec::new(),
+            relative_relocs: Vec::new(),
+            new_externals: Vec::new(),
+            got_imports: Vec::new(),
+            init_fini: None,
+        }
+    }
+
+    fn section(bytes: &[u8], name: &str) -> crate::elf_reader::SectionHeader {
+        let table = SectionTable::parse(bytes)
+            .expect("read the section headers")
+            .expect("the fixture has no section headers");
+        table
+            .sections
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("the fixture has no '{name}' section"))
+    }
+
+    /// The `.gnu.version` array: one version index per `.dynsym` entry.
+    fn version_indices(bytes: &[u8]) -> Vec<u16> {
+        let header = section(bytes, ".gnu.version");
+        let at = header.offset as usize;
+        bytes[at..at + header.size as usize]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes(c.try_into().expect("2 bytes")))
+            .collect()
+    }
+
+    /// The Verneed entries the `.gnu.version_r` section header lists, reached
+    /// the way `readelf` reaches them: from where the header says the list
+    /// starts, following `vn_next`.
+    fn listed_entries(bytes: &[u8]) -> HashSet<usize> {
+        let header = section(bytes, ".gnu.version_r");
+        if header.size == 0 {
+            return HashSet::new();
+        }
+        let mut entries = HashSet::new();
+        let mut at = header.offset as usize;
+        loop {
+            entries.insert(at);
+            let vn_next = u32::from_le_bytes(bytes[at + 12..at + 16].try_into().expect("4 bytes"));
+            if vn_next == 0 {
+                break;
+            }
+            at += vn_next as usize;
+        }
+        entries
+    }
+
+    /// Every version index those entries still require.
+    fn described_versions(bytes: &[u8]) -> HashSet<u16> {
+        required_version_indices(bytes, &listed_entries(bytes))
+    }
+
+    /// `.gnu.version_r`'s `sh_info`: the number of entries the section header
+    /// claims are on the list.
+    fn listed_count(bytes: &[u8]) -> u32 {
+        let table = SectionTable::parse(bytes)
+            .expect("read the section headers")
+            .expect("the fixture has no section headers");
+        let at = table.offset + section(bytes, ".gnu.version_r").index * SHDR_SIZE + SH_INFO;
+        u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+    }
+
+    /// The symbols whose version requirement came from the merged-away library
+    /// are undefined and unreferenced afterwards, but their `.gnu.version`
+    /// indices used to be left pointing into the entry that was unlinked —
+    /// which is what `readelf` reports as `tputs@@<corrupt>`, and what left
+    /// glibc sizing `l_versions` around a slot it never fills in.
+    #[test]
+    fn a_merged_away_librarys_symbols_stop_requiring_its_versions() {
+        let before = std::fs::read(BASH).expect("read test/bash");
+        let mut after = before.clone();
+        remove_verneed_entries(&mut after, &plan_removing(TINFO)).expect("remove verneed entries");
+
+        let (was, now) = (version_indices(&before), version_indices(&after));
+        assert_eq!(was.len(), now.len(), ".gnu.version changed length");
+
+        let changed: Vec<usize> = (0..was.len()).filter(|&i| was[i] != now[i]).collect();
+        assert!(
+            !changed.is_empty(),
+            "no symbol required a version of {TINFO}, so this proves nothing"
+        );
+        for i in changed {
+            assert_eq!(
+                now[i], VER_NDX_GLOBAL,
+                "symbol {i} went from version {} to {}",
+                was[i], now[i]
+            );
+        }
+
+        // tputs is the one from the issue: it is imported at
+        // NCURSES6_TINFO_5.0.19991023, a version only libtinfo provides.
+        let elf = goblin::elf::Elf::parse(&before).expect("parse test/bash");
+        let tputs = elf
+            .dynsyms
+            .iter()
+            .position(|sym| elf.dynstrtab.get_at(sym.st_name) == Some("tputs"))
+            .expect("test/bash imports tputs");
+        assert_ne!(was[tputs], VER_NDX_GLOBAL, "tputs was unversioned already");
+        assert_eq!(now[tputs], VER_NDX_GLOBAL);
+
+        // And nothing is left requiring a version no entry describes.
+        let described = described_versions(&after);
+        for (i, &index) in now.iter().enumerate() {
+            assert!(
+                index <= VER_NDX_GLOBAL || described.contains(&(index & !VERSYM_HIDDEN)),
+                "symbol {i} requires version {index}, which nothing describes"
+            );
+        }
+    }
+
+    /// The loader walks the Verneed list from `DT_VERNEED` and every other tool
+    /// from the `.gnu.version_r` section header. Unlinking the head entry
+    /// advanced the first and left the second behind, so `readelf` went on
+    /// listing a requirement against a library that is no longer in
+    /// `DT_NEEDED`.
+    #[test]
+    fn the_verneed_section_header_follows_the_list_the_loader_walks() {
+        use goblin::elf::dynamic::{DT_VERNEED, DT_VERNEEDNUM};
+
+        let before = std::fs::read(BASH).expect("read test/bash");
+        let mut after = before.clone();
+        remove_verneed_entries(&mut after, &plan_removing(TINFO)).expect("remove verneed entries");
+
+        let was = section(&before, ".gnu.version_r");
+        let now = section(&after, ".gnu.version_r");
+        let dynamic = DynamicTable::parse(&after).expect("parse .dynamic");
+
+        // The loader's view and every other tool's view have to be the same
+        // list: same first entry, same number of entries on it.
+        let head = dynamic.value_of(DT_VERNEED).expect("DT_VERNEED");
+        assert_eq!(
+            now.addr, head,
+            "the section starts at {:#x} but the loader starts at {head:#x}",
+            now.addr
+        );
+        let count = dynamic.value_of(DT_VERNEEDNUM).expect("DT_VERNEEDNUM");
+        assert_eq!(u64::from(listed_count(&after)), count, "sh_info is stale");
+        assert_eq!(
+            listed_entries(&after).len() as u64,
+            count,
+            "the list the header points at is not {count} entries long"
+        );
+
+        // libtinfo heads the list in this fixture, so the extent starts one
+        // entry further in and shrinks by as much, while still ending where it
+        // did — inside the file, covering every entry left on the list.
+        assert!(
+            now.addr > was.addr,
+            "the unlinked head entry is still described"
+        );
+        assert_eq!(now.offset - was.offset, now.addr - was.addr);
+        assert_eq!(now.size, was.size - (now.offset - was.offset));
+        assert!(now.offset + now.size <= after.len() as u64);
+        for entry in listed_entries(&after) {
+            assert!(
+                (now.offset..now.offset + now.size).contains(&(entry as u64)),
+                "the entry at {entry:#x} is outside the section that lists it"
+            );
+        }
     }
 }
 

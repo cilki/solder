@@ -227,7 +227,15 @@ libraries and leave that one dynamic, or relink against a soname.
   naming a library that is no longer there aborts the loader on
   `Assertion 'needed != NULL' failed` — and moves onto the executable any
   `DT_NEEDED` of theirs that still provides a symbol the extracted code calls
-  (see [Inherited dependencies](#inherited-dependencies))
+  (see [Inherited dependencies](#inherited-dependencies)). Unlinking a
+  requirement takes everything that referred to it along: the `.gnu.version`
+  index of each symbol that asked for one of its versions becomes
+  `VER_NDX_GLOBAL`, since the symbol is undefined and unreferenced after the
+  merge, and `.gnu.version_r`'s own section header follows
+  `DT_VERNEED`/`DT_VERNEEDNUM` onto the shortened list. Left behind, those
+  pointed at an entry that no longer exists — `readelf` prints the symbol as
+  `tputs@@<corrupt>` and goes on reporting a requirement against the removed
+  library
 - Carries the merged libraries' constructors and destructors onto the
   executable's `DT_PREINIT_ARRAY` and `DT_FINI_ARRAY` (see
   [Constructors and destructors](#constructors-and-destructors))

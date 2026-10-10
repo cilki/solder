@@ -186,6 +186,11 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<bool> {
 /// Size of an `Elf64_Dyn`: `d_tag` (8 bytes) followed by `d_val`/`d_ptr`.
 pub const DYN_ENTRY_SIZE: usize = 16;
 
+/// `VER_NDX_GLOBAL`: the `.gnu.version` index meaning "this symbol carries no
+/// version requirement". The writer stamps it on the externals it injects, and
+/// the patcher on the symbols whose required version it unlinks.
+pub const VER_NDX_GLOBAL: u16 = 1;
+
 /// The `.dynamic` table of an ELF image, decoded from its raw bytes.
 ///
 /// Nearly every stage of a merge reads `.dynamic`: import collection wants
@@ -356,6 +361,10 @@ pub const SH_FLAGS: usize = 8;
 pub const SH_ADDR: usize = 16;
 pub const SH_OFFSET: usize = 24;
 pub const SH_SIZE: usize = 32;
+/// `sh_info`, a `u32`. For `SHT_GNU_verneed` it is the number of Verneed
+/// entries in the section's list, the section-header counterpart of
+/// `DT_VERNEEDNUM`.
+pub const SH_INFO: usize = 44;
 pub const SH_ADDRALIGN: usize = 48;
 
 /// `SHN_XINDEX` / `SHN_LORESERVE`: section counts and `e_shstrndx` values at or
