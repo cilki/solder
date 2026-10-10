@@ -143,18 +143,14 @@ pub fn write_output(
             )
         })?;
 
-    // Build the extended merged segment: original segment + any sections we
-    // need to grow (.dynstr/.dynsym/.gnu.version when injecting new external
-    // symbols; .rela.dyn whenever PIE relocs or new GLOB_DATs are added).
-    let needs_rela_extension = plan.is_pie && !plan.relative_relocs.is_empty();
-    let needs_symbol_extension = !plan.new_externals.is_empty()
-        || !plan.got_imports.is_empty()
-        || !plan.add_needed.is_empty();
-    let (extended_seg, ext_info) = if needs_rela_extension || needs_symbol_extension {
-        build_extended_segment(patched_exe, merged_seg, plan, &dynamic, &exe)?
-    } else {
-        (merged_seg.to_vec(), ExtensionInfo::default())
-    };
+    // Build the extended merged segment: the original segment plus any table
+    // the merge has to rebuild there (.dynstr/.dynsym/.gnu.version when
+    // injecting new external symbols; .rela.dyn whenever PIE relocs or new
+    // GLOB_DATs are added). `build_extended_segment` decides which of those
+    // apply; with none of them it hands the segment back as it came, so there
+    // is nothing for a second copy of that decision here to save.
+    let (extended_seg, ext_info) =
+        build_extended_segment(patched_exe, merged_seg, plan, &dynamic, &exe)?;
 
     // The merged region is described by up to four PT_LOADs rather than one
     // read-write-execute mapping: the code and trampolines, then the merged
@@ -165,22 +161,23 @@ pub fn write_output(
     // keeps p_offset and p_vaddr congruent modulo the page size for all of
     // them.
     //
-    // Each element is the start offset of a mapping within the region; the
-    // mapping runs to the next element's start, or to the end of the region.
-    let mut regions: Vec<(u64, u32)> = Vec::with_capacity(4);
+    // Each element is the start offset of a mapping within the region, with
+    // the flags that mapping gets; a mapping runs to the next one's start, or
+    // to the end of the region.
+    let mut boundaries: Vec<(u64, u32)> = Vec::with_capacity(4);
     if plan.exec_size > 0 {
-        regions.push((0, (PF_R | PF_X).0));
+        boundaries.push((0, (PF_R | PF_X).0));
     }
     if plan.rodata_end > plan.exec_size {
-        regions.push((plan.exec_size, PF_R.0));
+        boundaries.push((plan.exec_size, PF_R.0));
     }
     if plan.writable_end > plan.rodata_end {
-        regions.push((plan.rodata_end, (PF_R | PF_W).0));
+        boundaries.push((plan.rodata_end, (PF_R | PF_W).0));
     }
-    regions.push((plan.writable_end, PF_R.0));
+    boundaries.push((plan.writable_end, PF_R.0));
 
     // Calculate sizes for embedding PHT within the new PT_LOAD segments.
-    let new_phnum = old_phdrs.len() + regions.len();
+    let new_phnum = old_phdrs.len() + boundaries.len();
     let pht_size = (new_phnum * phdr_entry_size) as u64;
 
     // PHT will be placed at the end of the extended segment, aligned to 8 bytes.
@@ -191,6 +188,23 @@ pub fn write_output(
 
     // Total size of the extended segment including PHT
     let total_seg_size = pht_offset_in_seg + pht_size;
+
+    // Now that the region's total size is known, turn the boundaries into the
+    // mappings themselves. Doing it here is what keeps "a mapping ends where
+    // the next one starts" in one place: both the program headers below and
+    // the section headers further down walk the mappings, and each used to
+    // re-derive the end of one from the start of the next.
+    let regions: Vec<MergedRegion> = boundaries
+        .iter()
+        .enumerate()
+        .map(|(i, &(start, flags))| {
+            let end = boundaries.get(i + 1).map_or(total_seg_size, |&(n, _)| n);
+            MergedRegion {
+                range: start..end,
+                flags,
+            }
+        })
+        .collect();
 
     // Build the output buffer.
     let total_file_size = seg_file_offset + total_seg_size;
@@ -225,15 +239,12 @@ pub fn write_output(
 
     // Write one PT_LOAD per mapping of the merged region. The last one runs to
     // the end of the region, so it is the one that covers the PHT.
-    for (i, (start, flags)) in regions.iter().enumerate() {
-        let end = regions
-            .get(i + 1)
-            .map(|(next, _)| *next)
-            .unwrap_or(total_seg_size);
-        let size = end - start;
+    for region in &regions {
+        let start = region.range.start;
+        let size = region.size();
         let dst = pht_start + written;
         write_u32_le(&mut out, dst, PT_LOAD.0);
-        write_u32_le(&mut out, dst + 4, *flags);
+        write_u32_le(&mut out, dst + 4, region.flags);
         write_u64_le(&mut out, dst + 8, seg_file_offset + start);
         write_u64_le(&mut out, dst + 16, plan.load_address + start);
         write_u64_le(&mut out, dst + 24, plan.load_address + start); // p_paddr = p_vaddr
@@ -260,16 +271,26 @@ pub fn write_output(
 
     // Everything above describes the merge to the dynamic loader, which reads
     // PT_DYNAMIC. Now describe it to everything that reads section headers.
-    rewrite_section_headers(
-        &mut out,
-        plan,
-        &ext_info,
-        seg_file_offset,
-        &regions,
-        total_seg_size,
-    )?;
+    rewrite_section_headers(&mut out, plan, &ext_info, seg_file_offset, &regions)?;
 
     replace_file(output_path, &out)
+}
+
+/// One mapping of the merged region: the bytes it covers as offsets from the
+/// start of the region, and the `p_flags` it is mapped with.
+///
+/// `layout` page-aligned the boundaries between them, so each mapping starts
+/// on a page; the program headers describe them to the loader and a section
+/// header is emitted per mapping for everything that reads those instead.
+struct MergedRegion {
+    range: std::ops::Range<u64>,
+    flags: u32,
+}
+
+impl MergedRegion {
+    fn size(&self) -> u64 {
+        self.range.end - self.range.start
+    }
 }
 
 /// Put `bytes` at `path`, which is the input executable, by writing a
@@ -413,8 +434,7 @@ fn rewrite_section_headers(
     plan: &MergePlan,
     ext: &ExtensionInfo,
     seg_file_offset: u64,
-    regions: &[(u64, u32)],
-    total_seg_size: u64,
+    regions: &[MergedRegion],
 ) -> Result<()> {
     use object::elf::{PF_W, PF_X, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_PROGBITS};
 
@@ -459,14 +479,10 @@ fn rewrite_section_headers(
         offset
     };
     let mut added = 0usize;
-    for (i, &(start, flags)) in regions.iter().enumerate().take(regions.len() - 1) {
-        let end = regions
-            .get(i + 1)
-            .map(|(next, _)| *next)
-            .unwrap_or(total_seg_size);
-        let (name, sh_flags) = if flags & PF_X.0 != 0 {
+    for region in &regions[..regions.len().saturating_sub(1)] {
+        let (name, sh_flags) = if region.flags & PF_X.0 != 0 {
             (".solder.text", (SHF_ALLOC | SHF_EXECINSTR).0)
-        } else if flags & PF_W.0 != 0 {
+        } else if region.flags & PF_W.0 != 0 {
             (".solder.data", (SHF_ALLOC | SHF_WRITE).0)
         } else {
             (".solder.rodata", SHF_ALLOC.0)
@@ -477,9 +493,9 @@ fn rewrite_section_headers(
         write_u32_le(&mut shdr, SH_NAME, name_off);
         write_u32_le(&mut shdr, SH_TYPE, SHT_PROGBITS.0);
         write_u64_le(&mut shdr, SH_FLAGS, sh_flags);
-        write_u64_le(&mut shdr, SH_ADDR, plan.load_address + start);
-        write_u64_le(&mut shdr, SH_OFFSET, seg_file_offset + start);
-        write_u64_le(&mut shdr, SH_SIZE, end - start);
+        write_u64_le(&mut shdr, SH_ADDR, plan.load_address + region.range.start);
+        write_u64_le(&mut shdr, SH_OFFSET, seg_file_offset + region.range.start);
+        write_u64_le(&mut shdr, SH_SIZE, region.size());
         write_u64_le(&mut shdr, SH_ADDRALIGN, crate::layout::PAGE_SIZE);
         shdrs.extend_from_slice(&shdr);
         added += 1;
@@ -573,8 +589,11 @@ const RELA_ENTRY_SIZE: usize = 24;
 
 /// What `build_extended_segment` rebuilt in the merged segment, as the
 /// `.dynamic` edits that make the loader read the new copies.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ExtensionInfo {
+    /// VA the merged segment is loaded at, i.e. the base every offset handed
+    /// to [`ExtensionInfo::rebuilt`] is relative to.
+    load_address: u64,
     /// `(d_tag, new d_val)` per entry to repoint. An entry the executable does
     /// not have is skipped: there is nothing pointing at the old table either,
     /// so nothing to redirect.
@@ -586,6 +605,46 @@ struct ExtensionInfo {
     /// region, so `rewrite_section_headers` can repoint its section header at
     /// the copy the loader will actually read.
     rebuilt_sections: Vec<(&'static str, u64, u64)>,
+}
+
+impl ExtensionInfo {
+    fn new(load_address: u64) -> Self {
+        Self {
+            load_address,
+            dyn_updates: Vec::new(),
+            needed_name_offsets: Vec::new(),
+            rebuilt_sections: Vec::new(),
+        }
+    }
+
+    /// Record a table of `size` bytes the merge rebuilt at `offset_in_seg`:
+    /// repoint the `DT_*` tag the loader reaches it through, the tag giving its
+    /// size where there is one, and the section header that claims to describe
+    /// it.
+    ///
+    /// The loader's view and the tools' view have to name the same bytes —
+    /// that is the whole point of `rewrite_section_headers` — so each rebuilt
+    /// table states both here, rather than adding itself to two parallel lists
+    /// it can fall out of one of.
+    ///
+    /// `size_tag` is `None` for `.dynsym` and `.gnu.version`, neither of which
+    /// has one: `DT_SYMENT` gives only the per-entry width, and there is no
+    /// `DT_SYMSZ` or `DT_VERSYMSZ` at all (see `read_dynsym_tables`).
+    fn rebuilt(
+        &mut self,
+        section: &'static str,
+        addr_tag: u64,
+        size_tag: Option<u64>,
+        offset_in_seg: usize,
+        size: usize,
+    ) {
+        let vaddr = self.load_address + offset_in_seg as u64;
+        self.dyn_updates.push((addr_tag, vaddr));
+        if let Some(size_tag) = size_tag {
+            self.dyn_updates.push((size_tag, size as u64));
+        }
+        self.rebuilt_sections.push((section, vaddr, size as u64));
+    }
 }
 
 /// R_X86_64_GLOB_DAT relocation type.
@@ -622,7 +681,7 @@ fn build_extended_segment(
     };
 
     let mut extended = Vec::from(merged_seg);
-    let mut info = ExtensionInfo::default();
+    let mut info = ExtensionInfo::new(plan.load_address);
 
     // ---- 1. Inject new external symbols (extends .dynstr / .dynsym / .gnu.version)
     //
@@ -669,10 +728,10 @@ fn build_extended_segment(
             // soname. Track the byte offset each name lands at so we can wire
             // st_name and the new DT_NEEDED values correctly.
             pad_to(&mut extended, 8);
-            let dynstr_offset_in_seg = extended.len();
+            let dynstr_at = extended.len();
             extended.extend_from_slice(&old_dynstr);
             let append_string = |extended: &mut Vec<u8>, s: &str| -> u32 {
-                let offset = extended.len() as u32 - dynstr_offset_in_seg as u32;
+                let offset = extended.len() as u32 - dynstr_at as u32;
                 extended.extend_from_slice(s.as_bytes());
                 extended.push(0);
                 offset
@@ -685,12 +744,12 @@ fn build_extended_segment(
                 let offset = append_string(&mut extended, soname);
                 info.needed_name_offsets.push(offset);
             }
-            let dynstr_size = extended.len() - dynstr_offset_in_seg;
+            let dynstr_size = extended.len() - dynstr_at;
 
             // .dynsym: copy existing entries (preserves all existing indices), then
             // append one undefined function entry per new symbol.
             pad_to(&mut extended, 8);
-            let dynsym_offset_in_seg = extended.len();
+            let dynsym_at = extended.len();
             extended.extend_from_slice(&old_dynsym);
             for (name_off, (_, weak)) in new_name_offsets.iter().zip(&injects) {
                 let mut sym = [0u8; SYM_ENTRY_SIZE];
@@ -710,7 +769,7 @@ fn build_extended_segment(
             // VER_NDX_GLOBAL entry per new symbol. This array must stay parallel
             // to .dynsym, so its length tracks the new symbol count.
             pad_to(&mut extended, 2);
-            let versym_offset_in_seg = extended.len();
+            let versym_at = extended.len();
             extended.extend_from_slice(&old_versym);
             for _ in &injects {
                 extended.extend_from_slice(&VER_NDX_GLOBAL.to_le_bytes());
@@ -719,29 +778,9 @@ fn build_extended_segment(
             let dynsym_size = old_dynsym.len() + injects.len() * SYM_ENTRY_SIZE;
             let versym_size = old_versym.len() + injects.len() * 2;
 
-            info.dyn_updates.extend([
-                (DT_STRTAB, plan.load_address + dynstr_offset_in_seg as u64),
-                (DT_STRSZ, dynstr_size as u64),
-                (DT_SYMTAB, plan.load_address + dynsym_offset_in_seg as u64),
-                (DT_VERSYM, plan.load_address + versym_offset_in_seg as u64),
-            ]);
-            info.rebuilt_sections.extend([
-                (
-                    ".dynstr",
-                    plan.load_address + dynstr_offset_in_seg as u64,
-                    dynstr_size as u64,
-                ),
-                (
-                    ".dynsym",
-                    plan.load_address + dynsym_offset_in_seg as u64,
-                    dynsym_size as u64,
-                ),
-                (
-                    ".gnu.version",
-                    plan.load_address + versym_offset_in_seg as u64,
-                    versym_size as u64,
-                ),
-            ]);
+            info.rebuilt(".dynstr", DT_STRTAB, Some(DT_STRSZ), dynstr_at, dynstr_size);
+            info.rebuilt(".dynsym", DT_SYMTAB, None, dynsym_at, dynsym_size);
+            info.rebuilt(".gnu.version", DT_VERSYM, None, versym_at, versym_size);
         }
     }
 
@@ -799,7 +838,7 @@ fn build_extended_segment(
         }
 
         pad_to(&mut extended, 8);
-        let rela_offset_in_seg = extended.len();
+        let rela_at = extended.len();
         extended.extend_from_slice(&existing_relative);
         extended.extend_from_slice(&new_relative);
         extended.extend_from_slice(&existing_non_relative);
@@ -811,16 +850,11 @@ fn build_extended_segment(
             + new_glob_dat.len();
         let new_count = old_relacount + (plan.relative_relocs.len() as u64);
 
-        info.dyn_updates.extend([
-            (DT_RELA, plan.load_address + rela_offset_in_seg as u64),
-            (DT_RELASZ, total_size as u64),
-            (DT_RELACOUNT, new_count),
-        ]);
-        info.rebuilt_sections.push((
-            ".rela.dyn",
-            plan.load_address + rela_offset_in_seg as u64,
-            total_size as u64,
-        ));
+        info.rebuilt(".rela.dyn", DT_RELA, Some(DT_RELASZ), rela_at, total_size);
+        // DT_RELACOUNT has no counterpart on the other tables: it is the
+        // length of the RELATIVE prefix laid out above, which ld.so takes as
+        // the entries needing no symbol lookup.
+        info.dyn_updates.push((DT_RELACOUNT, new_count));
     }
 
     Ok((extended, info))
