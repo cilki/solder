@@ -1514,9 +1514,28 @@ fn find_existing_data_blob(addr: u64, state: &ExtractionState) -> Option<(UnitId
     None
 }
 
-/// Find the section a given virtual address belongs to and return its name,
-/// base vaddr, contents and kind. The caller reaches the address itself through
-/// `addr - base`, which for the gap case below is past the end of `contents`.
+/// Where an address resolved to, without its contents.
+///
+/// The contents are deliberately not part of this: `ensure_data_blob_extracted`
+/// consults every address a dynamic relocation points at, and nearly all of
+/// those land in a section it has already copied or will not copy at all.
+/// Handing back the bytes meant copying the whole of `.rodata` — several
+/// megabytes in `libcrypto.so.3` — once per lookup only to drop it again, which
+/// was two thirds of the entire run. `section_contents` materializes them once
+/// the caller knows it needs them.
+struct SectionInfo {
+    index: object::SectionIndex,
+    name: String,
+    /// Base virtual address; the caller reaches the address it asked about
+    /// through `addr - vaddr`, which for the gap case is past the end of the
+    /// contents.
+    vaddr: u64,
+    /// Length of what `section_contents` will return.
+    size: u64,
+    kind: SectionKind,
+}
+
+/// Find the section a given virtual address belongs to.
 ///
 /// An address that no section contains, but that a `PT_LOAD` still covers,
 /// belongs to the section it follows inside that segment. Such an address is
@@ -1547,7 +1566,7 @@ fn find_existing_data_blob(addr: u64, state: &ExtractionState) -> Option<(UnitId
 fn find_section_for_address(
     elf: &object::read::elf::ElfFile64<'_>,
     addr: u64,
-) -> Option<(String, u64, Vec<u8>, SectionKind)> {
+) -> Option<SectionInfo> {
     let mut preceding: Option<(u64, object::read::elf::ElfSection64<'_, '_>)> = None;
 
     for section in elf.sections() {
@@ -1590,11 +1609,9 @@ fn is_alloc(section: &object::read::elf::ElfSection64<'_, '_>) -> bool {
     }
 }
 
-/// A section's name, base vaddr, contents and kind, or `None` if solder does
-/// not extract that kind of section.
-fn describe_section(
-    section: &object::read::elf::ElfSection64<'_, '_>,
-) -> Option<(String, u64, Vec<u8>, SectionKind)> {
+/// A section's name, base vaddr, length and kind, or `None` if solder does not
+/// extract that kind of section.
+fn describe_section(section: &object::read::elf::ElfSection64<'_, '_>) -> Option<SectionInfo> {
     let name = section.name().ok()?.to_string();
     let kind = match section.kind() {
         ObjSectionKind::Text => SectionKind::Text,
@@ -1602,14 +1619,36 @@ fn describe_section(
         ObjSectionKind::Data | ObjSectionKind::UninitializedData => SectionKind::Data,
         _ => return None, // Skip unsupported section types
     };
-    // Handle NOBITS sections (.bss) which have no data in the file
-    let data = if kind == SectionKind::Data && section.data().ok().is_none_or(|d| d.is_empty()) {
-        // NOBITS section - create zero-filled data
-        vec![0u8; section.size() as usize]
-    } else {
-        section.data().ok()?.to_vec()
+    // `data()` only slices what is already mapped, so asking for it here costs
+    // nothing and tells us both how long the contents are and — for anything
+    // but a NOBITS section, whose zero fill `section_contents` synthesizes —
+    // whether they can be read at all.
+    let size = match section.data() {
+        Ok(d) if !d.is_empty() => d.len() as u64,
+        _ if kind == SectionKind::Data => section.size(),
+        _ => return None,
     };
-    Some((name, section.address(), data, kind))
+    Some(SectionInfo {
+        index: section.index(),
+        name,
+        vaddr: section.address(),
+        size,
+        kind,
+    })
+}
+
+/// The bytes of the section `describe_section` described.
+///
+/// A NOBITS section (`.bss`, `.tbss`) has no contents in the file; the loader
+/// zero-fills it, and so does the merge.
+fn section_contents(elf: &object::read::elf::ElfFile64<'_>, info: &SectionInfo) -> Result<Vec<u8>> {
+    let section = elf
+        .section_by_index(info.index)
+        .with_context(|| format!("section {} vanished between lookups", info.name))?;
+    Ok(match section.data() {
+        Ok(d) if !d.is_empty() => d.to_vec(),
+        _ => vec![0u8; info.size as usize],
+    })
 }
 
 /// Collect dynamic relocations (.rela.dyn) that fall within
@@ -1637,15 +1676,19 @@ fn collect_dynamic_range_relocs(
     let Some(dyn_relocs) = elf64.dynamic_relocations() else {
         return Ok(());
     };
+    // Which offsets already carry a relocation, so a dynamic entry does not
+    // overwrite one the caller already resolved. Scanning `relocations` for
+    // each candidate instead made this quadratic in the number of relocations
+    // in range: `libcrypto.so.3`'s `.data.rel.ro` is half a megabyte of
+    // pointers covered by ~25k `R_X86_64_RELATIVE` entries, and the pairwise
+    // comparisons alone were most of the extraction.
+    let mut occupied: HashSet<u64> = relocations.iter().map(|r| r.offset_within_unit).collect();
     for (roff, reloc) in dyn_relocs {
         if roff < range_start || roff >= range_start + range_size {
             continue;
         }
         let offset_within_unit = roff - range_start;
-        if relocations
-            .iter()
-            .any(|r| r.offset_within_unit == offset_within_unit)
-        {
+        if occupied.contains(&offset_within_unit) {
             continue;
         }
 
@@ -1755,6 +1798,7 @@ fn collect_dynamic_range_relocs(
         // are those three and not, say, a TLS offset.
         let reloc_size = if reloc.size() == 0 { 64 } else { reloc.size() };
 
+        occupied.insert(offset_within_unit);
         relocations.push(ExtractedReloc {
             offset_within_unit,
             kind,
@@ -1777,26 +1821,35 @@ fn ensure_data_blob_extracted(
     state: &mut ExtractionState,
 ) -> Result<Option<(UnitId, u64, IndexSet<UnitKey>)>> {
     // Find the section containing this address
-    let (sec_name, sec_addr, sec_data, sec_kind) =
-        match find_section_for_address(elf64, target_addr) {
-            Some(info) => info,
-            None => return Ok(None), // Address not in any extractable section
-        };
+    let Some(sec) = find_section_for_address(elf64, target_addr) else {
+        return Ok(None); // Address not in any extractable section
+    };
 
     // Skip .text section - code references are handled separately
-    if sec_kind == SectionKind::Text {
+    if sec.kind == SectionKind::Text {
         return Ok(None);
     }
 
     let blob_key = DataBlobKey {
         lib: lib.to_path_buf(),
-        section: sec_name.clone(),
+        section: sec.name.clone(),
     };
 
     // Check if already extracted
     if let Some(info) = state.data_blobs.get(&blob_key) {
         return Ok(Some((info.id, info.base_vaddr, IndexSet::new())));
     }
+
+    // Only now that the section is known to need copying are its bytes worth
+    // materializing: every return above happens for the great majority of the
+    // addresses this is asked about.
+    let sec_data = section_contents(elf64, &sec)?;
+    let SectionInfo {
+        name: sec_name,
+        vaddr: sec_addr,
+        kind: sec_kind,
+        ..
+    } = sec;
 
     // Claim the blob's id and register it *before* collecting its relocations.
     // Resolving those relocations can lead back to this same section — directly
@@ -2269,16 +2322,30 @@ mod tests {
             );
 
             for addr in [data_end, bss - 1] {
-                let (section, base, contents, kind) = find_section_for_address(&elf, addr)
+                let sec = find_section_for_address(&elf, addr)
                     .unwrap_or_else(|| panic!("{name}: {addr:#x} resolved to no section"));
-                assert_eq!(section, ".data", "{name}: {addr:#x}");
-                assert_eq!(base, data.address(), "{name}: {addr:#x}");
-                assert_eq!(kind, SectionKind::Data, "{name}: {addr:#x}");
+                assert_eq!(sec.name, ".data", "{name}: {addr:#x}");
+                assert_eq!(sec.vaddr, data.address(), "{name}: {addr:#x}");
+                assert_eq!(sec.kind, SectionKind::Data, "{name}: {addr:#x}");
+                assert_eq!(sec.size, data.size(), "{name}: {addr:#x}");
+                let contents = section_contents(&elf, &sec).expect(".data contents");
                 assert_eq!(contents.len() as u64, data.size(), "{name}: {addr:#x}");
             }
 
-            let (section, ..) = find_section_for_address(&elf, bss).expect(".bss");
-            assert_eq!(section, ".bss", "{name}: containment must win over a gap");
+            let bss_sec = find_section_for_address(&elf, bss).expect(".bss");
+            assert_eq!(
+                bss_sec.name, ".bss",
+                "{name}: containment must win over a gap"
+            );
+            // `.bss` is NOBITS: the file holds none of it, so its contents have
+            // to be synthesized at its full declared length.
+            assert_eq!(
+                section_contents(&elf, &bss_sec)
+                    .expect(".bss contents")
+                    .len() as u64,
+                elf.section_by_name(".bss").expect(".bss").size(),
+                "{name}: .bss must be zero-filled to its declared size"
+            );
 
             let past_the_image = bss + elf.section_by_name(".bss").expect(".bss").size() + 0x1000;
             assert!(
