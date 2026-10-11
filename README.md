@@ -51,8 +51,9 @@ are representative:
 
 | executable | merged library | before | after |
 | ---------- | -------------- | -----: | ----: |
-| `grep`     | `libpcre2-8.so.0` (695K) |  198K |  807K |
+| `grep`     | `libpcre2-8.so.0` (695K) |  198K |  875K |
 | `md5sum`   | `libcrypto.so.3` (6.2M)  |   54K |  5.3M |
+| `bash`     | `libtinfo.so.6` (215K)   | 1.2M  |  1.6M |
 
 So `solder` is a way to drop a runtime dependency, not a way to keep the result
 small. Point `--dry-run` at a binary to see how much a merge would pull in
