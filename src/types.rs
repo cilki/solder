@@ -93,6 +93,12 @@ impl InitFiniKind {
 pub struct MergedArray {
     /// VA of the array in the merged segment.
     pub vaddr: u64,
+    /// VA the executable's own array of this kind had before the merge, when
+    /// it had one. The rebuilt array is somewhere else — the merged segment
+    /// starts past the end of the image — so this is what says whether the
+    /// move took the array out of the executable's RELRO region. See
+    /// [`crate::layout::relro_downgrade`].
+    pub exe_vaddr: Option<u64>,
     /// The function pointers, in the order the loader will read them.
     pub entries: Vec<u64>,
 }

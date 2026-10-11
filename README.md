@@ -294,6 +294,27 @@ libraries and leave that one dynamic, or relink against a soname.
   so nothing asks the loader to resolve them — but it does mean the symbol
   tables are not a way to tell whether a merge worked. Read the
   `.solder.*` section headers, or `DT_NEEDED`, instead
+- RELRO does not reach the merged region, and the rebuilt `DT_FINI_ARRAY`
+  leaves it. `PT_GNU_RELRO` names the bytes `ld.so` makes read-only once it has
+  finished relocating, which is why the linker puts `.got`, `.init_array` and
+  `.fini_array` in there. The merged region's writable run has exactly that
+  property — `solder` forces `DF_BIND_NOW`, so its GOT slots, its init/fini
+  arrays and the pointers in its data are each written once, by the loader,
+  before any code runs — and none of it is protected, because the merged region
+  is laid out past the end of the image and so cannot fall inside the range the
+  linker already named. Appending a second `PT_GNU_RELRO` would not help:
+  glibc keeps one RELRO range per object and takes the last entry it sees, so
+  that would unprotect the executable's own range rather than protect the merged
+  one. The combined `DT_FINI_ARRAY` has to be rebuilt in the merged region as
+  well, which moves the executable's own destructor pointer out of the range
+  that was protecting it. Properly protecting the run needs code in the merged
+  binary — an `mprotect` from a preinit constructor, once the loader is done —
+  which `solder` does not emit yet, so for now it warns about what the merge
+  costs, naming the unprotected range, how many words in it only the loader
+  writes, and the arrays that leave the protected one. Merging
+  `libpcre2-8.so.0` into `test/grep` reports 47 such words in
+  `0xd6000..0xd7000` while `PT_GNU_RELRO` still covers only
+  `0x30f50..0x32000`, and `DT_FINI_ARRAY` moving from `0x30f58` to `0xd6420`
 - `.note.gnu.property` is edited in place, so a property the executable does not
   already carry can't be added. If a merged library needs an x86-64 ISA level
   the executable has no entry for, you get a warning instead of a note entry

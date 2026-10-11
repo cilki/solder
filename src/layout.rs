@@ -382,10 +382,15 @@ fn plan_init_fini_arrays(
     }
 
     // Place each array in the merged segment, aligned to the pointer size.
-    let mut place = |entries: Vec<u64>| {
+    // Where the executable had its own array of that kind travels with it:
+    // the linker may have put it inside `PT_GNU_RELRO`, and the merged segment
+    // is past the end of the image, so the move can cost the array that
+    // protection (`relro_downgrade`).
+    let mut place = |kind: InitFiniKind, entries: Vec<u64>| {
         *offset = align_up(*offset, 8);
         let array = MergedArray {
             vaddr: load_address + *offset,
+            exe_vaddr: exe_dynamic.value_of(kind.dynamic_tags().0),
             entries,
         };
         *offset += array.size();
@@ -393,16 +398,126 @@ fn plan_init_fini_arrays(
     };
 
     Ok(Some(InitFiniPlan {
-        preinit: place(preinit_entries),
-        fini: place(combined_fini_entries),
+        preinit: place(InitFiniKind::Preinit, preinit_entries),
+        fini: place(InitFiniKind::Fini, combined_fini_entries),
     }))
+}
+
+/// The RELRO protection a merge does not extend to what it adds — and, where
+/// the rebuilt init/fini arrays are concerned, takes away from what was
+/// already there.
+///
+/// `PT_GNU_RELRO` names the bytes `ld.so` makes read-only once it has finished
+/// relocating (see [`crate::elf_reader::gnu_relro`]). `solder` forces
+/// `DF_BIND_NOW`, so every GOT slot and every array entry in the merged
+/// writable run is likewise written once, by the loader, before any code runs:
+/// exactly the data that range exists to protect. None of it is covered.
+///
+/// It cannot be, as the merged segment is laid out past the end of the image
+/// and glibc enforces one RELRO range per object, so this is a report rather
+/// than a fix: protecting the run needs code in the merged binary itself,
+/// calling `mprotect` from a preinit constructor once the loader is done.
+/// Until then the loss is at least visible at merge time.
+#[derive(Debug)]
+pub struct RelroDowngrade {
+    /// What `PT_GNU_RELRO` covers in the executable. The merge leaves it as it
+    /// is, so this is the protection the output still has.
+    pub relro: std::ops::Range<u64>,
+    /// The writable run of the merged segment, which nothing protects.
+    pub writable: std::ops::Range<u64>,
+    /// Words in the writable run that only `ld.so` ever writes: the GOT slots
+    /// the merge allocated, the init/fini array entries, and the absolute
+    /// pointers in merged data that the loader rebases under PIE.
+    pub loader_written: usize,
+    /// The init/fini arrays the linker had placed inside `PT_GNU_RELRO` that
+    /// the merge rebuilds outside it: which array, where it was, where it is
+    /// now. The executable's own destructor pointers are in there.
+    pub moved_arrays: Vec<(InitFiniKind, u64, u64)>,
+}
+
+/// Work out what `plan` costs the executable's RELRO region, or `None` if
+/// there is nothing to report — the executable has no `PT_GNU_RELRO` to begin
+/// with, or the merge puts nothing the loader writes past the end of it.
+pub fn relro_downgrade(
+    exe_elf: &object::read::elf::ElfFile64<'_>,
+    plan: &MergePlan,
+) -> Option<RelroDowngrade> {
+    let relro = crate::elf_reader::gnu_relro(exe_elf)?;
+    let writable = plan.load_address + plan.rodata_end..plan.load_address + plan.writable_end;
+
+    let arrays = || plan.init_fini.iter().flat_map(|p| p.arrays());
+
+    let moved_arrays: Vec<(InitFiniKind, u64, u64)> = arrays()
+        .filter(|(_, array)| !array.entries.is_empty())
+        .filter_map(|(kind, array)| {
+            let was = array.exe_vaddr?;
+            relro.contains(&was).then_some((kind, was, array.vaddr))
+        })
+        .collect();
+
+    // The loader resolves a GOT slot whether or not the executable is PIE; the
+    // array entries and the pointers inside merged data are link-time
+    // addresses, which it only has to rebase when the image moves.
+    let mut loader_written = plan.new_externals.len() + plan.got_imports.len();
+    if plan.is_pie {
+        loader_written += arrays()
+            .map(|(_, array)| array.entries.len())
+            .sum::<usize>();
+        loader_written += plan
+            .units
+            .iter()
+            .filter(|au| writable.contains(&au.assigned_vaddr))
+            .map(|au| {
+                au.unit
+                    .relocations
+                    .iter()
+                    .filter(|r| r.is_absolute64())
+                    .count()
+            })
+            .sum::<usize>();
+    }
+
+    (loader_written > 0 || !moved_arrays.is_empty()).then_some(RelroDowngrade {
+        relro,
+        writable,
+        loader_written,
+        moved_arrays,
+    })
+}
+
+impl std::fmt::Display for RelroDowngrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RELRO is not extended to the merged region: {} word(s) in {:#x}..{:#x} are \
+             written by ld.so before main and by nothing afterwards, but PT_GNU_RELRO still \
+             covers only {:#x}..{:#x}, so they stay writable for the life of the process",
+            self.loader_written,
+            self.writable.start,
+            self.writable.end,
+            self.relro.start,
+            self.relro.end,
+        )?;
+        for (kind, was, now) in &self.moved_arrays {
+            write!(
+                f,
+                ". The executable's {} was inside that range at {was:#x} and the merge rebuilds \
+                 it at {now:#x}, so its function pointers lose the protection they had",
+                kind.name(),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::elf_reader::MappedElf;
-    use crate::types::{ExtractedReloc, UnitId};
+    use crate::types::{ExtractedReloc, InitFiniEntry, UnitId};
+
+    const GREP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep");
+    const LIB: &str = "/nonexistent/libtest.so.1";
 
     fn unit(
         id: u32,
@@ -450,8 +565,16 @@ mod tests {
     }
 
     fn plan_for(units: Vec<ExtractedUnit>, is_pie: bool) -> MergePlan {
-        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep"));
-        let mapped = MappedElf::open(path).expect("open test/grep");
+        plan_for_with(units, is_pie, InitFiniArrays::default(), &[])
+    }
+
+    fn plan_for_with(
+        units: Vec<ExtractedUnit>,
+        is_pie: bool,
+        init_fini: InitFiniArrays,
+        lib_order: &[PathBuf],
+    ) -> MergePlan {
+        let mapped = MappedElf::open(std::path::Path::new(GREP)).expect("open test/grep");
         let exe = mapped.parse().expect("parse test/grep");
         let rela = crate::symbol_analysis::RelaTables::read(&exe).expect("test/grep .rela tables");
         plan_layout(
@@ -460,11 +583,19 @@ mod tests {
             &[],
             &rela.got_slot_vas(),
             is_pie,
-            InitFiniArrays::default(),
-            &[],
+            init_fini,
+            lib_order,
             Vec::new(),
         )
         .expect("plan layout")
+    }
+
+    /// `relro_downgrade` needs the executable the plan was made against, and a
+    /// parsed `ElfFile64` borrows the mapping it came out of, so the caller has
+    /// to own both.
+    fn with_grep<T>(f: impl FnOnce(&object::read::elf::ElfFile64<'_>) -> T) -> T {
+        let mapped = MappedElf::open(std::path::Path::new(GREP)).expect("open test/grep");
+        f(&mapped.parse().expect("parse test/grep"))
     }
 
     /// The reason the layout is split into runs at all: the writer maps the
@@ -595,6 +726,112 @@ mod tests {
         assert_eq!(
             plan.writable_end, plan.rodata_end,
             "nothing should have been placed in the writable run"
+        );
+    }
+
+    /// `test/grep`'s `DT_FINI_ARRAY` is at 0x30f58, inside the 0x30f50..0x32000
+    /// its `PT_GNU_RELRO` covers: the linker put the executable's destructor
+    /// pointer where `ld.so` would make it read-only after startup. The merge
+    /// has to rebuild that array to run the merged destructors too, and can
+    /// only do so in the merged segment — outside the protected range, which
+    /// the merge leaves exactly as it found it. That is a protection the input
+    /// had and the output does not, so it has to be reported.
+    #[test]
+    fn the_rebuilt_fini_array_leaving_relro_is_reported() {
+        let plan = plan_for_with(
+            vec![unit(0, "dtor", SectionKind::Text, 32, &[])],
+            true,
+            InitFiniArrays {
+                init_entries: Vec::new(),
+                fini_entries: vec![InitFiniEntry {
+                    source_lib: PathBuf::from(LIB),
+                    unit_name: "dtor".to_owned(),
+                }],
+            },
+            &[PathBuf::from(LIB)],
+        );
+
+        let fini = &plan.init_fini.as_ref().expect("a rebuilt fini array").fini;
+        let downgrade = with_grep(|exe| relro_downgrade(exe, &plan)).expect("a report");
+
+        assert_eq!(
+            downgrade.moved_arrays.len(),
+            1,
+            "{:?}",
+            downgrade.moved_arrays
+        );
+        let (kind, was, now) = downgrade.moved_arrays[0];
+        assert_eq!(kind, InitFiniKind::Fini);
+        assert_eq!(now, fini.vaddr, "the report names the wrong destination");
+        assert!(
+            downgrade.relro.contains(&was),
+            "{was:#x} was not inside the protected range {:#x}..{:#x}",
+            downgrade.relro.start,
+            downgrade.relro.end
+        );
+        assert!(
+            downgrade.writable.contains(&now) && !downgrade.relro.contains(&now),
+            "the rebuilt array at {now:#x} is not in the unprotected writable run"
+        );
+        // The executable's own destructor is still in there, behind the merged
+        // one — the array the loader walks backwards at exit.
+        assert_eq!(
+            fini.entries.len(),
+            2,
+            "the merged and the executable's own destructor"
+        );
+
+        // The two array entries are rebased at startup like any other pointer
+        // in the writable run, so they count towards what RELRO would cover.
+        assert_eq!(downgrade.loader_written, 2, "{downgrade:?}");
+    }
+
+    /// What the report counts: every word in the writable run that `ld.so`
+    /// writes once and nothing writes again — a GOT slot the merge allocated
+    /// for a symbol the executable did not import, and an absolute pointer in
+    /// merged read-only data that PIE leaves the loader to rebase. Those are
+    /// the words a RELRO region would be covering.
+    #[test]
+    fn loader_written_words_in_the_writable_run_are_counted() {
+        let plan = plan_for(
+            vec![
+                unit(
+                    0,
+                    "fn_a",
+                    SectionKind::Text,
+                    64,
+                    &["memcpy", "solder_absent_symbol"],
+                ),
+                rebased_rodata_unit(1, "ro_rebased"),
+            ],
+            true,
+        );
+        // `memcpy` reuses test/grep's own GOT slot, so only the made-up symbol
+        // needs a slot of the merge's own.
+        assert_eq!(plan.new_externals.len(), 1, "{:?}", plan.new_externals);
+
+        let downgrade = with_grep(|exe| relro_downgrade(exe, &plan)).expect("a report");
+        assert_eq!(downgrade.loader_written, 2, "{downgrade:?}");
+        assert!(downgrade.moved_arrays.is_empty(), "{downgrade:?}");
+    }
+
+    /// Nothing in a non-PIE merge is written at runtime by the loader: the
+    /// relocator resolves the pointers at merge time, and with no GOT slots to
+    /// allocate the writable run is empty. There is no protection to lose, so
+    /// there is nothing to warn about.
+    #[test]
+    fn a_non_pie_merge_has_nothing_to_report() {
+        let plan = plan_for(
+            vec![
+                unit(0, "fn_a", SectionKind::Text, 64, &[]),
+                rebased_rodata_unit(1, "ro_rebased"),
+            ],
+            false,
+        );
+
+        assert!(
+            with_grep(|exe| relro_downgrade(exe, &plan)).is_none(),
+            "a non-PIE merge reported a RELRO downgrade"
         );
     }
 }

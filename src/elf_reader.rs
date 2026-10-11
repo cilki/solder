@@ -71,6 +71,31 @@ pub fn pt_loads<'a>(elf: &'a ElfFile64<'a>) -> impl Iterator<Item = Load> + 'a {
         })
 }
 
+/// The virtual addresses `PT_GNU_RELRO` covers, when the object has one.
+///
+/// These are the bytes `ld.so` writes while relocating and then `mprotect`s
+/// read-only, before any code in the process runs — which is why a linker puts
+/// `.got`, `.init_array` and `.fini_array` there: each of those words is
+/// written exactly once, by the loader, and must never be written again.
+///
+/// An object gets one such range however many entries its program header table
+/// lists, because glibc's phdr loop assigns `l_relro_addr`/`l_relro_size`
+/// unconditionally and so keeps the last one. That is the one returned here,
+/// and the reason a merge cannot simply append a second entry for the merged
+/// region: doing so would unprotect the executable's own range rather than
+/// protect the merged one.
+pub fn gnu_relro(elf: &ElfFile64<'_>) -> Option<std::ops::Range<u64>> {
+    use object::read::elf::ProgramHeader;
+    let endian = elf.endian();
+    elf.elf_program_headers()
+        .iter()
+        .rfind(|seg| seg.p_type(endian) == object::elf::PT_GNU_RELRO)
+        .map(|seg| {
+            let start = seg.p_vaddr(endian);
+            start..start + seg.p_memsz(endian)
+        })
+}
+
 /// Convert a virtual address in a parsed ELF to a file offset.
 /// Returns None if the VA is not covered by any PT_LOAD segment.
 pub fn va_to_file_offset(elf: &ElfFile64<'_>, va: u64) -> Option<u64> {

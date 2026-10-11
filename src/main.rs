@@ -262,6 +262,14 @@ fn run() -> Result<()> {
     };
     info!(add_needed=?plan.add_needed, "DT_NEEDED entries to add");
 
+    // The loader protects the range `PT_GNU_RELRO` names and nothing else, and
+    // the merged region is necessarily outside it. Say so before writing
+    // anything, since the result is a binary whose function-pointer tables are
+    // writable where they were read-only before.
+    if let Some(downgrade) = layout::relro_downgrade(&exe_elf, &plan) {
+        warn!("{downgrade}");
+    }
+
     if cli.dry_run {
         print_merge_plan(&cli.input, &plan, imports, &dyn_info.needed);
         return Ok(());
