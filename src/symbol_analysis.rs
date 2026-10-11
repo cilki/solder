@@ -437,7 +437,12 @@ pub fn read_library_dynamic(lib_path: &Path) -> Result<LibraryDynamic> {
     })
 }
 
-/// Sonames the executable has to inherit from the libraries being merged away.
+/// A `DT_NEEDED` entry of a merged library, looked up: the file the entry names
+/// and the symbols that file defines.
+pub type ResolvedDependency = (PathBuf, HashSet<String>);
+
+/// `DT_NEEDED` entries the executable has to inherit from the libraries being
+/// merged away.
 ///
 /// Merging a library moves its code into the executable but not its
 /// dependencies: `libcrypto.so.3` resolves `ZSTD_compress` through its own
@@ -455,22 +460,34 @@ pub fn read_library_dynamic(lib_path: &Path) -> Result<LibraryDynamic> {
 ///     nothing in the extracted code refers to stays dropped.
 ///
 /// `merged_lib_deps` is the `DT_NEEDED` entries of every library being merged
-/// away, run together; `exports` maps a soname to the symbols it defines, or
-/// `None` when the library cannot be found. An unresolvable dependency is
-/// inherited anyway: guessing that it was unnecessary risks an executable that
-/// will not start, while an extra `DT_NEEDED` entry at worst reintroduces a
-/// dependency the original binary already had through the merged library.
+/// away, run together; `resolve` maps one of those entries to the file it names
+/// and the symbols that file defines, or `None` when the library cannot be
+/// found. An unresolvable dependency is inherited anyway: guessing that it was
+/// unnecessary risks an executable that will not start, while an extra
+/// `DT_NEEDED` entry at worst reintroduces a dependency the original binary
+/// already had through the merged library.
+///
+/// A dependency recorded as a *path* rather than a soname cannot be inherited
+/// verbatim, because the path is read relative to whichever object declared it:
+/// `$ORIGIN` is the declaring object's own directory and a relative path is the
+/// running process's working directory. Copying `$ORIGIN/libbaz.so` off
+/// `/usr/lib/libbar.so` and onto `/home/me/app/bin/app` therefore stops naming
+/// `/usr/lib/libbaz.so` and starts naming `/home/me/app/bin/libbaz.so` — a file
+/// that need not exist, and that anyone who can write next to the executable
+/// gets to supply. Such an entry is inherited as the absolute path solder
+/// resolved it to, which is the file the merged library was loading, and the
+/// merge fails outright when solder cannot work out which file that is.
 pub fn inherited_needed<'a>(
     merged_lib_deps: impl IntoIterator<Item = &'a str>,
     exe_needed: &[String],
     remove_needed: &[String],
     injected: &HashSet<String>,
-    exports: &mut dyn FnMut(&str) -> Option<HashSet<String>>,
-) -> Vec<String> {
+    resolve: &mut dyn FnMut(&str) -> Option<ResolvedDependency>,
+) -> Result<Vec<String>> {
     if injected.is_empty() {
         // Nothing was referenced beyond what the executable already imports,
         // so every dependency of the merged libraries goes away with them.
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let already_linked: HashSet<&str> = exe_needed
@@ -479,13 +496,19 @@ pub fn inherited_needed<'a>(
         .map(String::as_str)
         .collect();
 
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut inherited: Vec<String> = Vec::new();
-    for soname in merged_lib_deps {
-        if already_linked.contains(soname) || inherited.iter().any(|s| s == soname) {
+    for dep in merged_lib_deps {
+        if already_linked.contains(dep) || !seen.insert(dep) {
             continue;
         }
-        match exports(soname) {
-            Some(defined) => {
+        // glibc's `_dl_map_object` branches on `strchr (name, '/')`: an entry
+        // with a slash in it is a filename opened directly, everything else a
+        // soname looked up on the search path. Only the former is tied to the
+        // object that declared it.
+        let names_a_path = dep.contains('/');
+        match resolve(dep) {
+            Some((path, defined)) => {
                 let used: Vec<&str> = injected
                     .iter()
                     .filter(|name| defined.contains(*name))
@@ -493,31 +516,66 @@ pub fn inherited_needed<'a>(
                     .collect();
                 if used.is_empty() {
                     debug!(
-                        soname,
+                        soname = dep,
                         "Merged library's dependency provides nothing the extracted code \
                          references; leaving it out of DT_NEEDED"
                     );
+                    continue;
+                }
+                let entry = if names_a_path {
+                    let resolved = path
+                        .to_str()
+                        .with_context(|| {
+                            format!(
+                                "a merged library depends on '{dep}', which resolves to {}; \
+                                 that path is not valid UTF-8 and cannot be written into \
+                                 .dynstr",
+                                path.display()
+                            )
+                        })?
+                        .to_owned();
+                    if resolved != dep {
+                        debug!(
+                            dependency = dep,
+                            resolved, "Inheriting a path-valued dependency as the file it names"
+                        );
+                    }
+                    resolved
                 } else {
-                    debug!(
-                        soname,
-                        symbols = ?used,
-                        "Inheriting DT_NEEDED from merged library"
-                    );
-                    inherited.push(soname.to_owned());
+                    dep.to_owned()
+                };
+                debug!(
+                    soname = entry,
+                    symbols = ?used,
+                    "Inheriting DT_NEEDED from merged library"
+                );
+                if !already_linked.contains(entry.as_str()) && !inherited.contains(&entry) {
+                    inherited.push(entry);
                 }
             }
+            // Inheriting the entry as it stands would point the executable at
+            // a file next to itself (or next to whatever directory it is run
+            // from), so there is nothing safe to write here.
+            None if names_a_path => anyhow::bail!(
+                "a merged library depends on '{dep}', which solder cannot resolve to a file. \
+                 The executable cannot inherit that entry as it stands: a path in DT_NEEDED \
+                 is read relative to the object that declared it, so on the executable it \
+                 names a different file — for a relative path, one in the working directory \
+                 of whoever runs it. Leave that library out of the merge, or relink it \
+                 against a soname or an absolute path."
+            ),
             None => {
                 warn!(
-                    soname,
+                    soname = dep,
                     "Dependency of a merged library could not be found; adding it to DT_NEEDED \
                      without checking whether the extracted code needs it"
                 );
-                inherited.push(soname.to_owned());
+                inherited.push(dep.to_owned());
             }
         }
     }
 
-    inherited
+    Ok(inherited)
 }
 
 /// For a given set of imported symbols, find the file offsets of their JUMP_SLOT
@@ -593,7 +651,7 @@ pub fn symbol_is_zero_initialized(lib_path: &std::path::Path, name: &str) -> Res
 
 #[cfg(test)]
 mod inherited_needed_tests {
-    use super::{HashSet, inherited_needed};
+    use super::{HashSet, PathBuf, ResolvedDependency, inherited_needed};
 
     fn names(entries: &[&str]) -> Vec<String> {
         entries.iter().map(|s| s.to_string()).collect()
@@ -603,16 +661,17 @@ mod inherited_needed_tests {
         entries.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Resolver over a fixed soname → exports table; anything not listed is
-    /// treated as a library that could not be found.
+    /// Resolver over a fixed table of `DT_NEEDED` entry → (the file it names,
+    /// the symbols that file exports); anything not listed is treated as a
+    /// library that could not be found.
     fn resolver<'t>(
-        table: &'t [(&'t str, &'t [&'t str])],
-    ) -> impl FnMut(&str) -> Option<HashSet<String>> + 't {
-        move |soname: &str| {
+        table: &'t [(&'t str, &'t str, &'t [&'t str])],
+    ) -> impl FnMut(&str) -> Option<ResolvedDependency> + 't {
+        move |entry: &str| {
             table
                 .iter()
-                .find(|(name, _)| *name == soname)
-                .map(|(_, syms)| set(syms))
+                .find(|(needed, _, _)| *needed == entry)
+                .map(|(_, path, syms)| (PathBuf::from(path), set(syms)))
         }
     }
 
@@ -621,8 +680,12 @@ mod inherited_needed_tests {
         // libcrypto is merged away; the extracted code still calls into
         // libzstd, which was reachable only through libcrypto's DT_NEEDED.
         let mut exports = resolver(&[
-            ("libzstd.so.1", &["ZSTD_compress", "ZSTD_decompress"]),
-            ("libc.so.6", &["memcpy"]),
+            (
+                "libzstd.so.1",
+                "/usr/lib64/libzstd.so.1",
+                &["ZSTD_compress", "ZSTD_decompress"],
+            ),
+            ("libc.so.6", "/usr/lib64/libc.so.6", &["memcpy"]),
         ]);
         let inherited = inherited_needed(
             ["libzstd.so.1", "libc.so.6"],
@@ -630,20 +693,26 @@ mod inherited_needed_tests {
             &names(&["libcrypto.so.3"]),
             &set(&["ZSTD_compress", "memcpy"]),
             &mut exports,
-        );
+        )
+        .expect("resolvable dependencies");
         assert_eq!(inherited, names(&["libzstd.so.1"]));
     }
 
     #[test]
     fn a_dependency_nothing_references_is_left_out() {
-        let mut exports = resolver(&[("libzstd.so.1", &["ZSTD_compress"])]);
+        let mut exports = resolver(&[(
+            "libzstd.so.1",
+            "/usr/lib64/libzstd.so.1",
+            &["ZSTD_compress"],
+        )]);
         let inherited = inherited_needed(
             ["libzstd.so.1"],
             &names(&["libcrypto.so.3", "libc.so.6"]),
             &names(&["libcrypto.so.3"]),
             &set(&["memcpy", "strlen"]),
             &mut exports,
-        );
+        )
+        .expect("resolvable dependencies");
         assert!(
             inherited.is_empty(),
             "a dependency the extracted code never calls must stay dropped, got {inherited:?}"
@@ -654,14 +723,15 @@ mod inherited_needed_tests {
     fn a_dependency_that_is_itself_merged_away_is_not_re_added() {
         // Both libcrypto and libz are merged, and libcrypto depends on libz.
         // libz's symbols come from the merged units, not from a DT_NEEDED.
-        let mut exports = resolver(&[("libz.so.1", &["compress"])]);
+        let mut exports = resolver(&[("libz.so.1", "/usr/lib64/libz.so.1", &["compress"])]);
         let inherited = inherited_needed(
             ["libz.so.1"],
             &names(&["libcrypto.so.3", "libz.so.1", "libc.so.6"]),
             &names(&["libcrypto.so.3", "libz.so.1"]),
             &set(&["compress"]),
             &mut exports,
-        );
+        )
+        .expect("resolvable dependencies");
         assert!(
             inherited.is_empty(),
             "a merged-away library must not be put back in DT_NEEDED, got {inherited:?}"
@@ -670,14 +740,15 @@ mod inherited_needed_tests {
 
     #[test]
     fn a_dependency_the_executable_already_links_is_not_duplicated() {
-        let mut exports = resolver(&[("libc.so.6", &["memcpy"])]);
+        let mut exports = resolver(&[("libc.so.6", "/usr/lib64/libc.so.6", &["memcpy"])]);
         let inherited = inherited_needed(
             ["libc.so.6"],
             &names(&["libcrypto.so.3", "libc.so.6"]),
             &names(&["libcrypto.so.3"]),
             &set(&["memcpy"]),
             &mut exports,
-        );
+        )
+        .expect("resolvable dependencies");
         assert!(inherited.is_empty(), "{inherited:?}");
     }
 
@@ -690,7 +761,8 @@ mod inherited_needed_tests {
             &names(&["libcrypto.so.3"]),
             &set(&["ZSTD_compress"]),
             &mut exports,
-        );
+        )
+        .expect("an unresolvable soname is not fatal");
         assert_eq!(inherited, names(&["libzstd.so.1"]));
     }
 
@@ -706,13 +778,14 @@ mod inherited_needed_tests {
             &names(&["libcrypto.so.3"]),
             &HashSet::new(),
             &mut exports,
-        );
+        )
+        .expect("nothing to inherit");
         assert!(inherited.is_empty(), "{inherited:?}");
     }
 
     #[test]
     fn a_dependency_shared_by_two_merged_libraries_is_added_once() {
-        let mut exports = resolver(&[("libz.so.1", &["compress"])]);
+        let mut exports = resolver(&[("libz.so.1", "/usr/lib64/libz.so.1", &["compress"])]);
         let inherited = inherited_needed(
             // The same soname twice over, as two merged libraries sharing a
             // dependency hands it in.
@@ -721,8 +794,96 @@ mod inherited_needed_tests {
             &names(&["libcrypto.so.3", "libssl.so.3"]),
             &set(&["compress"]),
             &mut exports,
-        );
+        )
+        .expect("resolvable dependencies");
         assert_eq!(inherited, names(&["libz.so.1"]));
+    }
+
+    /// `$ORIGIN` in the dependency of a merged library is that *library's*
+    /// directory. Copied onto the executable's `DT_NEEDED` unchanged it becomes
+    /// the executable's directory, so the merged code would call into whatever
+    /// file happens to sit beside the binary instead of the one it was linked
+    /// against.
+    #[test]
+    fn an_origin_relative_dependency_is_inherited_as_the_file_it_named() {
+        let mut exports = resolver(&[(
+            "$ORIGIN/libbaz.so",
+            "/opt/vendor/lib/libbaz.so",
+            &["baz_init"],
+        )]);
+        let inherited = inherited_needed(
+            ["$ORIGIN/libbaz.so"],
+            &names(&["libbar.so", "libc.so.6"]),
+            &names(&["libbar.so"]),
+            &set(&["baz_init"]),
+            &mut exports,
+        )
+        .expect("a resolvable path-valued dependency");
+        assert_eq!(inherited, names(&["/opt/vendor/lib/libbaz.so"]));
+    }
+
+    /// An absolute path names the same file whoever reads it, so it is
+    /// inherited as it stands.
+    #[test]
+    fn an_absolute_path_dependency_is_inherited_unchanged() {
+        let mut exports = resolver(&[(
+            "/opt/vendor/lib/libbaz.so",
+            "/opt/vendor/lib/libbaz.so",
+            &["baz_init"],
+        )]);
+        let inherited = inherited_needed(
+            ["/opt/vendor/lib/libbaz.so"],
+            &names(&["libbar.so", "libc.so.6"]),
+            &names(&["libbar.so"]),
+            &set(&["baz_init"]),
+            &mut exports,
+        )
+        .expect("a resolvable path-valued dependency");
+        assert_eq!(inherited, names(&["/opt/vendor/lib/libbaz.so"]));
+    }
+
+    /// A path solder cannot resolve is the one case where there is nothing
+    /// right to write: `../lib/libbaz.so` on the executable's `DT_NEEDED` is
+    /// read against the working directory of whoever runs it, which is as good
+    /// as letting the caller choose the library. Inheriting it verbatim — what
+    /// a bare soname gets — has to be a merge failure instead.
+    #[test]
+    fn an_unresolvable_path_dependency_fails_the_merge() {
+        let mut exports = resolver(&[]);
+        let err = inherited_needed(
+            ["../lib/libbaz.so"],
+            &names(&["libbar.so", "libc.so.6"]),
+            &names(&["libbar.so"]),
+            &set(&["baz_init"]),
+            &mut exports,
+        )
+        .expect_err("an unresolvable path-valued dependency is fatal");
+        assert!(
+            err.to_string().contains("../lib/libbaz.so"),
+            "the error has to name the entry: {err}"
+        );
+    }
+
+    /// The check is on the dependency, not on the merge as a whole: a
+    /// path-valued entry nothing in the extracted code needs is dropped like
+    /// any other unused dependency, so it never reaches the point of having to
+    /// be rewritten.
+    #[test]
+    fn an_unused_path_dependency_is_dropped_rather_than_failing() {
+        let mut exports = resolver(&[(
+            "$ORIGIN/libbaz.so",
+            "/opt/vendor/lib/libbaz.so",
+            &["baz_init"],
+        )]);
+        let inherited = inherited_needed(
+            ["$ORIGIN/libbaz.so"],
+            &names(&["libbar.so", "libc.so.6"]),
+            &names(&["libbar.so"]),
+            &set(&["memcpy"]),
+            &mut exports,
+        )
+        .expect("an unused dependency is not fatal");
+        assert!(inherited.is_empty(), "{inherited:?}");
     }
 }
 

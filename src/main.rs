@@ -244,8 +244,9 @@ fn run() -> Result<()> {
                 &ldso_cache,
                 origin,
             )
-            .and_then(|path| symbol_analysis::read_library_dynamic(&path))
-            .map(|lib| lib.defined)
+            .and_then(|path| {
+                symbol_analysis::read_library_dynamic(&path).map(|lib| (path, lib.defined))
+            })
             .ok()
         };
 
@@ -257,7 +258,7 @@ fn run() -> Result<()> {
             &plan.remove_needed,
             &injected,
             &mut resolve_exports,
-        )
+        )?
     };
     info!(add_needed=?plan.add_needed, "DT_NEEDED entries to add");
 
