@@ -177,6 +177,26 @@ impl ExtractionState {
             });
         }
     }
+
+    /// Finish the relocations collected for unit `id`: queue the placeholder
+    /// resolutions keyed to their indices, and zero and record the copied GOT
+    /// slots in `bytes` that ld.so has to fill in.
+    ///
+    /// Hands back the unit's relocation list and the units it depends on, for
+    /// the caller to store and to enqueue. Extracting a symbol and extracting
+    /// a data section blob both end this way.
+    fn take_unit_relocs(
+        &mut self,
+        id: UnitId,
+        bytes: &mut [u8],
+        relocs: UnitRelocs,
+    ) -> (Vec<ExtractedReloc>, IndexSet<UnitKey>) {
+        for (reloc_idx, dep_key) in relocs.pending {
+            self.pending.push((id, reloc_idx, dep_key));
+        }
+        self.register_got_slot_fixups(id, bytes, relocs.got_fixups);
+        (relocs.relocations, relocs.new_deps)
+    }
 }
 
 /// Extract all symbols transitively reachable from `seeds` (direct imports).
@@ -276,20 +296,49 @@ pub fn extract_units(
     Ok((state.units, state.init_fini, state.got_slot_fixups))
 }
 
-/// Record a dependency on `dep_key`, queue the relocation that will be pushed
-/// at index `reloc_idx` for second-pass resolution, and hand back the
-/// placeholder target to store in it until then. The three steps have to stay
-/// in lockstep — the pending entry is keyed by the relocation's index — so they
-/// live in one place.
-fn depend_on(
-    dep_key: UnitKey,
-    reloc_idx: usize,
-    new_deps: &mut IndexSet<UnitKey>,
-    pending_relocs: &mut Vec<(usize, UnitKey)>,
-) -> RelocTarget {
-    new_deps.insert(dep_key.clone());
-    pending_relocs.push((reloc_idx, dep_key));
-    RelocTarget::MergedUnit(UnitId(u32::MAX))
+/// Everything collecting one unit's relocations produces: the relocations
+/// themselves, and the three things they drag along.
+///
+/// The four have to travel together, because a pending resolution is keyed by
+/// the index of the relocation it belongs to. Carrying them as four separate
+/// out-parameters is what took `collect_dynamic_range_relocs` to eleven
+/// arguments, and what left every caller of `depend_on` responsible for
+/// handing it the index its own relocation was about to land at.
+#[derive(Default)]
+struct UnitRelocs {
+    /// The unit's relocations, in the order they were collected.
+    relocations: Vec<ExtractedReloc>,
+    /// Units that have to be extracted for those relocations to have targets.
+    new_deps: IndexSet<UnitKey>,
+    /// `(index into `relocations`, target)` per placeholder target, for the
+    /// second pass in `extract_units` to resolve.
+    pending: Vec<(usize, UnitKey)>,
+    /// `(offset within the unit, symbol name, weak)` per copied GOT slot that
+    /// ld.so has to fill in (see `GotSlotFixup`).
+    got_fixups: Vec<(u64, String, bool)>,
+}
+
+impl UnitRelocs {
+    /// Record a dependency on `dep_key`, queue the relocation that is about to
+    /// be pushed for second-pass resolution, and hand back the placeholder
+    /// target to store in it until then.
+    ///
+    /// The queued entry is keyed by that relocation's index, which is read off
+    /// `relocations` here rather than passed in — so the two cannot get out of
+    /// step.
+    fn depend_on(&mut self, dep_key: UnitKey) -> RelocTarget {
+        self.new_deps.insert(dep_key.clone());
+        self.pending.push((self.relocations.len(), dep_key));
+        RelocTarget::MergedUnit(UnitId(u32::MAX))
+    }
+
+    /// Whether a relocation already covers `offset`, so a later pass leaves
+    /// the target an earlier one resolved alone.
+    fn covers(&self, offset: u64) -> bool {
+        self.relocations
+            .iter()
+            .any(|r| r.offset_within_unit == offset)
+    }
 }
 
 /// A synthetic PC-relative relocation over a displacement the instruction
@@ -473,8 +522,13 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     };
 
     let lib_index = state.lib_index(&key.lib, elf64);
+    let lib = Lib {
+        path: &key.lib,
+        elf: elf64,
+        index: &lib_index,
+    };
 
-    let mut new_deps: IndexSet<UnitKey> = IndexSet::new();
+    let mut relocs = UnitRelocs::default();
 
     // Extract init/fini arrays from this library if we haven't already. Each
     // constructor/destructor becomes an extraction root of its own: when the
@@ -484,13 +538,13 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     // extract_init_fini_arrays.
     if !state.processed_libs.contains(&key.lib) {
         state.processed_libs.insert(key.lib.clone());
-        let lib_init_fini = extract_init_fini_arrays(elf64, &lib_index, &key.lib)?;
+        let lib_init_fini = extract_init_fini_arrays(lib)?;
         for entry in lib_init_fini
             .init_entries
             .iter()
             .chain(&lib_init_fini.fini_entries)
         {
-            new_deps.insert(UnitKey {
+            relocs.new_deps.insert(UnitKey {
                 lib: entry.source_lib.clone(),
                 sym: entry.unit_name.clone(),
             });
@@ -506,7 +560,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     }
 
     // Find the symbol in .symtab first, fall back to .dynsym.
-    let sym = find_symbol(elf64, &lib_index, &key.sym)
+    let sym = find_symbol(lib, &key.sym)
         .with_context(|| format!("symbol '{}' in {}", key.sym, key.lib.display()))?;
 
     // Determine symbol size.
@@ -514,7 +568,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
         sym.size as usize
     } else {
         // Infer from the next symbol in the same section by address.
-        infer_symbol_size(elf64, &lib_index, &sym)?
+        infer_symbol_size(lib, &sym)?
     };
 
     if sym_size == 0 {
@@ -559,10 +613,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     let alignment = section.align().max(1);
 
     // Collect relocations that fall within this symbol's byte range.
-    let mut relocations: Vec<ExtractedReloc> = Vec::new();
-    // Track which relocations need resolution: (reloc_index, dep_key)
-    let mut pending_relocs: Vec<(usize, UnitKey)> = Vec::new();
-
     for (roff, reloc) in section.relocations() {
         // Only care about relocations within our symbol's byte range.
         if roff < sym_vaddr || roff >= sym_vaddr + sym_size as u64 {
@@ -593,16 +643,10 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                 if state.external_syms.contains(&ts_name) || ts_name.is_empty() {
                     RelocTarget::External(ts_name)
                 } else if let Some(other_lib) = state.cross_lib_syms.get(&ts_name).cloned() {
-                    let dep_key = UnitKey {
+                    relocs.depend_on(UnitKey {
                         lib: other_lib,
                         sym: ts_name,
-                    };
-                    depend_on(
-                        dep_key,
-                        relocations.len(),
-                        &mut new_deps,
-                        &mut pending_relocs,
-                    )
+                    })
                 } else {
                     bail!(
                         "symbol '{}' in {}: references external symbol '{}' which is not \
@@ -623,24 +667,17 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                 } else {
                     // Try to extract this data section containing the symbol
                     // This will populate state.data_blobs if it's a data section
-                    let extract_result =
-                        ensure_data_blob_extracted(elf64, &lib_index, ts_vaddr, &key.lib, state);
+                    let extract_result = ensure_data_blob_extracted(lib, ts_vaddr, state);
                     if let Ok(Some((blob_id, blob_base, blob_deps))) = extract_result {
                         let offset_in_blob = ts_vaddr - blob_base;
-                        new_deps.extend(blob_deps);
+                        relocs.new_deps.extend(blob_deps);
                         RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
                     } else {
                         // It's a code symbol or unknown - extract as a unit
-                        let dep_key = UnitKey {
+                        relocs.depend_on(UnitKey {
                             lib: key.lib.clone(),
                             sym: ts_name,
-                        };
-                        depend_on(
-                            dep_key,
-                            relocations.len(),
-                            &mut new_deps,
-                            &mut pending_relocs,
-                        )
+                        })
                     }
                 }
             }
@@ -649,7 +686,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
             RelocTarget::MergedUnit(UnitId(u32::MAX))
         };
 
-        relocations.push(ExtractedReloc {
+        relocs.relocations.push(ExtractedReloc {
             offset_within_unit,
             kind,
             encoding,
@@ -662,27 +699,20 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     // Data symbol units: pick up .rela.dyn entries within the symbol's range
     // (e.g. __dso_handle's self-pointing RELATIVE, function pointers in .data).
     // Section-attached relocation tables don't exist in linked shared objects.
-    let mut got_fixup_offsets: Vec<(u64, String, bool)> = Vec::new();
     if section_kind != SectionKind::Text {
         collect_dynamic_range_relocs(
-            elf64,
-            &lib_index,
-            &key.lib,
+            lib,
             &key.sym,
-            sym_vaddr,
-            sym_size as u64,
+            sym_vaddr..sym_vaddr + sym_size as u64,
             state,
-            &mut relocations,
-            &mut new_deps,
-            &mut pending_relocs,
-            &mut got_fixup_offsets,
+            &mut relocs,
         )?;
     }
 
     // A text unit's bytes are the function plus whatever sits between its last
     // instruction and the next bound, which is not code (see `code_extent`).
     let code_len = if section_kind == SectionKind::Text {
-        code_extent(&bytes, sym_vaddr, &lib_index)
+        code_extent(&bytes, sym_vaddr, lib.index)
     } else {
         bytes.len()
     };
@@ -701,10 +731,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
             }
 
             // Check if there's already a relocation at this offset (from .rela.text)
-            if relocations
-                .iter()
-                .any(|r| r.offset_within_unit == rip_ref.offset as u64)
-            {
+            if relocs.covers(rip_ref.offset as u64) {
                 continue;
             }
 
@@ -729,19 +756,14 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                     let target = if !state.external_syms.contains(&ext_name)
                         && let Some(other_lib) = state.cross_lib_syms.get(&ext_name).cloned()
                     {
-                        depend_on(
-                            UnitKey {
-                                lib: other_lib,
-                                sym: ext_name,
-                            },
-                            relocations.len(),
-                            &mut new_deps,
-                            &mut pending_relocs,
-                        )
+                        relocs.depend_on(UnitKey {
+                            lib: other_lib,
+                            sym: ext_name,
+                        })
                     } else {
                         RelocTarget::External(ext_name)
                     };
-                    relocations.push(pcrel_reloc(
+                    relocs.relocations.push(pcrel_reloc(
                         rip_ref.offset as u64,
                         reloc_size,
                         rip_ref.addend,
@@ -756,24 +778,19 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                     // MD5_Update/MD5_Final call directly. Without this, the call
                     // bytes were copied verbatim and the stale displacement
                     // pointed into unmapped memory, crashing at runtime.
-                    let dep = resolve_owning_unit(elf64, &lib_index, target_addr).or_else(|| {
-                        anon_target_is_extractable(elf64, target_addr)
+                    let dep = resolve_owning_unit(lib, target_addr).or_else(|| {
+                        anon_target_is_extractable(lib.elf, target_addr)
                             .then(|| (anon_unit_name(target_addr), 0))
                     });
                     if let Some((target_name, offset_in_target)) = dep {
-                        let target = depend_on(
-                            UnitKey {
-                                lib: key.lib.clone(),
-                                sym: target_name,
-                            },
-                            relocations.len(),
-                            &mut new_deps,
-                            &mut pending_relocs,
-                        );
+                        let target = relocs.depend_on(UnitKey {
+                            lib: key.lib.clone(),
+                            sym: target_name,
+                        });
                         // The relocator computes S + A - P against the unit's
                         // base, so an interior target is reached through the
                         // addend.
-                        relocations.push(pcrel_reloc(
+                        relocs.relocations.push(pcrel_reloc(
                             rip_ref.offset as u64,
                             reloc_size,
                             rip_ref.addend + offset_in_target as i64,
@@ -795,19 +812,13 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                 // label inside the function doing the load). Resolve it to an
                 // owning unit first; anything else falls through to the blob
                 // path below.
-                if let Some((target_name, offset_in_target)) =
-                    resolve_owning_unit(elf64, &lib_index, target_addr)
+                if let Some((target_name, offset_in_target)) = resolve_owning_unit(lib, target_addr)
                 {
-                    let target = depend_on(
-                        UnitKey {
-                            lib: key.lib.clone(),
-                            sym: target_name,
-                        },
-                        relocations.len(),
-                        &mut new_deps,
-                        &mut pending_relocs,
-                    );
-                    relocations.push(pcrel_reloc(
+                    let target = relocs.depend_on(UnitKey {
+                        lib: key.lib.clone(),
+                        sym: target_name,
+                    });
+                    relocs.relocations.push(pcrel_reloc(
                         rip_ref.offset as u64,
                         32,
                         rip_ref.addend + offset_in_target as i64,
@@ -817,11 +828,11 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                 }
                 // Otherwise try to extract the data section
                 if let Some((blob_id, blob_base, blob_deps)) =
-                    ensure_data_blob_extracted(elf64, &lib_index, target_addr, &key.lib, state)?
+                    ensure_data_blob_extracted(lib, target_addr, state)?
                 {
                     let offset_in_blob = target_addr - blob_base;
-                    new_deps.extend(blob_deps);
-                    relocations.push(pcrel_reloc(
+                    relocs.new_deps.extend(blob_deps);
+                    relocs.relocations.push(pcrel_reloc(
                         rip_ref.offset as u64,
                         32,
                         rip_ref.addend,
@@ -842,7 +853,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     // Jump table detection via symbolic execution
     if section_kind == SectionKind::Text
         && let Ok(jump_tables) =
-            crate::jump_table::detect_jump_tables(&bytes[..code_len], sym_vaddr, &key.sym, elf64)
+            crate::jump_table::detect_jump_tables(&bytes[..code_len], sym_vaddr, &key.sym, lib.elf)
     {
         if !jump_tables.is_empty() {
             debug!(
@@ -855,9 +866,9 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
         for table in jump_tables {
             // 1. Ensure .rodata blob containing table is extracted
             if let Some((blob_id, blob_base, blob_deps)) =
-                ensure_data_blob_extracted(elf64, &lib_index, table.table_vaddr, &key.lib, state)?
+                ensure_data_blob_extracted(lib, table.table_vaddr, state)?
             {
-                new_deps.extend(blob_deps);
+                relocs.new_deps.extend(blob_deps);
                 // 2. Create relocations for each table entry
                 for (idx, target_addr) in table.targets.iter().enumerate() {
                     let entry_offset_in_blob = (table.table_vaddr - blob_base) + (idx * 4) as u64;
@@ -906,7 +917,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                     // The target is this very unit, which is already being
                     // extracted, so there is no new dependency to enqueue —
                     // only a pending resolution of the placeholder UnitId.
-                    // (Not `pending_relocs`: that one is for relocations of
+                    // (Not `relocs.pending`: that one is for relocations of
                     // the current unit, these belong to the blob.)
                     state.pending.push((
                         blob_id,
@@ -929,7 +940,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     // alignment padding that follows the branch instead.
     // (Reloc indices are preserved, so pending resolutions stay valid.)
     let mut bytes = bytes;
-    for reloc in relocations.iter_mut() {
+    for reloc in relocs.relocations.iter_mut() {
         if reloc.size != 8 {
             continue;
         }
@@ -963,12 +974,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     let id = state.alloc_id();
     state.extracted.insert(key.clone(), id);
 
-    // Record pending resolutions using our explicit tracking.
-    for (reloc_idx, dep_key) in pending_relocs {
-        state.pending.push((id, reloc_idx, dep_key));
-    }
-
-    state.register_got_slot_fixups(id, &mut bytes, got_fixup_offsets);
+    let (relocations, new_deps) = state.take_unit_relocs(id, &mut bytes, relocs);
 
     state.push_unit(ExtractedUnit {
         id,
@@ -1072,20 +1078,30 @@ impl LibIndex {
     }
 }
 
+/// One library as extraction sees it: the file it came from, its parsed ELF,
+/// and the lookups [`LibIndex`] precomputed over it.
+///
+/// The three are never wanted apart — a name is resolved through the index,
+/// the bytes behind it read out of the ELF, and whatever comes out keyed by
+/// the path — so they are threaded through as one handle rather than as three
+/// parameters repeated down the call chain.
+#[derive(Clone, Copy)]
+struct Lib<'a, 'data> {
+    path: &'a Path,
+    elf: &'a object::read::elf::ElfFile64<'data>,
+    index: &'a LibIndex,
+}
+
 /// Find a symbol by name using the precomputed library index, falling back to
 /// the ELF only for synthetic anonymous-unit names.
-fn find_symbol(
-    elf: &object::read::elf::ElfFile64<'_>,
-    index: &LibIndex,
-    name: &str,
-) -> Result<SymInfo> {
+fn find_symbol(lib: Lib<'_, '_>, name: &str) -> Result<SymInfo> {
     // Synthetic anonymous unit: resolve the address encoded in the name to the
     // executable section that contains it. Size is left at 0 so the caller
     // infers it from the next symbol boundary.
     if let Some(hex) = name.strip_prefix(ANON_UNIT_PREFIX) {
         let addr = u64::from_str_radix(hex.trim_start_matches("0x"), 16)
             .with_context(|| format!("malformed anonymous unit name '{name}'"))?;
-        for section in elf.sections() {
+        for section in lib.elf.sections() {
             let sec_addr = section.address();
             if addr >= sec_addr
                 && addr < sec_addr + section.size()
@@ -1101,7 +1117,7 @@ fn find_symbol(
         bail!("anonymous unit address {addr:#x} not in any executable section");
     }
 
-    index
+    lib.index
         .by_name
         .get(name)
         .cloned()
@@ -1153,16 +1169,12 @@ fn anon_unit_name(addr: u64) -> String {
 ///
 /// Returns `None` when nothing is known to own `addr`; the caller decides
 /// whether to fall back to an anonymous unit starting there.
-fn resolve_owning_unit(
-    elf: &object::read::elf::ElfFile64<'_>,
-    index: &LibIndex,
-    addr: u64,
-) -> Option<(String, u64)> {
+fn resolve_owning_unit(lib: Lib<'_, '_>, addr: u64) -> Option<(String, u64)> {
     // A symbol defined at exactly this address, as long as it has a usable
     // size: zero-size boundary markers (e.g. `__TMC_END__`, which sits at the
     // exact end of .data with nothing after it) own nothing.
-    if let Some(name) = find_symbol_at_address(index, addr)
-        && symbol_unit_size(elf, index, &name).is_some_and(|size| size > 0)
+    if let Some(name) = find_symbol_at_address(lib.index, addr)
+        && symbol_unit_size(lib, &name).is_some_and(|size| size > 0)
     {
         return Some((name, 0));
     }
@@ -1171,28 +1183,24 @@ fn resolve_owning_unit(
     // a named symbol at that function's entry so the interior reference shares
     // the unit the function is already extracted as, instead of duplicating its
     // tail under an anonymous name.
-    let (fde_start, _) = index.fdes.containing(addr)?;
+    let (fde_start, _) = lib.index.fdes.containing(addr)?;
     let offset = addr - fde_start;
-    if let Some(name) = find_symbol_at_address(index, fde_start)
-        && symbol_unit_size(elf, index, &name).is_some_and(|size| size as u64 > offset)
+    if let Some(name) = find_symbol_at_address(lib.index, fde_start)
+        && symbol_unit_size(lib, &name).is_some_and(|size| size as u64 > offset)
     {
         return Some((name, offset));
     }
-    anon_target_is_extractable(elf, fde_start).then(|| (anon_unit_name(fde_start), offset))
+    anon_target_is_extractable(lib.elf, fde_start).then(|| (anon_unit_name(fde_start), offset))
 }
 
 /// The size `process_symbol` would extract for `name`, or `None` if the symbol
 /// cannot be resolved at all.
-fn symbol_unit_size(
-    elf: &object::read::elf::ElfFile64<'_>,
-    index: &LibIndex,
-    name: &str,
-) -> Option<usize> {
-    let sym = find_symbol(elf, index, name).ok()?;
+fn symbol_unit_size(lib: Lib<'_, '_>, name: &str) -> Option<usize> {
+    let sym = find_symbol(lib, name).ok()?;
     if sym.size > 0 {
         Some(sym.size as usize)
     } else {
-        infer_symbol_size(elf, index, &sym).ok()
+        infer_symbol_size(lib, &sym).ok()
     }
 }
 
@@ -1651,43 +1659,40 @@ fn section_contents(elf: &object::read::elf::ElfFile64<'_>, info: &SectionInfo) 
     })
 }
 
-/// Collect dynamic relocations (.rela.dyn) that fall within
-/// [range_start, range_start + range_size) into `relocations`, resolving their
-/// targets. Linked shared objects carry data relocations only in .rela.dyn —
-/// there are no section-attached relocation tables — so every extracted data
-/// range (whole-section blob or single-symbol unit) must consult this table or
-/// its copied bytes hold stale library VAs.
+/// Collect the dynamic relocations (.rela.dyn) that fall within `range` into
+/// `relocs`, resolving their targets. Linked shared objects carry data
+/// relocations only in .rela.dyn — there are no section-attached relocation
+/// tables — so every extracted data range (whole-section blob or single-symbol
+/// unit) must consult this table or its copied bytes hold stale library VAs.
 ///
-/// Offsets pushed into `relocations`/`got_fixups` are relative to `range_start`.
-#[allow(clippy::too_many_arguments)]
+/// `ctx` names the symbol or section being extracted. Offsets pushed into
+/// `relocs` are relative to `range.start`.
 fn collect_dynamic_range_relocs(
-    elf64: &object::read::elf::ElfFile64<'_>,
-    index: &LibIndex,
-    lib: &Path,
+    lib: Lib<'_, '_>,
     ctx: &str,
-    range_start: u64,
-    range_size: u64,
+    range: std::ops::Range<u64>,
     state: &mut ExtractionState,
-    relocations: &mut Vec<ExtractedReloc>,
-    new_deps: &mut IndexSet<UnitKey>,
-    pending_relocs: &mut Vec<(usize, UnitKey)>,
-    got_fixups: &mut Vec<(u64, String, bool)>,
+    relocs: &mut UnitRelocs,
 ) -> Result<()> {
-    let Some(dyn_relocs) = elf64.dynamic_relocations() else {
+    let Some(dyn_relocs) = lib.elf.dynamic_relocations() else {
         return Ok(());
     };
     // Which offsets already carry a relocation, so a dynamic entry does not
-    // overwrite one the caller already resolved. Scanning `relocations` for
-    // each candidate instead made this quadratic in the number of relocations
-    // in range: `libcrypto.so.3`'s `.data.rel.ro` is half a megabyte of
-    // pointers covered by ~25k `R_X86_64_RELATIVE` entries, and the pairwise
+    // overwrite one the caller already resolved. Scanning `relocs` for each
+    // candidate instead made this quadratic in the number of relocations in
+    // range: `libcrypto.so.3`'s `.data.rel.ro` is half a megabyte of pointers
+    // covered by ~25k `R_X86_64_RELATIVE` entries, and the pairwise
     // comparisons alone were most of the extraction.
-    let mut occupied: HashSet<u64> = relocations.iter().map(|r| r.offset_within_unit).collect();
+    let mut occupied: HashSet<u64> = relocs
+        .relocations
+        .iter()
+        .map(|r| r.offset_within_unit)
+        .collect();
     for (roff, reloc) in dyn_relocs {
-        if roff < range_start || roff >= range_start + range_size {
+        if !range.contains(&roff) {
             continue;
         }
-        let offset_within_unit = roff - range_start;
+        let offset_within_unit = roff - range.start;
         if occupied.contains(&offset_within_unit) {
             continue;
         }
@@ -1695,13 +1700,13 @@ fn collect_dynamic_range_relocs(
         // Validate relocation kind (same as code extraction)
         let kind = reloc.kind();
         let encoding = reloc.encoding();
-        reject_got_reloc(kind, encoding, ctx, lib)?;
-        reject_unliftable_dynamic_reloc(kind, elf_r_type(&reloc), ctx, lib)?;
+        reject_got_reloc(kind, encoding, ctx, lib.path)?;
+        reject_unliftable_dynamic_reloc(kind, elf_r_type(&reloc), ctx, lib.path)?;
 
         // Resolve the relocation target symbol. Dynamic relocation symbol
         // indices refer to .dynsym, not .symtab.
         let target_sym = match reloc.target() {
-            object::RelocationTarget::Symbol(si) => dynamic_symbol_by_index(elf64, si),
+            object::RelocationTarget::Symbol(si) => dynamic_symbol_by_index(lib.elf, si),
             _ => None,
         };
 
@@ -1720,11 +1725,10 @@ fn collect_dynamic_range_relocs(
                     // Sole provider is another merged (removed) library —
                     // resolve directly to the merged copy, as ld.so would
                     // have resolved to that library.
-                    let dep_key = UnitKey {
+                    relocs.depend_on(UnitKey {
                         lib: other_lib,
                         sym: ts_name,
-                    };
-                    depend_on(dep_key, relocations.len(), new_deps, pending_relocs)
+                    })
                 } else {
                     // A slot holding an external symbol's address (a copied
                     // GOT slot, or a data pointer to an external). Defer to
@@ -1732,16 +1736,17 @@ fn collect_dynamic_range_relocs(
                     // matches dynamic linking exactly — including 0 for
                     // unresolved weak symbols, which CRT code null-checks. A
                     // trampoline address here would break those checks.
-                    got_fixups.push((offset_within_unit, ts_name, ts.is_weak()));
+                    relocs
+                        .got_fixups
+                        .push((offset_within_unit, ts_name, ts.is_weak()));
                     continue;
                 }
             } else {
                 // Internal to the library
-                let dep_key = UnitKey {
-                    lib: lib.to_path_buf(),
+                relocs.depend_on(UnitKey {
+                    lib: lib.path.to_path_buf(),
                     sym: ts_name,
-                };
-                depend_on(dep_key, relocations.len(), new_deps, pending_relocs)
+                })
             }
         } else {
             // RELATIVE relocation (no symbol, addend is the target)
@@ -1760,16 +1765,15 @@ fn collect_dynamic_range_relocs(
                 let offset_in_blob = addend_va - blob_base;
                 RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
             } else if let Some((target_name, offset_in_target)) =
-                resolve_owning_unit(elf64, index, addend_va)
+                resolve_owning_unit(lib, addend_va)
             {
                 resolved_addend = Some(offset_in_target as i64);
-                let dep_key = UnitKey {
-                    lib: lib.to_path_buf(),
+                relocs.depend_on(UnitKey {
+                    lib: lib.path.to_path_buf(),
                     sym: target_name,
-                };
-                depend_on(dep_key, relocations.len(), new_deps, pending_relocs)
+                })
             } else if let Some((blob_id, blob_base, blob_deps)) =
-                ensure_data_blob_extracted(elf64, index, addend_va, lib, state)?
+                ensure_data_blob_extracted(lib, addend_va, state)?
             {
                 // No symbol and no unwind info describe the target, but it does
                 // live in a data section we can copy wholesale — most often a
@@ -1778,12 +1782,12 @@ fn collect_dynamic_range_relocs(
                 // several hundred of these). Pulling that section in and
                 // retargeting the pointer at it is the only way the copied
                 // table keeps working once the library is gone.
-                new_deps.extend(blob_deps);
+                relocs.new_deps.extend(blob_deps);
                 RelocTarget::DataBlobOffset(blob_id, addend_va - blob_base)
             } else {
                 warn!(
                     ctx,
-                    lib = %lib.display(),
+                    lib = %lib.path.display(),
                     target = format_args!("{:#x}", addend_va),
                     "RELATIVE relocation target not resolvable; leaving stale"
                 );
@@ -1799,7 +1803,7 @@ fn collect_dynamic_range_relocs(
         let reloc_size = if reloc.size() == 0 { 64 } else { reloc.size() };
 
         occupied.insert(offset_within_unit);
-        relocations.push(ExtractedReloc {
+        relocs.relocations.push(ExtractedReloc {
             offset_within_unit,
             kind,
             encoding,
@@ -1814,14 +1818,12 @@ fn collect_dynamic_range_relocs(
 /// Extract a data section blob if not already extracted.
 /// Returns the blob's UnitId and base vaddr.
 fn ensure_data_blob_extracted(
-    elf64: &object::read::elf::ElfFile64<'_>,
-    index: &LibIndex,
+    lib: Lib<'_, '_>,
     target_addr: u64,
-    lib: &Path,
     state: &mut ExtractionState,
 ) -> Result<Option<(UnitId, u64, IndexSet<UnitKey>)>> {
     // Find the section containing this address
-    let Some(sec) = find_section_for_address(elf64, target_addr) else {
+    let Some(sec) = find_section_for_address(lib.elf, target_addr) else {
         return Ok(None); // Address not in any extractable section
     };
 
@@ -1831,7 +1833,7 @@ fn ensure_data_blob_extracted(
     }
 
     let blob_key = DataBlobKey {
-        lib: lib.to_path_buf(),
+        lib: lib.path.to_path_buf(),
         section: sec.name.clone(),
     };
 
@@ -1843,7 +1845,7 @@ fn ensure_data_blob_extracted(
     // Only now that the section is known to need copying are its bytes worth
     // materializing: every return above happens for the great majority of the
     // addresses this is asked about.
-    let sec_data = section_contents(elf64, &sec)?;
+    let sec_data = section_contents(lib.elf, &sec)?;
     let SectionInfo {
         name: sec_name,
         vaddr: sec_addr,
@@ -1871,30 +1873,17 @@ fn ensure_data_blob_extracted(
     );
 
     // Collect relocations that fall within this data section's byte range.
-    let mut relocations: Vec<ExtractedReloc> = Vec::new();
-    let mut new_deps: IndexSet<UnitKey> = IndexSet::new();
-    let mut pending_relocs: Vec<(usize, UnitKey)> = Vec::new();
-    // (offset within blob, symbol name, weak) — becomes GotSlotFixup entries.
-    let mut got_fixup_offsets: Vec<(u64, String, bool)> = Vec::new();
-
+    let mut relocs = UnitRelocs::default();
     collect_dynamic_range_relocs(
-        elf64,
-        index,
         lib,
         &sec_name,
-        sec_addr,
-        sec_data.len() as u64,
+        sec_addr..sec_addr + sec_data.len() as u64,
         state,
-        &mut relocations,
-        &mut new_deps,
-        &mut pending_relocs,
-        &mut got_fixup_offsets,
+        &mut relocs,
     )?;
 
-    // Register pending relocations for this data blob
-    for (reloc_idx, dep_key) in pending_relocs {
-        state.pending.push((id, reloc_idx, dep_key));
-    }
+    let mut sec_data = sec_data;
+    let (relocations, new_deps) = state.take_unit_relocs(id, &mut sec_data, relocs);
 
     if !relocations.is_empty() {
         debug!(
@@ -1904,24 +1893,19 @@ fn ensure_data_blob_extracted(
         );
     }
 
-    let mut sec_data = sec_data;
-    state.register_got_slot_fixups(id, &mut sec_data, got_fixup_offsets);
-
-    let unit = ExtractedUnit {
+    state.push_unit(ExtractedUnit {
         id,
         name: format!(
             "{}:{}",
-            lib.file_name().unwrap_or_default().to_string_lossy(),
+            lib.path.file_name().unwrap_or_default().to_string_lossy(),
             sec_name
         ),
-        source_lib: lib.to_path_buf(),
+        source_lib: lib.path.to_path_buf(),
         bytes: sec_data,
         section_kind: sec_kind,
         alignment: 32, // Conservative alignment for data sections
         relocations,
-    };
-
-    state.push_unit(unit);
+    });
 
     Ok(Some((id, sec_addr, new_deps)))
 }
@@ -1934,17 +1918,14 @@ fn ensure_data_blob_extracted(
 /// between two exported symbols can hold dozens of local functions: the whole
 /// run would be copied once for every one of them that gets referenced, and a
 /// unit that long also breaks short-branch veneering.
-fn infer_symbol_size(
-    elf: &object::read::elf::ElfFile64<'_>,
-    index: &LibIndex,
-    sym: &SymInfo,
-) -> Result<usize> {
+fn infer_symbol_size(lib: Lib<'_, '_>, sym: &SymInfo) -> Result<usize> {
     let sym_vaddr = sym.vaddr;
     let sym_section = sym.section;
 
-    let next_addr = index.next_addr_in_section(sym_vaddr, sym_section);
+    let next_addr = lib.index.next_addr_in_section(sym_vaddr, sym_section);
 
-    let section = elf
+    let section = lib
+        .elf
         .section_by_index(sym_section)
         .context("section lookup")?;
     let section_end = section.address() + section.size();
@@ -1962,7 +1943,7 @@ fn infer_symbol_size(
     // cannot. Unwind ranges only describe code, so this is consulted only for
     // symbols in an executable section.
     if section.kind() == ObjSectionKind::Text
-        && let Some(next_fde) = index.fdes.next_start_after(sym_vaddr)
+        && let Some(next_fde) = lib.index.fdes.next_start_after(sym_vaddr)
     {
         limit = limit.min(next_fde);
     }
@@ -1995,33 +1976,32 @@ fn is_crt_glue(name: &str) -> bool {
 /// some linkers zero the slots and rely on the R_X86_64_RELATIVE addend
 /// instead, so relocation addends take precedence over raw content.
 /// Sentinel values (0 or -1) are skipped.
-fn extract_init_fini_arrays(
-    elf64: &object::read::elf::ElfFile64<'_>,
-    index: &LibIndex,
-    lib_path: &std::path::Path,
-) -> Result<InitFiniArrays> {
+fn extract_init_fini_arrays(lib: Lib<'_, '_>) -> Result<InitFiniArrays> {
+    let lib_path = lib.path;
     let mut result = InitFiniArrays::default();
 
     // Function addresses for init/fini slots, recovered from .rela.dyn:
     // R_X86_64_RELATIVE carries the address in its addend; a symbol-based
     // relocation (e.g. R_X86_64_64) resolves to symbol address + addend.
     let mut reloc_targets: HashMap<u64, u64> = HashMap::new();
-    if let Some(dyn_relocs) = elf64.dynamic_relocations() {
+    if let Some(dyn_relocs) = lib.elf.dynamic_relocations() {
         for (roff, reloc) in dyn_relocs {
             let func_vaddr = match reloc.target() {
-                object::RelocationTarget::Symbol(si) => match dynamic_symbol_by_index(elf64, si) {
-                    Some(sym) if !sym.is_undefined() => {
-                        sym.address().wrapping_add(reloc.addend() as u64)
+                object::RelocationTarget::Symbol(si) => {
+                    match dynamic_symbol_by_index(lib.elf, si) {
+                        Some(sym) if !sym.is_undefined() => {
+                            sym.address().wrapping_add(reloc.addend() as u64)
+                        }
+                        _ => continue,
                     }
-                    _ => continue,
-                },
+                }
                 _ => reloc.addend() as u64,
             };
             reloc_targets.insert(roff, func_vaddr);
         }
     }
 
-    for section in elf64.sections() {
+    for section in lib.elf.sections() {
         let sname = section.name().unwrap_or("");
         let is_init = sname == ".init_array";
         let is_fini = sname == ".fini_array";
@@ -2046,7 +2026,7 @@ fn extract_init_fini_arrays(
                 continue;
             }
 
-            let sym_name = find_symbol_at_address(index, func_vaddr);
+            let sym_name = find_symbol_at_address(lib.index, func_vaddr);
             if let Some(ref name) = sym_name
                 && is_crt_glue(name)
             {
@@ -2059,9 +2039,9 @@ fn extract_init_fini_arrays(
             }
 
             let unit_name = sym_name
-                .filter(|n| find_symbol(elf64, index, n).is_ok())
+                .filter(|n| find_symbol(lib, n).is_ok())
                 .or_else(|| {
-                    anon_target_is_extractable(elf64, func_vaddr)
+                    anon_target_is_extractable(lib.elf, func_vaddr)
                         .then(|| anon_unit_name(func_vaddr))
                 })
                 .with_context(|| {
@@ -2388,7 +2368,12 @@ mod tests {
 
             let mut state = test_state();
             let index = state.lib_index(&lib, &elf);
-            let arrays = extract_init_fini_arrays(&elf, &index, &lib).expect("init/fini arrays");
+            let arrays = extract_init_fini_arrays(Lib {
+                path: &lib,
+                elf: &elf,
+                index: &index,
+            })
+            .expect("init/fini arrays");
             assert!(
                 !arrays.init_entries.is_empty() && !arrays.fini_entries.is_empty(),
                 "{name}: expected CRT glue in both arrays"
@@ -2458,7 +2443,12 @@ mod tests {
         let index = state.lib_index(&lib, elf64);
         let data = elf64.section_by_name(".data").expect(".data").address();
 
-        let (blob_id, base, _) = ensure_data_blob_extracted(elf64, &index, data, &lib, &mut state)
+        let handle = Lib {
+            path: &lib,
+            elf: elf64,
+            index: &index,
+        };
+        let (blob_id, base, _) = ensure_data_blob_extracted(handle, data, &mut state)
             .expect("extract .data")
             .expect(".data is extractable");
         assert_eq!(base, data);
