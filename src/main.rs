@@ -271,7 +271,13 @@ fn run() -> Result<()> {
     }
 
     if cli.dry_run {
-        print_merge_plan(&cli.input, &plan, imports, &dyn_info.needed);
+        print_merge_report(
+            &cli.input,
+            &plan,
+            imports,
+            &dyn_info.needed,
+            Outcome::DryRun,
+        );
         return Ok(());
     }
 
@@ -330,20 +336,54 @@ fn run() -> Result<()> {
         "Merge complete"
     );
 
+    let before = exe_mapped.bytes().len() as u64;
+    let after = std::fs::metadata(&cli.input)
+        .map(|m| m.len())
+        .unwrap_or(before);
+    print_merge_report(
+        &cli.input,
+        &plan,
+        imports,
+        &dyn_info.needed,
+        Outcome::Written { before, after },
+    );
+
     Ok(())
 }
 
-/// Print the merge plan for `--dry-run`.
+/// How the run ended, which is all that differs between the two reports
+/// [`print_merge_report`] writes.
+enum Outcome {
+    /// `--dry-run`: the plan was worked out and the executable left alone.
+    DryRun,
+    /// The merge was written over the executable, which grew from `before`
+    /// bytes to `after`.
+    Written { before: u64, after: u64 },
+}
+
+/// Print what the merge did, or — under `--dry-run` — what it would do.
 ///
-/// This goes to stdout directly rather than through `tracing`: previewing the
-/// plan is the whole point of the flag, and the default log filter is `warn`,
-/// so routing it through `info!` meant `solder --dry-run` printed nothing at
-/// all unless the user happened to set `RUST_LOG`.
-fn print_merge_plan(
+/// This goes to stdout directly rather than through `tracing`: the result of
+/// the run is the whole point of invoking solder, and the default log filter is
+/// `warn`, so routing it through `info!` meant `solder` printed nothing at all
+/// unless the user happened to set `RUST_LOG`.
+///
+/// A real merge gets the same report as `--dry-run`, because the merge is not
+/// only subtractive. It drops the libraries it absorbed, but it also *inherits*
+/// the dependencies those libraries had of their own (see
+/// [`symbol_analysis::inherited_needed`]), and a dependency that resolves is
+/// inherited with nothing louder than a `debug!`. So `solder ./md5sum` dropped
+/// `libcrypto.so.3`, added `libz.so.1` and `libzstd.so.1` to the executable's
+/// `DT_NEEDED`, grew it from 54K to 5.3M, and said not one word about any of
+/// it — from a tool whose purpose is removing runtime dependencies. Learning
+/// what you had just been given took a second run with `--dry-run`, or
+/// `readelf -d` on the output.
+fn print_merge_report(
     input: &std::path::Path,
     plan: &types::MergePlan,
     imports: &[types::ImportedSymbol],
     needed: &[String],
+    outcome: Outcome,
 ) {
     use std::collections::BTreeMap;
 
@@ -367,8 +407,16 @@ fn print_merge_plan(
         stats.bytes += au.unit.bytes.len();
     }
 
-    println!("Merge plan for {}", input.display());
-    println!("  libraries to merge:");
+    match outcome {
+        Outcome::DryRun => {
+            println!("Merge plan for {}", input.display());
+            println!("  libraries to merge:");
+        }
+        Outcome::Written { .. } => {
+            println!("Merged into {}", input.display());
+            println!("  libraries merged:");
+        }
+    }
     for (lib, stats) in &per_lib {
         println!(
             "    {} ({} imported symbols, {} units, {} bytes)",
@@ -432,5 +480,10 @@ fn print_merge_plan(
             init_fini.fini.entries.len()
         );
     }
-    println!("Dry run: {} left unchanged", input.display());
+    match outcome {
+        Outcome::DryRun => println!("Dry run: {} left unchanged", input.display()),
+        Outcome::Written { before, after } => {
+            println!("  size: {before} bytes -> {after} bytes")
+        }
+    }
 }
