@@ -65,8 +65,8 @@ So a dependency of a merged library is added to the executable's own
 A dependency nothing in the extracted code calls stays dropped. One that
 `solder` cannot find on disk is inherited without that last check, since
 guessing it away risks an executable that will not load; you'll get a warning
-saying so. `--dry-run` lists whatever gets inherited, so you can see up front
-which dependencies survive the merge.
+saying so. Every merge lists whatever got inherited, and `--dry-run` lists it
+up front, so you can see which dependencies survive the merge either way.
 
 ### Constructors and destructors
 
@@ -120,8 +120,27 @@ solder ./myapp -L /opt/mylibs -L ./libs
 # Preview what would happen without writing output
 solder ./myapp --dry-run
 
-# Report what solder is doing (only warnings and errors are printed by default)
+# Trace every stage of the merge, beyond the report it prints anyway
 RUST_LOG=info solder ./myapp
+```
+
+Either way `solder` reports what it did on stdout — the libraries it absorbed,
+the `DT_NEEDED` entries that went and the ones that arrived, the shape of the
+new mapping, and what the executable grew to:
+
+```
+Merged into ./md5sum
+  libraries merged:
+    /usr/lib64/libcrypto.so.3 (3 imported symbols, 10218 units, 4479756 bytes)
+  DT_NEEDED entries removed: libcrypto.so.3
+  DT_NEEDED entries kept: libc.so.6
+  DT_NEEDED entries inherited from the merged libraries: libz.so.1, libzstd.so.1
+  new mapping at 0x000000000000e000, 4595712 bytes: 3407872 read-execute (code, trampolines), 626688 read-only (constants), 561152 read-write (data, loader-written slots)
+  GOT entries patched: 3
+  trampolines for symbols still resolved at runtime: 169
+  symbols injected into .dynsym: 137
+  rebuilt preinit array entries: 1, fini array entries: 2 (merged constructors and destructors, plus the executable's own)
+  size: 55752 bytes -> 5349848 bytes
 ```
 
 A `-m` entry that matches no `DT_NEEDED` soname, or that matches only
