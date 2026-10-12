@@ -208,6 +208,91 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<bool> {
     Ok(is_pie)
 }
 
+/// Validate that `bytes` is a shared library the merge can take code from: a
+/// little-endian, 64-bit, x86-64 `ET_DYN` object.
+///
+/// [`validate_executable`] checks the file solder writes to. Nothing checked
+/// the files it copies machine code *out of*, and a search path that names a
+/// foreign build of a soname — a cross sysroot reached through `SYSROOT` or
+/// `-L`, a multiarch directory, the 32-bit half of a multilib tree, where
+/// `/usr/lib/libfoo.so.1` is the i686 build and only `/usr/lib64` holds the
+/// x86-64 one — is reached by `resolve_library` like any other. Every way that
+/// went wrong was worse than an error:
+///
+///   * an `EM_AARCH64` library is a well-formed 64-bit little-endian ELF, so
+///     every stage ran to completion and solder exited 0 after planting
+///     aarch64 instructions in an executable `PT_LOAD` of an x86-64 binary and
+///     pointing the executable's GOT slots at them;
+///   * an `ELFCLASS32` library parses as 32-bit for goblin, whose `.dynsym`
+///     then yields none of the names the executable imports, so solder logged
+///     "No mergeable imported symbols found" and exited 0 having merged
+///     nothing at all;
+///   * a big-endian one did fail, but as `bad offset 4611686018427387904`
+///     from somewhere inside the extractor.
+///
+/// The header is read out of the raw bytes rather than through a parser
+/// because the point is to reject the files a 64-bit little-endian reader
+/// cannot describe in the first place.
+pub fn validate_merge_library(bytes: &[u8], path: &Path) -> Result<()> {
+    use object::elf::{ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_DYN};
+
+    /// `EI_CLASS`: whether the object is 32- or 64-bit.
+    const EI_CLASS: usize = 4;
+    /// `EI_DATA`: which endianness every multi-byte field is written in.
+    const EI_DATA: usize = 5;
+    /// `e_ident` (16 bytes), then `e_type` and `e_machine`.
+    const HEADER_PREFIX: usize = 20;
+
+    if !bytes.starts_with(&ELFMAG) || bytes.len() < HEADER_PREFIX {
+        bail!(
+            "{}: not an ELF shared library (no readable ELF header)",
+            path.display()
+        );
+    }
+
+    let hint = "solder copies a library's machine code into the executable, so only an \
+                x86-64 shared object can be merged into one — check that the search path \
+                (-L, DT_RPATH/DT_RUNPATH, SYSROOT, LD_LIBRARY_PATH) names the x86-64 build \
+                of this soname";
+
+    if bytes[EI_CLASS] != ELFCLASS64.0 {
+        bail!(
+            "{}: not a 64-bit library (EI_CLASS={}); {hint}",
+            path.display(),
+            bytes[EI_CLASS]
+        );
+    }
+    if bytes[EI_DATA] != ELFDATA2LSB.0 {
+        bail!(
+            "{}: not a little-endian library (EI_DATA={}); {hint}",
+            path.display(),
+            bytes[EI_DATA]
+        );
+    }
+
+    let e_type = read_u16(bytes, 0x10)?;
+    let e_machine = read_u16(bytes, 0x12)?;
+
+    if e_machine != EM_X86_64.0 {
+        bail!(
+            "{}: unsupported architecture e_machine=0x{e_machine:04x} (only EM_X86_64, \
+             0x{:04x}, is supported); {hint}",
+            path.display(),
+            EM_X86_64.0
+        );
+    }
+    if e_type != ET_DYN.0 {
+        bail!(
+            "{}: not a shared object (e_type=0x{e_type:04x}, expected ET_DYN 0x{:04x}) — \
+             ld.so would not load this file as a dependency either",
+            path.display(),
+            ET_DYN.0
+        );
+    }
+
+    Ok(())
+}
+
 /// Size of an `Elf64_Dyn`: `d_tag` (8 bytes) followed by `d_val`/`d_ptr`.
 pub const DYN_ENTRY_SIZE: usize = 16;
 
@@ -523,6 +608,99 @@ pub fn file_offset_to_va(elf: &ElfFile64<'_>, offset: u64) -> Option<u64> {
     pt_loads(elf)
         .find(|seg| (seg.offset..seg.offset + seg.filesz).contains(&offset))
         .map(|seg| offset - seg.offset + seg.vaddr)
+}
+
+#[cfg(test)]
+mod merge_library_tests {
+    use super::*;
+
+    /// The committed `test/libs/` libraries are the ones solder actually
+    /// merges, so they have to pass the check they are gated by.
+    const TEST_LIBS: [&str; 3] = ["libpcre2-8.so.0", "libcrypto.so.3", "libtinfo.so.6"];
+
+    fn read_test_lib(name: &str) -> Vec<u8> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs/").to_string() + name;
+        std::fs::read(&path).expect("test library")
+    }
+
+    /// A real library with one byte of its ELF header changed, which is how a
+    /// foreign-architecture build differs from a mergeable one in everything
+    /// the check looks at.
+    fn with_header_byte(at: usize, value: u8) -> Vec<u8> {
+        let mut bytes = read_test_lib(TEST_LIBS[0]);
+        bytes[at] = value;
+        bytes
+    }
+
+    fn rejection(bytes: &[u8]) -> String {
+        let path = Path::new("/sysroot/lib/libpcre2-8.so.0");
+        format!(
+            "{:#}",
+            validate_merge_library(bytes, path).expect_err("a foreign library must be refused")
+        )
+    }
+
+    #[test]
+    fn the_libraries_solder_merges_are_accepted() {
+        for name in TEST_LIBS {
+            validate_merge_library(&read_test_lib(name), Path::new(name))
+                .unwrap_or_else(|e| panic!("{name} should be mergeable: {e:#}"));
+        }
+    }
+
+    /// The one that used to merge: an aarch64 library is a well-formed 64-bit
+    /// little-endian ELF, so nothing downstream objected and solder exited 0
+    /// having put aarch64 instructions in an executable mapping of an x86-64
+    /// binary.
+    #[test]
+    fn a_library_for_another_architecture_is_refused() {
+        // e_machine at 0x12: EM_AARCH64 (183) and EM_RISCV (243).
+        for machine in [183u16, 243] {
+            let mut bytes = read_test_lib(TEST_LIBS[0]);
+            bytes[0x12..0x14].copy_from_slice(&machine.to_le_bytes());
+            let err = rejection(&bytes);
+            assert!(err.contains("e_machine"), "{err}");
+            assert!(err.contains("/sysroot/lib/libpcre2-8.so.0"), "{err}");
+        }
+    }
+
+    /// The one that used to merge *nothing*: goblin reads a 32-bit library as
+    /// 32-bit, its `.dynsym` then matches none of the executable's imports, and
+    /// the merge reported success having done nothing.
+    #[test]
+    fn a_32_bit_library_is_refused() {
+        let err = rejection(&with_header_byte(4, 1)); // EI_CLASS = ELFCLASS32
+        assert!(err.contains("64-bit"), "{err}");
+    }
+
+    #[test]
+    fn a_big_endian_library_is_refused() {
+        let err = rejection(&with_header_byte(5, 2)); // EI_DATA = ELFDATA2MSB
+        assert!(err.contains("little-endian"), "{err}");
+    }
+
+    /// A `DT_NEEDED` entry has to name a shared object. An `ET_EXEC` file has
+    /// no relocations for the code the merge moves to a new address, so its
+    /// absolute references would keep pointing at where it was linked to load.
+    #[test]
+    fn a_file_that_is_not_a_shared_object_is_refused() {
+        let mut bytes = read_test_lib(TEST_LIBS[0]);
+        bytes[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+        let err = rejection(&bytes);
+        assert!(err.contains("shared object"), "{err}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_elf_at_all_is_refused() {
+        for bytes in [
+            b"#!/bin/sh\nexec something\n".to_vec(),
+            Vec::new(),
+            read_test_lib(TEST_LIBS[0])[..19].to_vec(),
+        ] {
+            let err = rejection(&bytes);
+            assert!(err.contains("ELF"), "{err}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -420,9 +420,16 @@ pub struct LibraryDynamic {
 }
 
 /// Read `lib_path`'s exports and dependencies.
+///
+/// A file that is not an x86-64 shared object is an error rather than a
+/// library with no exports: everything this feeds — the symbol-to-library map
+/// the merge extracts code through, and the inherited-`DT_NEEDED` decision —
+/// assumes the file's code can run in the executable. See
+/// [`validate_merge_library`](crate::elf_reader::validate_merge_library).
 pub fn read_library_dynamic(lib_path: &Path) -> Result<LibraryDynamic> {
     let bytes =
         std::fs::read(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
+    crate::elf_reader::validate_merge_library(&bytes, lib_path)?;
     let elf = goblin::elf::Elf::parse(&bytes)
         .with_context(|| format!("parsing {}", lib_path.display()))?;
 
@@ -647,6 +654,50 @@ pub fn symbol_is_zero_initialized(lib_path: &std::path::Path, name: &str) -> Res
 
     // Symbol not found as a definition — nothing to preserve.
     Ok(true)
+}
+
+#[cfg(test)]
+mod library_dynamic_tests {
+    use super::*;
+
+    const PCRE2: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs/libpcre2-8.so.0");
+
+    #[test]
+    fn a_real_library_yields_its_exports_and_dependencies() {
+        let lib = read_library_dynamic(Path::new(PCRE2)).expect("read libpcre2-8.so.0");
+        assert!(lib.defined.contains("pcre2_compile_8"), "exports");
+        assert!(
+            lib.needed.iter().any(|n| n.starts_with("libc.so")),
+            "{:?}",
+            lib.needed
+        );
+    }
+
+    /// A library solder cannot take code from has to stop the merge here, where
+    /// the soname is being resolved to a file, rather than contribute an export
+    /// map the extractor then copies instructions through. A 32-bit build of the
+    /// right soname is the quiet case: goblin reads it happily, its `.dynsym`
+    /// matches none of the executable's imports, and the merge used to report
+    /// success having done nothing at all.
+    #[test]
+    fn a_library_of_the_wrong_architecture_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (at, value, what) in [(4usize, 1u8, "32-bit"), (0x12, 183, "aarch64")] {
+            let mut bytes = std::fs::read(PCRE2).expect("read libpcre2-8.so.0");
+            bytes[at] = value;
+            let path = dir.path().join("libpcre2-8.so.0");
+            std::fs::write(&path, &bytes).expect("write the doctored library");
+
+            let Err(e) = read_library_dynamic(&path) else {
+                panic!("{what}: a foreign library must be refused");
+            };
+            let err = format!("{e:#}");
+            assert!(
+                err.contains(&path.display().to_string()),
+                "{what}: {err} should name the file"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
