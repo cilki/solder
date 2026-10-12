@@ -325,12 +325,6 @@ fn replace_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let written = (|| -> Result<()> {
         file.write_all(bytes)
             .with_context(|| format!("writing {}", temp.display()))?;
-        // The merged binary is worth more than the few milliseconds: a rename
-        // over unflushed data can leave the path naming a file of zeroes after
-        // a crash, which is the failure this function exists to rule out.
-        file.sync_all()
-            .with_context(|| format!("flushing {}", temp.display()))?;
-        drop(file);
 
         // Carry over the mode, and the owner and group where we are allowed to.
         // A fresh file is 0o600 and owned by whoever ran `solder`, so without
@@ -339,6 +333,16 @@ fn replace_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         // somehow lacked it; the mode is otherwise left exactly as it was,
         // setuid and setgid bits included — widening a 0o700 binary to
         // world-executable is not the merge's business either.
+        //
+        // Both go through the open descriptor rather than through `temp`. The
+        // name is predictable (see `create_temp_beside`), so when the directory
+        // is writable by someone other than the user running `solder` — a
+        // merge under `sudo` of a binary in a staging directory the invoking
+        // user owns — a path-based `chown`/`chmod` here is theirs to redirect:
+        // unlink the temporary file and put a link to a file of their choosing
+        // under the same name, and the mode this applies, setuid bit included,
+        // lands on that file instead. A descriptor cannot be substituted that
+        // way; it still names the file `create_temp_beside` created.
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -348,15 +352,22 @@ fn replace_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
                 // Only root may give a file away, so a failure here is the
                 // ordinary case of merging a file you own. This has to come
                 // first: `chown` clears the setuid and setgid bits.
-                let _ = std::os::unix::fs::chown(&temp, Some(m.uid()), Some(m.gid()));
+                let _ = std::os::unix::fs::fchown(&file, Some(m.uid()), Some(m.gid()));
             }
             let mode = metadata
                 .as_ref()
                 .map_or(0o755, |m| m.permissions().mode() & 0o7777)
                 | 0o100;
-            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
                 .with_context(|| format!("setting the mode of {}", temp.display()))?;
         }
+
+        // The merged binary is worth more than the few milliseconds: a rename
+        // over unflushed data can leave the path naming a file of zeroes after
+        // a crash, which is the failure this function exists to rule out.
+        file.sync_all()
+            .with_context(|| format!("flushing {}", temp.display()))?;
+        drop(file);
 
         std::fs::rename(&temp, &target)
             .with_context(|| format!("replacing {} with {}", target.display(), temp.display()))
@@ -372,11 +383,26 @@ fn replace_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 /// Create a file for `target`'s replacement in `dir`, returning its path and an
 /// open handle. The name is hidden and carries the pid so two `solder` runs over
 /// the same directory cannot collide.
+///
+/// It is created 0o600 rather than at the default 0o666-minus-umask, which is
+/// world-readable almost everywhere: between here and the `chmod` in
+/// [`replace_file`] the file holds the whole merged binary, and a 0o700 input's
+/// bytes are not for anyone who happens to look in the directory. `replace_file`
+/// widens it to the input's own mode before the rename, so what the merged
+/// executable ends up readable by is unaffected.
 fn create_temp_beside(
     dir: &std::path::Path,
     target: &std::path::Path,
 ) -> Result<(std::path::PathBuf, std::fs::File)> {
     use std::ffi::OsString;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
 
     let stem = target
         .file_name()
@@ -386,11 +412,7 @@ fn create_temp_beside(
         name.push(stem);
         name.push(format!(".solder.{}.{attempt}", std::process::id()));
         let candidate = dir.join(name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        match options.open(&candidate) {
             Ok(file) => return Ok((candidate, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
@@ -1580,6 +1602,34 @@ mod section_header_tests {
                 & 0o7777;
             assert_eq!(got, mode, "mode {mode:o} became {got:o}");
         }
+    }
+
+    /// The temporary file the merge is written into holds the whole merged
+    /// binary until the rename, so it must not be created readable by anyone
+    /// the input was not readable by. At the default creation mode
+    /// (0o666 & ~umask, so 0o644 under the usual umask) merging a 0o700 binary
+    /// published its bytes to every user on the machine for the duration of the
+    /// write.
+    #[cfg(unix)]
+    #[test]
+    fn the_output_is_written_through_a_file_only_its_owner_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (temp, _file) =
+            create_temp_beside(dir.path(), &dir.path().join("grep")).expect("create the temp file");
+
+        let mode = std::fs::metadata(&temp)
+            .expect("stat the temp file")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "{} is group/world accessible at mode {:o}",
+            temp.display(),
+            mode & 0o7777
+        );
     }
 
     /// A symlink names the executable; the file it points at is the executable.
