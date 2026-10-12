@@ -177,6 +177,16 @@ picked, and a `glibc-hwcaps` variant loses to the baseline library — whether
 the machine that will run the merged executable implements the instructions
 that variant was built for is not knowable from here.
 
+A soname none of that turns up is only an error when you asked for it. Named
+with `-m`, it fails the merge, like any other `-m` entry that cannot take
+effect. Reached because `solder ./myapp` considers every `DT_NEEDED` entry it
+finds, it is left alone with a warning and the rest are still merged: the entry
+stays in `DT_NEEDED`, nothing is taken out of that library, and the merged
+binary resolves it wherever it runs exactly as the input did. So a dependency
+that only exists on the machine the binary ships to — a plugin library, a
+sysroot that doesn't carry all of them — no longer costs you the merge of the
+libraries that *are* on the search path.
+
 ### Dependencies recorded as a path
 
 A `DT_NEEDED` entry containing a slash — what the linker writes when the
@@ -186,11 +196,12 @@ same: none of the directories above are consulted for such an entry, it is only
 expanded for dynamic string tokens (`$ORIGIN` here being the directory of the
 object that declared the dependency) and used as given.
 
-A *relative* path entry is rejected with an error. The loader resolves it
-against the working directory of the running process, so which file it names is
-not something the merge can know; merging whatever `solder`'s own working
-directory happens to point at would be a guess. Use `-m` to merge the other
-libraries and leave that one dynamic, or relink against a soname.
+A *relative* path entry is rejected with an error, `-m` or no `-m`. The loader
+resolves it against the working directory of the running process, so which file
+it names is not something the merge can know; merging whatever `solder`'s own
+working directory happens to point at would be a guess, and so would deciding
+it isn't there. Use `-m` to merge the other libraries and leave that one
+dynamic, or relink against a soname.
 
 ## How It Works
 
