@@ -264,7 +264,14 @@ libraries and leave that one dynamic, or relink against a soname.
   producing a broken binary
 - A copy-relocated data symbol (`R_X86_64_COPY`) coming from a library we're
   removing has to be zero-initialized, since its initial value currently can't
-  be carried over
+  be carried over. The storage itself stays the executable's, as it already
+  was: such a symbol is defined in the executable's own `.bss`, and the
+  executable comes first in the global scope, so the loader resolved even the
+  defining library's references to that copy. The merged code keeps reaching it
+  through a `GLOB_DAT` of its own rather than carrying a copy of the library's
+  definition along — `test/bash` assigns ncurses' `PC`, `UP` and `BC` while
+  readline sets the terminal up and merged `tputs` reads them back, which only
+  works while the two sides are looking at the same bytes
 - We can't merge a library that uses thread-local storage, or one that defines
   an ifunc that extracted code reaches. Both are dynamic relocations whose slot
   is not an address — a TLS slot holds a module id or an offset from the thread

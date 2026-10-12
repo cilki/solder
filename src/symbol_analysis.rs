@@ -376,6 +376,25 @@ impl RelaTables {
         }
         map
     }
+
+    /// The names of the symbols the executable copy-relocates
+    /// (`R_X86_64_COPY`).
+    ///
+    /// Such a symbol's storage belongs to the executable: the linker gave the
+    /// executable a definition of its own in `.bss` and had ld.so copy the
+    /// library's initial value into it. The consequence that matters to the
+    /// merge is on the other side of the lookup — the executable is first in
+    /// the global scope, so *every* object's reference to that name resolved to
+    /// the executable's copy, the defining library's own references included.
+    /// Extracted code has to keep reaching that copy or the variable becomes
+    /// two unrelated objects (see `collect_dynamic_range_relocs`).
+    pub fn copy_reloc_symbols(&self) -> HashSet<String> {
+        use goblin::elf64::reloc::R_X86_64_COPY;
+
+        self.dynamic_of_type(R_X86_64_COPY)
+            .map(|e| e.symbol.clone())
+            .collect()
+    }
 }
 
 /// Decode the named `.rela.*` section, naming each entry's symbol out of

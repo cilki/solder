@@ -72,6 +72,10 @@ struct ExtractionState {
     /// Symbols the executable actually DEFINES (subset of `external_syms`,
     /// which also contains the executable's undefined imports).
     exe_defined_syms: HashSet<String>,
+    /// Symbols the executable copy-relocates, whose storage is therefore the
+    /// executable's and not the defining library's (see
+    /// `RelaTables::copy_reloc_symbols`).
+    exe_copy_relocated: HashSet<String>,
     /// Libraries we've already extracted init/fini arrays from.
     processed_libs: HashSet<PathBuf>,
     /// Accumulated init/fini entries from all processed libraries.
@@ -207,6 +211,7 @@ pub fn extract_units(
     seeds: &[crate::types::ImportedSymbol],
     exe_elf: &object::read::elf::ElfFile64<'_>,
     merged_lib_syms: &HashMap<String, PathBuf>,
+    exe_copy_relocated: &HashSet<String>,
 ) -> Result<(Vec<ExtractedUnit>, InitFiniArrays, Vec<GotSlotFixup>)> {
     // Collect symbol names from the executable's .dynsym that merged library code
     // can reference. This includes both defined symbols (callable directly) and
@@ -232,6 +237,7 @@ pub fn extract_units(
         external_syms: exe_dynsym_names,
         cross_lib_syms: merged_lib_syms.clone(),
         exe_defined_syms,
+        exe_copy_relocated: exe_copy_relocated.clone(),
         processed_libs: HashSet::new(),
         init_fini: InitFiniArrays::default(),
         data_blobs: HashMap::new(),
@@ -1124,6 +1130,15 @@ fn find_symbol(lib: Lib<'_, '_>, name: &str) -> Result<SymInfo> {
         .with_context(|| format!("symbol '{name}' not found in .symtab or .dynsym"))
 }
 
+/// Whether a definition in a shared library can be preempted by one elsewhere
+/// in the global scope — which is what lets a copy relocation move the storage
+/// into the executable. Only a default-visibility definition can: ld.so binds
+/// a reference to a protected one to the library's own copy, so that copy and
+/// the executable's were already two objects before any merge.
+fn is_preemptible(sym: &object::read::elf::ElfSymbol64<'_, '_>) -> bool {
+    sym.elf_symbol().st_visibility() == object::elf::STV_DEFAULT
+}
+
 /// Look up a symbol by index in the dynamic symbol table. Symbol indices in
 /// dynamic relocations (.rela.dyn) refer to .dynsym; resolving them with
 /// `elf.symbol_by_index` would index .symtab and return an unrelated symbol.
@@ -1741,6 +1756,23 @@ fn collect_dynamic_range_relocs(
                         .push((offset_within_unit, ts_name, ts.is_weak()));
                     continue;
                 }
+            } else if state.exe_copy_relocated.contains(&ts_name) && is_preemptible(&ts) {
+                // The library defines it, but the executable copy-relocates it,
+                // so the executable owns the storage and ld.so resolved this
+                // very slot to the copy in the executable's `.bss` rather than
+                // to the definition here — the lookup walks the global scope,
+                // where the executable comes first. Extracting the library's
+                // definition and pointing the slot at that instead turns one
+                // variable into two: ncurses' `tputs` reads the pad character
+                // out of `PC`, which readline inside `test/bash` assigns, and
+                // after the merge each was looking at its own copy. Defer to
+                // ld.so with a GLOB_DAT, exactly as for a symbol the library
+                // imports, and the merged code is back on the executable's
+                // copy.
+                relocs
+                    .got_fixups
+                    .push((offset_within_unit, ts_name, ts.is_weak()));
+                continue;
             } else {
                 // Internal to the library
                 relocs.depend_on(UnitKey {
@@ -2084,6 +2116,7 @@ mod tests {
             external_syms: HashSet::new(),
             cross_lib_syms: HashMap::new(),
             exe_defined_syms: HashSet::new(),
+            exe_copy_relocated: HashSet::new(),
             processed_libs: HashSet::new(),
             init_fini: InitFiniArrays::default(),
             data_blobs: HashMap::new(),
@@ -2165,6 +2198,61 @@ mod tests {
                 reloc.target
             );
         }
+    }
+
+    /// Whether anything extracted so far asked for the unit named `sym`.
+    fn depends_on(state: &ExtractionState, sym: &str) -> bool {
+        state.pending.iter().any(|(_, _, key)| key.sym == sym)
+    }
+
+    /// A variable the executable copy-relocates lives in the executable's own
+    /// `.bss`, and the lookup that resolved the library's GOT slot for it found
+    /// that copy rather than the definition in the library — the executable
+    /// comes first in the global scope. So the merge has to leave such a slot
+    /// to ld.so: resolving it to an extracted copy of the library's definition
+    /// gives the merged code a second, private copy of a variable the
+    /// executable is still writing.
+    ///
+    /// `test/bash` copy-relocates ncurses' `UP`, `PC` and `BC` — readline
+    /// assigns all three while setting the terminal up, and `tputs` reads them
+    /// to pad its output — so merging `libtinfo.so.6` into it split every one
+    /// of them, leaving `tputs` padding from a zeroed copy nothing ever wrote
+    /// to.
+    #[test]
+    fn a_variable_the_executable_copy_relocates_is_left_to_ld_so() {
+        let key = UnitKey {
+            lib: test_lib("libtinfo.so.6"),
+            sym: "tputs".to_string(),
+        };
+        let mut state = test_state();
+        state.exe_copy_relocated = ["UP", "PC", "BC"].iter().map(|s| (*s).to_owned()).collect();
+        process_symbol(&key, &mut state).expect("extract tputs");
+
+        let fixups: Vec<&str> = state
+            .got_slot_fixups
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        for name in ["UP", "PC", "BC"] {
+            assert!(
+                fixups.contains(&name),
+                "'{name}' got no GLOB_DAT, so the merged code is not on the \
+                 executable's copy: {fixups:?}"
+            );
+            assert!(
+                !depends_on(&state, name),
+                "'{name}' was extracted from the library as well, splitting it in two"
+            );
+        }
+
+        // The control: `ospeed` sits beside the three in the same `.bss` and is
+        // reached through the same `.got`, but nothing copy-relocates it, so its
+        // slot must keep pointing at the library's own copy.
+        assert!(
+            depends_on(&state, "ospeed"),
+            "'ospeed' is not copy-relocated and has no copy but the library's"
+        );
+        assert!(!fixups.contains(&"ospeed"), "{fixups:?}");
     }
 
     /// `test/libs/libtinfo.so.6` with the first `.rela.dyn` entry inside

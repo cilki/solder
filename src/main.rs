@@ -132,8 +132,13 @@ fn run() -> Result<()> {
     }
 
     // ── Step 2: transitive closure extraction ────────────────────────────────
+    // A variable the executable copy-relocates stays the executable's: the
+    // extracted code has to reach that copy rather than the definition in the
+    // library it is being lifted out of.
+    let copy_relocated = rela.copy_reloc_symbols();
+
     let (units, init_fini, got_slot_fixups) =
-        extractor::extract_units(imports, &exe_elf, merged_lib_syms)?;
+        extractor::extract_units(imports, &exe_elf, merged_lib_syms, &copy_relocated)?;
 
     for u in &units {
         info!(
