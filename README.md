@@ -249,11 +249,13 @@ libraries and leave that one dynamic, or relink against a soname.
   have, and the loader enables IBT over code with no `endbr64` where `solder`
   routes calls into it through the GOT
 - Rewrites the section header table so it describes the result: the headers of
-  the rebuilt `.dynsym`/`.dynstr`/`.gnu.version`/`.rela.dyn` are repointed at
-  the copies the loader now reads, and `.solder.text`/`.solder.rodata`/
-  `.solder.data` are added over the new mappings. `readelf`, `nm` and `gdb` read
-  section headers rather than `PT_DYNAMIC`, so without this the merged binary
-  still looks exactly like the input to all of them
+  the rebuilt `.dynsym`/`.dynstr`/`.gnu.version`/`.rela.dyn` and of the rebuilt
+  `.preinit_array`/`.fini_array` are repointed at the copies the loader now
+  reads, and `.solder.text`/`.solder.rodata`/`.solder.data` are added over the
+  new mappings. `readelf`, `nm` and `gdb` read section headers rather than
+  `PT_DYNAMIC`, so without this the merged binary still looks exactly like the
+  input to all of them — down to `readelf -x .fini_array` printing the
+  destructor list the merge replaced
 
 ## Limitations
 

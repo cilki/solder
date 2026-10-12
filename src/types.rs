@@ -79,6 +79,20 @@ impl InitFiniKind {
         }
     }
 
+    /// The section that described the executable's own array of this kind.
+    ///
+    /// The merge rebuilds the array in the merged segment and repoints the
+    /// `DT_*` pair above at it, so this is the header that has to be repointed
+    /// with it: everything that reads section headers rather than `PT_DYNAMIC`
+    /// — `readelf`, `objdump`, `gdb` — otherwise goes on describing the
+    /// pre-merge array (see `rewrite_section_headers`).
+    pub fn section(self) -> &'static str {
+        match self {
+            Self::Preinit => ".preinit_array",
+            Self::Fini => ".fini_array",
+        }
+    }
+
     /// How the array is named in diagnostics.
     pub fn name(self) -> &'static str {
         match self {

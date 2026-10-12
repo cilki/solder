@@ -411,13 +411,14 @@ fn create_temp_beside(
 
 /// Make the section header table describe the merged binary.
 ///
-/// The merge moves `.dynstr`, `.dynsym`, `.gnu.version` and `.rela.dyn` into
-/// the merged region (rebuilt larger) and repoints the matching `DT_*` tags at
-/// the new copies, but their section headers kept describing the pre-merge
-/// file. Everything that reads section headers instead of `PT_DYNAMIC` — and
-/// that is every binutils tool, plus gdb and patchelf — therefore saw the
-/// executable as it was before the merge: the old relocation and symbol tables,
-/// and no trace at all of the merged code and data.
+/// The merge moves `.dynstr`, `.dynsym`, `.gnu.version`, `.rela.dyn` and the
+/// init/fini arrays into the merged region (rebuilt larger) and repoints the
+/// matching `DT_*` tags at the new copies, but their section headers kept
+/// describing the pre-merge file. Everything that reads section headers instead
+/// of `PT_DYNAMIC` — and that is every binutils tool, plus gdb and patchelf —
+/// therefore saw the executable as it was before the merge: the old relocation
+/// and symbol tables, the destructor list the executable had on its own, and no
+/// trace at all of the merged code and data.
 ///
 /// `solder` is itself one of those readers: `read_dynsym_tables` takes the
 /// `.dynsym` and `.gnu.version` sizes from their section headers, because
@@ -450,9 +451,28 @@ fn rewrite_section_headers(
     let names_at = shstrtab.offset as usize;
     let mut names = out[names_at..names_at + shstrtab.size as usize].to_vec();
 
+    // The preinit and fini arrays are rebuilt in the merged region as well,
+    // and `update_dynamic_entries` repoints their `DT_*` pairs at the copies
+    // there. Their sections move with them for the same reason the tables do:
+    // `.fini_array` left behind went on claiming the executable's own
+    // single-entry array, inside the range `PT_GNU_RELRO` covers, while the
+    // loader ran a longer array somewhere else — so `readelf -x .fini_array`
+    // on a merged binary printed the pre-merge destructor list and nothing in
+    // the section table named the destructors the merge had just added.
+    //
+    // An array the merge did not rebuild is left alone, matching
+    // `update_dynamic_entries`: with no entries there is no copy to point at.
+    let rebuilt_arrays: Vec<(&'static str, u64, u64)> = plan
+        .init_fini
+        .iter()
+        .flat_map(|init_fini| init_fini.arrays())
+        .filter(|(_, array)| !array.entries.is_empty())
+        .map(|(kind, array)| (kind.section(), array.vaddr, array.size()))
+        .collect();
+
     // Repoint the sections the merge rebuilt. A section the executable does not
     // have is skipped: nothing described the old table either.
-    for &(section, vaddr, size) in &ext.rebuilt_sections {
+    for &(section, vaddr, size) in ext.rebuilt_sections.iter().chain(&rebuilt_arrays) {
         let Some(header) = table.by_name(section) else {
             continue;
         };
@@ -1206,6 +1226,17 @@ mod section_header_tests {
     /// Merge the same three units over whatever copy of `test/grep` already
     /// sits at `dest`, which is how `solder` is used: the input is the output.
     fn merge_grep_over(dest: &Path) -> MergePlan {
+        merge_grep_over_with(dest, InitFiniArrays::default(), &[])
+    }
+
+    /// The same merge, with the merged libraries' constructors and destructors
+    /// the caller names — which is what makes the writer rebuild the init/fini
+    /// arrays in the merged segment.
+    fn merge_grep_over_with(
+        dest: &Path,
+        init_fini: InitFiniArrays,
+        lib_order: &[PathBuf],
+    ) -> MergePlan {
         let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
         let exe = mapped.parse().expect("parse test/grep");
         let units = vec![
@@ -1226,8 +1257,8 @@ mod section_header_tests {
             &[],
             &rela.got_slot_vas(),
             true,
-            InitFiniArrays::default(),
-            &[],
+            init_fini,
+            lib_order,
             Vec::new(),
         )
         .expect("plan layout");
@@ -1292,6 +1323,70 @@ mod section_header_tests {
             section(&table, ".dynsym").size / SYM_ENTRY_SIZE as u64 * 2,
             section(&table, ".gnu.version").size,
             ".gnu.version is not parallel to .dynsym"
+        );
+    }
+
+    /// `.fini_array` is the section that described the executable's own
+    /// destructor list, and the merge rebuilds that list in the merged region
+    /// so the merged libraries' destructors run too. Left pointing where the
+    /// linker had put it, the header claimed `test/grep`'s single pre-merge
+    /// entry at 0x30f58 — still inside `PT_GNU_RELRO` — while `DT_FINI_ARRAY`
+    /// named a two-entry array out in the merged segment. So `readelf -x
+    /// .fini_array` printed the destructor list the merge had replaced, and
+    /// nothing in the section table named the one the loader would run.
+    #[test]
+    fn the_rebuilt_fini_array_and_its_section_header_agree() {
+        use crate::types::InitFiniEntry;
+        use goblin::elf::dynamic::{DT_FINI_ARRAY, DT_FINI_ARRAYSZ};
+
+        let out = tempfile::NamedTempFile::new().expect("temp output");
+        std::fs::copy(GREP, out.path()).expect("seed the output with the fixture");
+        // `fn_a` is the code unit the shared helper merges; naming it here is
+        // what makes it a destructor of the library it came from.
+        let lib = PathBuf::from("/nonexistent/libtest.so.1");
+        let plan = merge_grep_over_with(
+            out.path(),
+            InitFiniArrays {
+                init_entries: Vec::new(),
+                fini_entries: vec![InitFiniEntry {
+                    source_lib: lib.clone(),
+                    unit_name: "fn_a".to_owned(),
+                }],
+            },
+            std::slice::from_ref(&lib),
+        );
+        let bytes = std::fs::read(out.path()).expect("read the merged output back");
+
+        let fini = &plan.init_fini.as_ref().expect("a rebuilt fini array").fini;
+        assert_eq!(
+            fini.entries.len(),
+            2,
+            "the merged destructor and the executable's own"
+        );
+
+        let dynamic = DynamicTable::parse(&bytes).expect("parse .dynamic of the merged output");
+        let va = dynamic.value_of(DT_FINI_ARRAY).expect("DT_FINI_ARRAY");
+        let size = dynamic.value_of(DT_FINI_ARRAYSZ).expect("DT_FINI_ARRAYSZ");
+        let table = section_table(&bytes);
+        let header = section(&table, ".fini_array");
+        assert_eq!(
+            header.addr, va,
+            "'.fini_array' describes {:#x} but the loader reads {va:#x}",
+            header.addr
+        );
+        assert_eq!(header.size, size, "'.fini_array' is the wrong size");
+
+        // The header's own file offset has to reach those same bytes: the
+        // address is what the loader uses, but `readelf -x` and `objcopy` read
+        // the section through its offset.
+        let at = header.offset as usize;
+        let described: Vec<u64> = bytes[at..at + header.size as usize]
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
+            .collect();
+        assert_eq!(
+            described, fini.entries,
+            "'.fini_array' at offset {at:#x} names the wrong bytes"
         );
     }
 
