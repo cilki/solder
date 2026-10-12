@@ -158,6 +158,18 @@ after `DT_RPATH`. Note that `-L` therefore does *not* override an executable
 that was linked with an `RPATH`. As with the loader, a `DT_RUNPATH` supersedes
 the `DT_RPATH` of the same object entirely rather than being searched after it.
 
+That order applies to a soname the *executable* names. A dependency of a
+library being merged away (see [Inherited
+dependencies](#inherited-dependencies)) is looked up the way the loader looks
+it up for that library: the library's own `DT_RPATH` leads, ahead of the
+executable's, and `DT_RUNPATH` is the library's own. The executable's
+`DT_RUNPATH` is not searched for it at all — a `DT_RUNPATH` governs the lookups
+of the object that records it and not those of its dependencies — and `$ORIGIN`
+throughout is the merged library's directory rather than the executable's. Both
+matter because the file solder finds is the one whose exports decide whether the
+dependency has to be inherited: reading those off some other copy of the soname
+can drop a `DT_NEEDED` entry the merged code still needs.
+
 `DT_RPATH` and `DT_RUNPATH` entries go through the same dynamic string token
 substitution the loader applies, so an executable that ships its libraries
 beside itself (`-Wl,-rpath,'$ORIGIN/libs'`) resolves them from there:

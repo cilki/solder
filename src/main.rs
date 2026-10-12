@@ -223,36 +223,45 @@ fn run() -> Result<()> {
             .chain(plan.got_imports.iter().map(|g| g.name.clone()))
             .collect();
 
-        // `$ORIGIN` in a path-valued DT_NEEDED entry means the directory of the
-        // object that declared it, so a dependency of a merged library resolves
-        // against that library's directory rather than the executable's.
-        let mut dep_origin: HashMap<&str, &std::path::Path> = HashMap::new();
-        for lib in &absorbed {
-            if let Some(dir) = lib.path.parent() {
-                for dep in &lib.needed {
-                    dep_origin.entry(dep.as_str()).or_insert(dir);
-                }
+        // A dependency is looked up the way ld.so looks it up for the library
+        // that declared it: through that library's own DT_RPATH/DT_RUNPATH
+        // ahead of the executable's, and with `$ORIGIN` — in a search-path
+        // entry as in a path-valued DT_NEEDED one — meaning the declaring
+        // library's directory rather than the executable's. The first library
+        // to name a dependency decides, as it did when each entry carried its
+        // own origin.
+        let mut declarer: HashMap<&str, &symbol_analysis::MergedLibrary> = HashMap::new();
+        for &lib in &absorbed {
+            for dep in &lib.needed {
+                declarer.entry(dep.as_str()).or_insert(lib);
             }
         }
 
-        let mut search_rpath = dyn_info.search_rpath().to_vec();
-        search_rpath.extend_from_slice(&library_path);
+        let mut exe_rpath = dyn_info.search_rpath().to_vec();
+        exe_rpath.extend_from_slice(&library_path);
         let mut resolve_exports = |soname: &str| {
-            let origin = dep_origin
-                .get(soname)
-                .copied()
-                .unwrap_or(dyn_info.origin.as_path());
-            resolve_library(
-                soname,
-                &search_rpath,
-                &dyn_info.runpath,
-                &ldso_cache,
-                origin,
-            )
-            .and_then(|path| {
-                symbol_analysis::read_library_dynamic(&path).map(|lib| (path, lib.defined))
-            })
-            .ok()
+            let (rpath, runpath, origin) = match declarer.get(soname) {
+                Some(lib) => {
+                    let (rpath, runpath) = symbol_analysis::dependency_search_path(lib, &exe_rpath);
+                    (
+                        rpath,
+                        runpath,
+                        lib.path.parent().unwrap_or(dyn_info.origin.as_path()),
+                    )
+                }
+                // Nothing being merged away declares this entry, so there is no
+                // other object whose search path could apply to it.
+                None => (
+                    exe_rpath.clone(),
+                    dyn_info.runpath.as_slice(),
+                    dyn_info.origin.as_path(),
+                ),
+            };
+            resolve_library(soname, &rpath, runpath, &ldso_cache, origin)
+                .and_then(|path| {
+                    symbol_analysis::read_library_dynamic(&path).map(|lib| (path, lib.defined))
+                })
+                .ok()
         };
 
         symbol_analysis::inherited_needed(
