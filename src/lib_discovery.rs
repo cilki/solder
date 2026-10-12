@@ -20,6 +20,25 @@ const NEVER_MERGE_PREFIXES: &[&str] = &[
     "libgcc_s.so",
 ];
 
+/// Nothing reachable from the search path provides a `DT_NEEDED` entry.
+///
+/// Carried as its own error type so a caller can tell this apart from a
+/// resolution that *failed*: an entry solder cannot act on at all (a relative
+/// path, a `$PLATFORM` token) is a merge it must not guess its way through,
+/// while an entry that is simply not installed on this machine is a library
+/// that can stay dynamic. The message is the whole of the error, so
+/// propagating it reads the same as it did before it had a type.
+#[derive(Debug)]
+pub struct NotFound(String);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
+
 /// The file-name part of a `DT_NEEDED` entry.
 ///
 /// A dependency is usually recorded as a bare soname, but it may also be
@@ -107,6 +126,9 @@ pub fn expand_dynamic_tokens(entry: &str, origin: &Path) -> Option<PathBuf> {
 ///   4. `/etc/ld.so.cache`
 ///   5. Default paths: /lib64, /usr/lib64, /lib, /usr/lib,
 ///      /lib/x86_64-linux-gnu, /usr/lib/x86_64-linux-gnu
+///
+/// An entry none of those provide fails with [`NotFound`]; an entry that could
+/// not be looked up at all fails with something else.
 pub fn resolve_library(
     soname: &str,
     rpath: &[PathBuf],
@@ -167,7 +189,10 @@ pub fn resolve_library(
         }
     }
 
-    bail!("cannot find shared library '{soname}' — try -L to add a search path")
+    Err(NotFound(format!(
+        "cannot find shared library '{soname}' — try -L to add a search path"
+    ))
+    .into())
 }
 
 /// Resolve a `DT_NEEDED` entry that names a path instead of a soname.
@@ -204,10 +229,11 @@ fn resolve_path_entry(needed: &str, origin: &Path) -> Result<PathBuf> {
         );
     }
     if !path.exists() {
-        bail!(
+        return Err(NotFound(format!(
             "cannot find shared library '{needed}': {} does not exist",
             path.display()
-        );
+        ))
+        .into());
     }
     Ok(path)
 }
@@ -621,6 +647,46 @@ mod resolution_tests {
             .expect_err("the library is not there")
         );
         assert!(err.contains(&missing.display().to_string()), "{err}");
+    }
+
+    /// The two ways resolution ends without a file have to stay
+    /// distinguishable: `collect_imports` skips a dependency this machine
+    /// simply does not have, but refuses to merge when the entry itself is
+    /// something it cannot act on.
+    #[test]
+    fn an_entry_nothing_provides_is_not_found_while_an_unusable_entry_is_an_error() {
+        let root = decoy_tree();
+
+        for absent in [
+            // No search directory, no cache and no default path has it.
+            "libsolder-absent.so.99",
+            // A path-valued entry whose file is not there.
+            "$ORIGIN/sub/libsolder-absent.so.99",
+        ] {
+            let err = resolve_library(
+                absent,
+                &[root.path().join("sysroot/lib")],
+                &[],
+                &empty_cache(),
+                &root.path().join("sysroot/lib"),
+            )
+            .expect_err("the library is not there");
+            assert!(err.is::<NotFound>(), "{absent}: {err:#}");
+        }
+
+        // Which file a relative entry names is not knowable here, so it is an
+        // error however many other libraries the merge could have gone on to
+        // take: skipping it would leave the executable pointing at a file
+        // solder never looked at.
+        let err = resolve_library(
+            "../../elsewhere/sub/libfoo.so.1",
+            &[root.path().join("sysroot/lib")],
+            &[],
+            &empty_cache(),
+            root.path(),
+        )
+        .expect_err("relative entry");
+        assert!(!err.is::<NotFound>(), "{err:#}");
     }
 
     #[test]

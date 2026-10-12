@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use crate::elf_reader::{DynamicTable, va_to_file_offset};
 use crate::lib_discovery::{
-    LdsoCache, expand_dynamic_tokens, is_excluded, resolve_library, soname_base,
+    LdsoCache, NotFound, expand_dynamic_tokens, is_excluded, resolve_library, soname_base,
 };
 use crate::types::{ImportKind, ImportedSymbol};
 
@@ -227,14 +227,37 @@ pub fn collect_imports(
             continue;
         }
 
-        let lib_path = resolve_library(
+        let resolved = resolve_library(
             needed,
             &search_rpath,
             search_runpath,
             ldso_cache,
             &dyn_info.origin,
-        )
-        .with_context(|| format!("resolving DT_NEEDED '{needed}'"))?;
+        );
+
+        let lib_path = match resolved {
+            Ok(path) => path,
+            // Nothing here provides the entry, and the user did not ask for
+            // this library by name: leave it dynamic and merge the rest.
+            //
+            // Without the merge, the executable's references into that library
+            // are resolved by whatever provides it where the binary runs, and
+            // skipping it keeps exactly that — the soname stays in
+            // `DT_NEEDED`, no symbol is taken out of it, and nothing about the
+            // merged output depends on a file solder never read. Failing the
+            // whole run instead meant one dependency that is not installed
+            // here (a plugin library, a sysroot that doesn't carry all of
+            // them) merged *none* of the ones that were sitting right there.
+            Err(e) if merge_filter.is_none() && e.is::<NotFound>() => {
+                warn!("{e}; the entry stays in DT_NEEDED and nothing is merged out of it");
+                continue;
+            }
+            // A library named with `-m` has to be merged or the invocation is
+            // not the one the user asked for, and an entry solder cannot act
+            // on at all (a relative path, an unexpandable token) is never
+            // skippable: see `resolve_path_entry`.
+            Err(e) => return Err(e).with_context(|| format!("resolving DT_NEEDED '{needed}'")),
+        };
 
         let lib = read_library_dynamic(&lib_path)?;
         for name in lib.defined {
@@ -716,6 +739,111 @@ mod library_dynamic_tests {
                 "{what}: {err} should name the file"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unresolvable_dependency_tests {
+    use super::*;
+    use crate::elf_reader::MappedElf;
+
+    const GREP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep");
+    const LIBS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs");
+
+    /// The soname the fixture's second dependency is renamed to. No search
+    /// directory, cache or default path can hold it, whatever machine the test
+    /// runs on — which is the point: `test/grep`'s real dependencies are
+    /// `libpcre2-8.so.0` (shipped in `test/libs`) and `libc.so.6` (never
+    /// merged), so neither exercises a candidate library that cannot be found.
+    ///
+    /// It has to be no longer than the string it replaces: `.dynstr` is
+    /// rewritten in place, so growing it would shift every string behind it.
+    const ABSENT: &str = "libx.so.9";
+
+    /// A copy of `test/grep` whose `libc.so.6` dependency is renamed to
+    /// [`ABSENT`], leaving an executable with one dependency that resolves and
+    /// one that cannot.
+    fn grep_needing_an_absent_library() -> tempfile::NamedTempFile {
+        let mut bytes = std::fs::read(GREP).expect("read test/grep");
+
+        let from = b"libc.so.6\0";
+        let mut to = ABSENT.as_bytes().to_vec();
+        to.resize(from.len(), 0);
+
+        // Every spelling of the soname in the file, which is both the
+        // `DT_NEEDED` string and the `.gnu.version_r` file name beside it.
+        let mut renamed = 0;
+        let mut at = 0;
+        while let Some(found) = bytes[at..].windows(from.len()).position(|w| w == from) {
+            let start = at + found;
+            bytes[start..start + to.len()].copy_from_slice(&to);
+            at = start + to.len();
+            renamed += 1;
+        }
+        assert!(renamed > 0, "test/grep should name libc.so.6 somewhere");
+
+        let file = tempfile::NamedTempFile::new().expect("temp executable");
+        std::fs::write(file.path(), &bytes).expect("write the renamed fixture");
+        file
+    }
+
+    /// A dependency that is not installed where the merge runs is not a reason
+    /// to merge nothing: the executable keeps naming it in `DT_NEEDED` and
+    /// resolves it wherever it ends up running, exactly as it did before, while
+    /// the libraries that *are* here still get merged.
+    #[test]
+    fn a_dependency_that_cannot_be_found_is_skipped_rather_than_failing_the_merge() {
+        let fixture = grep_needing_an_absent_library();
+        let mapped = MappedElf::open(fixture.path()).expect("open the fixture");
+        let exe = mapped.parse().expect("parse the fixture");
+        let dyn_info = parse_dynamic(&exe, fixture.path()).expect("parse .dynamic");
+        assert_eq!(
+            dyn_info.needed,
+            vec!["libpcre2-8.so.0".to_string(), ABSENT.to_string()],
+            "the fixture should need one library that resolves and one that cannot"
+        );
+
+        let rela = RelaTables::read(&exe).expect("read the fixture's .rela tables");
+        let libs = [PathBuf::from(LIBS)];
+        let cache = LdsoCache::load();
+
+        let info = collect_imports(&exe, &rela, &dyn_info, &cache, &libs, None)
+            .expect("an unresolvable dependency must not fail a merge nobody asked for");
+        assert_eq!(
+            info.merged_libs
+                .iter()
+                .map(|lib| lib.soname.as_str())
+                .collect::<Vec<_>>(),
+            ["libpcre2-8.so.0"],
+            "the library that is here should still be a merge candidate"
+        );
+        assert!(
+            info.imports.iter().any(|i| i.name.starts_with("pcre2_")),
+            "symbols should still be taken out of it"
+        );
+    }
+
+    /// Named with `-m`, the same library is an error: merging a subset of what
+    /// the user asked for is what `validate_merge_filter` exists to prevent,
+    /// and a soname that cannot be resolved is no more mergeable than one the
+    /// executable never linked against.
+    #[test]
+    fn the_same_dependency_is_an_error_when_the_user_asked_for_it() {
+        let fixture = grep_needing_an_absent_library();
+        let mapped = MappedElf::open(fixture.path()).expect("open the fixture");
+        let exe = mapped.parse().expect("parse the fixture");
+        let dyn_info = parse_dynamic(&exe, fixture.path()).expect("parse .dynamic");
+        let rela = RelaTables::read(&exe).expect("read the fixture's .rela tables");
+        let libs = [PathBuf::from(LIBS)];
+        let cache = LdsoCache::load();
+
+        let filter = [ABSENT.to_string()];
+        let Err(err) = collect_imports(&exe, &rela, &dyn_info, &cache, &libs, Some(&filter)) else {
+            panic!("a library named with -m has to be merged or refused");
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains(ABSENT), "{msg}");
+        assert!(msg.contains("-L"), "{msg}");
     }
 }
 
