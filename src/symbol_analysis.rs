@@ -28,18 +28,42 @@ pub struct DynamicInfo {
 
 impl DynamicInfo {
     /// The `DT_RPATH` directories the loader would actually search.
-    ///
-    /// `DT_RUNPATH` supersedes `DT_RPATH` outright: ld.so ignores an object's
-    /// `DT_RPATH` whenever that object also carries a `DT_RUNPATH`. Searching
-    /// both would let solder pick a library out of a directory the loader
-    /// never reads, and merge code the executable does not actually run.
     pub fn search_rpath(&self) -> &[PathBuf] {
-        if self.runpath.is_empty() {
-            &self.rpath
-        } else {
-            &[]
-        }
+        effective_rpath(&self.rpath, &self.runpath)
     }
+}
+
+/// One object's `DT_RPATH` as ld.so searches it.
+///
+/// `DT_RUNPATH` supersedes `DT_RPATH` outright: ld.so ignores an object's
+/// `DT_RPATH` whenever that same object also carries a `DT_RUNPATH`. Searching
+/// both would let solder pick a library out of a directory the loader never
+/// reads, and merge code the executable does not actually run.
+fn effective_rpath<'a>(rpath: &'a [PathBuf], runpath: &[PathBuf]) -> &'a [PathBuf] {
+    if runpath.is_empty() { rpath } else { &[] }
+}
+
+/// The search directories ld.so reads out of one object's `DT_RPATH` or
+/// `DT_RUNPATH` values: each value is a colon-separated list of directories,
+/// each of which may carry dynamic string tokens. The tokens are expanded
+/// against `origin`, the directory of the object that recorded the entry — so
+/// these have to be read from the object they belong to, not from another one
+/// that happens to be in the same link.
+fn search_dirs<'a>(values: impl Iterator<Item = &'a str>, origin: &Path) -> Vec<PathBuf> {
+    values
+        .flat_map(|s| s.split(':'))
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| {
+            let dir = expand_dynamic_tokens(p, origin);
+            if dir.is_none() {
+                warn!(
+                    entry = p,
+                    "ignoring library search path with a token that cannot be expanded"
+                );
+            }
+            dir
+        })
+        .collect()
 }
 
 pub fn parse_dynamic(elf: &ElfFile64<'_>, exe_path: &Path) -> Result<DynamicInfo> {
@@ -57,25 +81,13 @@ pub fn parse_dynamic(elf: &ElfFile64<'_>, exe_path: &Path) -> Result<DynamicInfo
         .unwrap_or_else(|_| exe_path.to_path_buf());
     let origin = exe_real.parent().unwrap_or(Path::new("."));
 
-    // DT_RPATH and DT_RUNPATH each name a colon-separated list of directories,
-    // each of which may contain dynamic string tokens.
     let search_list = |tag: u64| -> Vec<PathBuf> {
-        dynamic
-            .values_of(tag)
-            .filter_map(|val| dynamic.string_at(bytes, val))
-            .flat_map(|s| s.split(':'))
-            .filter(|p| !p.is_empty())
-            .filter_map(|p| {
-                let dir = expand_dynamic_tokens(p, origin);
-                if dir.is_none() {
-                    warn!(
-                        entry = p,
-                        "ignoring library search path with a token that cannot be expanded"
-                    );
-                }
-                dir
-            })
-            .collect()
+        search_dirs(
+            dynamic
+                .values_of(tag)
+                .filter_map(|val| dynamic.string_at(bytes, val)),
+            origin,
+        )
     };
 
     let info = DynamicInfo {
@@ -112,6 +124,44 @@ pub struct MergedLibrary {
     /// inherited-dependency pass ([`inherited_needed`]) both want these, and
     /// each used to read and parse the whole library again to get them.
     pub needed: Vec<String>,
+    /// Its own `DT_RPATH` and `DT_RUNPATH`, with dynamic string tokens
+    /// expanded against *its* `$ORIGIN`. These are the directories ld.so
+    /// searches for the entries in `needed`; read them through
+    /// [`dependency_search_path`] rather than directly.
+    pub rpath: Vec<PathBuf>,
+    pub runpath: Vec<PathBuf>,
+}
+
+/// Where ld.so looks for a dependency that `lib` declares, in the two groups
+/// [`resolve_library`] takes them in: the directories searched ahead of
+/// `LD_LIBRARY_PATH`, and the ones searched behind it.
+///
+/// glibc's `_dl_map_object` resolves a soname against the `DT_RPATH` of the
+/// object that asked for it, then of each object up the chain that loaded it
+/// (the executable last), then `LD_LIBRARY_PATH`, then the `DT_RUNPATH` of
+/// *that same object*, then the cache and the default directories. So the
+/// merged library's own entries lead, and `exe_rpath` — the executable's
+/// `DT_RPATH` plus solder's own `$SYSROOT/lib` and `-L` directories — follows
+/// them.
+///
+/// The executable's `DT_RUNPATH` is deliberately absent: a `DT_RUNPATH`
+/// governs only the lookups of the object that records it, never those of its
+/// dependencies. Resolving a merged library's dependency through the
+/// executable's `DT_RUNPATH` — and without the library's own entries — looked
+/// up a soname in directories the loader never reads for it, so solder could
+/// read the exports of a different file from the one the library was linked
+/// against. That file's export list is what decides whether the executable has
+/// to inherit the dependency at all ([`inherited_needed`]): a copy that
+/// happens not to export the symbol gets the entry dropped, and the merged
+/// binary then dies at startup under the `DF_BIND_NOW` solder forces
+/// ("symbol lookup error: undefined symbol").
+pub fn dependency_search_path<'a>(
+    lib: &'a MergedLibrary,
+    exe_rpath: &[PathBuf],
+) -> (Vec<PathBuf>, &'a [PathBuf]) {
+    let mut rpath = effective_rpath(&lib.rpath, &lib.runpath).to_vec();
+    rpath.extend_from_slice(exe_rpath);
+    (rpath, &lib.runpath)
 }
 
 /// Collect all symbols the executable imports from shared libraries, resolving
@@ -267,6 +317,8 @@ pub fn collect_imports(
             soname: needed.clone(),
             path: lib_path,
             needed: lib.needed,
+            rpath: lib.rpath,
+            runpath: lib.runpath,
         });
     }
 
@@ -459,6 +511,11 @@ pub struct LibraryDynamic {
     pub defined: HashSet<String>,
     /// Its own `DT_NEEDED` entries, in the order it lists them.
     pub needed: Vec<String>,
+    /// Its own `DT_RPATH` and `DT_RUNPATH`, with dynamic string tokens
+    /// expanded against the library's own directory: the search path ld.so
+    /// uses for the entries in `needed`.
+    pub rpath: Vec<PathBuf>,
+    pub runpath: Vec<PathBuf>,
 }
 
 /// Read `lib_path`'s exports and dependencies.
@@ -475,6 +532,14 @@ pub fn read_library_dynamic(lib_path: &Path) -> Result<LibraryDynamic> {
     let elf = goblin::elf::Elf::parse(&bytes)
         .with_context(|| format!("parsing {}", lib_path.display()))?;
 
+    // `$ORIGIN` in this library's search path is this library's own directory,
+    // symlinks resolved — the same rule `parse_dynamic` applies to the
+    // executable, applied to the object that recorded these entries.
+    let real = lib_path
+        .canonicalize()
+        .unwrap_or_else(|_| lib_path.to_path_buf());
+    let origin = real.parent().unwrap_or(Path::new("."));
+
     Ok(LibraryDynamic {
         defined: elf
             .dynsyms
@@ -483,6 +548,8 @@ pub fn read_library_dynamic(lib_path: &Path) -> Result<LibraryDynamic> {
             .filter_map(|sym| elf.dynstrtab.get_at(sym.st_name).map(str::to_owned))
             .collect(),
         needed: elf.libraries.iter().map(|s| (*s).to_owned()).collect(),
+        rpath: search_dirs(elf.rpaths.iter().copied(), origin),
+        runpath: search_dirs(elf.runpaths.iter().copied(), origin),
     })
 }
 
@@ -1086,6 +1153,65 @@ mod inherited_needed_tests {
 }
 
 #[cfg(test)]
+mod dependency_search_tests {
+    use super::{MergedLibrary, dependency_search_path};
+    use std::path::PathBuf;
+
+    fn dirs(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    /// A bundled library, with whichever search path entries the case wants.
+    fn lib(rpath: &[&str], runpath: &[&str]) -> MergedLibrary {
+        MergedLibrary {
+            soname: "libfoo.so.1".to_owned(),
+            path: PathBuf::from("/opt/app/lib/libfoo.so.1"),
+            needed: vec!["libbar.so.1".to_owned()],
+            rpath: dirs(rpath),
+            runpath: dirs(runpath),
+        }
+    }
+
+    /// ld.so searches the `DT_RPATH` of the object that asked for a soname
+    /// before it works its way up to the executable's, so a bundled library
+    /// that carries its dependencies next to itself resolves them from there
+    /// even when the executable's own `DT_RPATH` holds another copy.
+    #[test]
+    fn the_declaring_librarys_rpath_leads_the_search() {
+        let lib = lib(&["/opt/app/lib"], &[]);
+        let (rpath, runpath) = dependency_search_path(&lib, &dirs(&["/usr/lib/exe-rpath"]));
+        assert_eq!(rpath, dirs(&["/opt/app/lib", "/usr/lib/exe-rpath"]));
+        assert!(runpath.is_empty(), "{runpath:?}");
+    }
+
+    /// `DT_RUNPATH` is searched after `LD_LIBRARY_PATH` rather than before it,
+    /// and it supersedes the `DT_RPATH` of the same object — the library's own
+    /// `DT_RPATH` here, not the executable's, which ld.so still reads.
+    #[test]
+    fn a_runpath_of_its_own_supersedes_only_its_own_rpath() {
+        let lib = lib(&["/opt/app/ignored"], &["/opt/app/lib"]);
+        let (rpath, runpath) = dependency_search_path(&lib, &dirs(&["/usr/lib/exe-rpath"]));
+        assert_eq!(
+            rpath,
+            dirs(&["/usr/lib/exe-rpath"]),
+            "the library's DT_RPATH is dead once it has a DT_RUNPATH"
+        );
+        assert_eq!(runpath, dirs(&["/opt/app/lib"]).as_slice());
+    }
+
+    /// A library with no search path of its own leaves the executable's, which
+    /// is where solder's `$SYSROOT/lib` and `-L` directories ride along.
+    #[test]
+    fn a_library_without_a_search_path_leaves_the_executables() {
+        let lib = lib(&[], &[]);
+        let (rpath, runpath) =
+            dependency_search_path(&lib, &dirs(&["/sysroot/lib", "/opt/mylibs"]));
+        assert_eq!(rpath, dirs(&["/sysroot/lib", "/opt/mylibs"]));
+        assert!(runpath.is_empty(), "{runpath:?}");
+    }
+}
+
+#[cfg(test)]
 mod absorbed_library_tests {
     use super::{ImportInfo, MergedLibrary};
     use crate::types::{ImportKind, ImportedSymbol};
@@ -1096,6 +1222,8 @@ mod absorbed_library_tests {
             soname: soname.to_owned(),
             path: PathBuf::from("/usr/lib").join(soname),
             needed: Vec::new(),
+            rpath: Vec::new(),
+            runpath: Vec::new(),
         }
     }
 

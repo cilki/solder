@@ -67,6 +67,8 @@ mod tests {
             soname: soname.to_owned(),
             path: PathBuf::from("/usr/lib").join(soname),
             needed: needed.iter().map(|s| (*s).to_owned()).collect(),
+            rpath: Vec::new(),
+            runpath: Vec::new(),
         }
     }
 
