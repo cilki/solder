@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
 use object::{Object, ObjectSection};
 use tracing::debug;
 
@@ -25,9 +25,32 @@ enum AbstractValue {
     ComputedTarget { table_base: u64 },
 }
 
-/// Abstract values currently held by the 64-bit GP registers. Sub-registers
-/// share their parent's entry, so `AL`, `EAX` and `RAX` are all `RAX`.
-type RegState = HashMap<Register, AbstractValue>;
+/// Abstract values currently held by the 64-bit GP registers, indexed by
+/// register number. Sub-registers share their parent's slot, so `AL`, `EAX` and
+/// `RAX` are all `RAX`.
+///
+/// There are only sixteen of these, and the scan below reads and writes them on
+/// every instruction it walks — four hundred thousand of them for `test/md5sum`
+/// against `libcrypto.so.3` — so they are a flat array. As a `HashMap` the
+/// hashing alone was a measurable share of extraction.
+#[derive(Default)]
+struct RegState([Option<AbstractValue>; 16]);
+
+impl RegState {
+    /// The abstract value tracked for whichever 64-bit register `reg` is part
+    /// of, or `None` for a register this does not track at all.
+    fn get(&self, reg: Register) -> Option<&AbstractValue> {
+        self.0[gpr_slot(reg)?].as_ref()
+    }
+
+    /// Replace what `reg` holds, where `None` means the register's value is no
+    /// longer anything this scanner can describe.
+    fn set(&mut self, reg: Register, value: Option<AbstractValue>) {
+        if let Some(slot) = gpr_slot(reg) {
+            self.0[slot] = value;
+        }
+    }
+}
 
 /// The 64-bit GP register whose state `reg` is part of, e.g. `CL`/`CX`/`ECX` →
 /// `RCX`. `None` for anything that is not a GP register: `RIP`, `XMM0`, or the
@@ -36,9 +59,11 @@ fn to_gpr64(reg: Register) -> Option<Register> {
     reg.is_gpr().then(|| reg.full_register())
 }
 
-/// The abstract value tracked for whichever 64-bit register `reg` is part of.
-fn value_of(regs: &RegState, reg: Register) -> Option<&AbstractValue> {
-    regs.get(&to_gpr64(reg)?)
+/// Which of the sixteen slots tracks `reg`. `Register::number()` is 0..16 for
+/// every width of GP register, and `to_gpr64` is what collapses the widths of
+/// one register onto one slot.
+fn gpr_slot(reg: Register) -> Option<usize> {
+    Some(to_gpr64(reg)?.number())
 }
 
 /// The 64-bit GP register named by operand `op`, if it names one.
@@ -55,7 +80,7 @@ fn operand_value<'a>(
     regs: &'a RegState,
     op: u32,
 ) -> Option<&'a AbstractValue> {
-    regs.get(&operand_gpr(instr, op)?)
+    regs.get(operand_gpr(instr, op)?)
 }
 
 /// The base and index registers of the instruction's memory operand, or
@@ -70,37 +95,39 @@ fn memory_regs(instr: &Instruction) -> (Register, Register) {
 
 /// Detects jump tables in a function using symbolic execution with iced-x86.
 ///
-/// Decodes instructions and tracks register state to identify the pattern:
+/// Tracks register state across the function's already-decoded instructions to
+/// identify the pattern:
 ///   LEA reg, [rip+disp]  (load .rodata table base)
 ///   MOVSXD reg, [base+idx*4]  (read i32 offset from table)
 ///   ADD reg, reg  (compute target = base + offset)
 ///   JMP reg  (indirect jump through computed address)
+///
+/// `instrs` are the function's instructions and `code_len` the number of bytes
+/// they span, decoded once by the caller (see
+/// [`crate::extractor::decode_instructions`]).
 pub fn detect_jump_tables(
-    code: &[u8],
+    instrs: &[Instruction],
+    code_len: u64,
     base_vaddr: u64,
     symbol_name: &str,
     elf: &object::read::elf::ElfFile64<'_>,
 ) -> Result<Vec<JumpTable>> {
-    if code.len() < 16 {
+    if code_len < 16 {
         return Ok(Vec::new());
     }
 
     debug!(symbol = symbol_name, "Scanning for jump tables");
 
     // Symbolic execution pass
-    let mut instr = Instruction::default();
-    let mut regs = RegState::new();
+    let mut regs = RegState::default();
     let mut confirmed_bases: HashSet<u64> = HashSet::new();
 
-    let mut decoder = Decoder::with_ip(64, code, base_vaddr, DecoderOptions::NONE);
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instr);
-
+    for instr in instrs {
         // An indirect branch through a register holding table base + entry is
         // what confirms a table.
         if instr.flow_control() == FlowControl::IndirectBranch
-            && let Some(gpr) = operand_gpr(&instr, 0)
-            && let Some(AbstractValue::ComputedTarget { table_base }) = regs.get(&gpr)
+            && let Some(gpr) = operand_gpr(instr, 0)
+            && let Some(AbstractValue::ComputedTarget { table_base }) = regs.get(gpr)
         {
             debug!(
                 table_base = format_args!("{:#x}", table_base),
@@ -114,11 +141,9 @@ pub fn detect_jump_tables(
         // whatever it leaves there replaces what we were tracking. An
         // instruction we cannot interpret invalidates its destination instead
         // of letting a stale value survive the write.
-        if let Some(dst) = operand_gpr(&instr, 0) {
-            match transfer(&instr, elf, &regs) {
-                Some(value) => regs.insert(dst, value),
-                None => regs.remove(&dst),
-            };
+        if let Some(dst) = operand_gpr(instr, 0) {
+            let value = transfer(instr, elf, &regs);
+            regs.set(dst, value);
         }
     }
 
@@ -134,7 +159,7 @@ pub fn detect_jump_tables(
     let mut jump_tables = Vec::new();
     for (i, &table_addr) in sorted_bases.iter().enumerate() {
         let next_table = sorted_bases.get(i + 1).copied();
-        match identify_table_bounds(elf, table_addr, base_vaddr, code.len() as u64, next_table) {
+        match identify_table_bounds(elf, table_addr, base_vaddr, code_len, next_table) {
             Ok(table) => {
                 debug!(
                     vaddr = format_args!("{:#x}", table.table_vaddr),
@@ -178,14 +203,14 @@ fn transfer(
         // an entry read out of that table, which is the branch target.
         Mnemonic::Lea => {
             let (base, index) = memory_regs(instr);
-            combine(value_of(regs, base), value_of(regs, index))
+            combine(regs.get(base), regs.get(index))
         }
         Mnemonic::Add => combine(operand_value(instr, regs, 0), operand_value(instr, regs, 1)),
         // `movsxd dst, [table+idx*4]` reads a signed 32-bit entry out of a
         // tracked table.
         Mnemonic::Movsxd => {
             let (table, _) = memory_regs(instr);
-            match value_of(regs, table)? {
+            match regs.get(table)? {
                 &AbstractValue::RodataAddr(table_base) => {
                     Some(AbstractValue::TableEntry { table_base })
                 }
@@ -390,7 +415,9 @@ mod tests {
         };
 
         let (code, base) = function_code(elf, "pcre2_config_8");
-        let tables = detect_jump_tables(&code, base, "pcre2_config_8", elf).expect("detect");
+        let instrs = crate::extractor::decode_instructions(&code, base);
+        let tables = detect_jump_tables(&instrs, code.len() as u64, base, "pcre2_config_8", elf)
+            .expect("detect");
         assert_eq!(tables.len(), 2, "{tables:#x?}");
 
         let rodata = elf.section_by_name(".rodata").expect(".rodata");

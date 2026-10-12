@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use iced_x86::Instruction;
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
@@ -707,17 +708,25 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
     }
 
     // A text unit's bytes are the function plus whatever sits between its last
-    // instruction and the next bound, which is not code (see `code_extent`).
-    let code_len = if section_kind == SectionKind::Text {
-        code_extent(&bytes, sym_vaddr, lib.index)
+    // instruction and the next bound, which is not code (see
+    // `decode_unit_code`). Decoding is what extraction spends most of its time
+    // on, and the extent, the RIP-relative scan and the jump-table detector all
+    // want the same instruction stream, so it is decoded once here and shared
+    // rather than re-derived by each of the three.
+    let code = if section_kind == SectionKind::Text {
+        decode_unit_code(&bytes, sym_vaddr, lib.index)
     } else {
-        bytes.len()
+        UnitCode {
+            instrs: Vec::new(),
+            len: bytes.len(),
+        }
     };
+    let code_len = code.len;
 
     // Scan for RIP-relative references (calls, jumps, and data accesses).
     // Create synthetic relocations for each reference so they get patched correctly.
     if section_kind == SectionKind::Text {
-        let rip_refs = scan_rip_relative_refs(&bytes[..code_len], sym_vaddr);
+        let rip_refs = scan_rip_relative_refs(&code.instrs, &bytes, sym_vaddr);
         for rip_ref in rip_refs {
             let target_addr = rip_ref.target_vaddr;
 
@@ -847,8 +856,13 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
 
     // Jump table detection via symbolic execution
     if section_kind == SectionKind::Text
-        && let Ok(jump_tables) =
-            crate::jump_table::detect_jump_tables(&bytes[..code_len], sym_vaddr, &key.sym, lib.elf)
+        && let Ok(jump_tables) = crate::jump_table::detect_jump_tables(
+            &code.instrs,
+            code_len as u64,
+            sym_vaddr,
+            &key.sym,
+            lib.elf,
+        )
     {
         if !jump_tables.is_empty() {
             debug!(
@@ -1242,8 +1256,17 @@ fn anon_target_is_extractable(elf: &object::read::elf::ElfFile64<'_>, addr: u64)
     false
 }
 
-/// How many of a text unit's leading bytes are instructions of the function it
-/// was extracted for.
+/// A text unit's instruction stream, and how many of the unit's leading bytes
+/// those instructions cover.
+struct UnitCode {
+    /// The unit's first `len` bytes, decoded.
+    instrs: Vec<Instruction>,
+    /// How many of a text unit's leading bytes are instructions of the function
+    /// it was extracted for.
+    len: usize,
+}
+
+/// Decode a text unit's code, stopping where the function's instructions do.
 ///
 /// A unit covers the function plus everything the linker left between its last
 /// instruction and the bound extraction stopped at: alignment padding, and —
@@ -1263,58 +1286,75 @@ fn anon_target_is_extractable(elf: &object::read::elf::ElfFile64<'_>, addr: u64)
 /// Hand-written assembly whose unwind info covers only part of its function
 /// fails that test and keeps being scanned to the end of the unit, since
 /// missing a relocation in real code is far worse than inventing one in data.
-fn code_extent(bytes: &[u8], vaddr: u64, index: &LibIndex) -> usize {
+fn decode_unit_code(bytes: &[u8], vaddr: u64, index: &LibIndex) -> UnitCode {
     // Only an FDE that starts where the unit starts describes the unit's
     // function; one that merely contains `vaddr` belongs to a function the unit
     // begins partway into, and says nothing about where the unit's code ends.
-    match index
+    let fde_end = index
         .fdes
         .containing(vaddr)
         .filter(|&(start, _)| start == vaddr)
-    {
-        Some((_, fde_end)) => instruction_extent(bytes, vaddr, fde_end),
-        None => bytes.len(),
+        .map(|(_, end)| end);
+    decode_to_code_bound(bytes, vaddr, fde_end)
+}
+
+/// `decode_unit_code` with the unwind bound supplied rather than looked up.
+fn decode_to_code_bound(bytes: &[u8], vaddr: u64, fde_end: Option<u64>) -> UnitCode {
+    // A bound at or past the end of the unit leaves nothing to cut.
+    let claimed = fde_end
+        .and_then(|end| end.checked_sub(vaddr))
+        .map(|len| len as usize)
+        .filter(|&len| len < bytes.len());
+
+    // Decode only as far as the unwind info claims the function runs. Where the
+    // claim holds, the tail — which is not code — is never decoded at all,
+    // which is the point of cutting there in the first place.
+    let Some(len) = claimed else {
+        return UnitCode {
+            instrs: decode_instructions(bytes, vaddr),
+            len: bytes.len(),
+        };
+    };
+
+    let mut instrs = decode_instructions(&bytes[..len], vaddr);
+    if ends_the_function(&instrs, vaddr + len as u64) {
+        return UnitCode { instrs, len };
+    }
+
+    // The claim was rejected, so the scanners get the whole unit. Decoding one
+    // instruction does not depend on what follows it, so what has been decoded
+    // already stands — bar a last instruction the cut may have run through the
+    // middle of — and the decode picks up after it instead of starting over.
+    instrs.pop();
+    let resume = instrs.last().map_or(vaddr, |i| i.next_ip());
+    instrs.extend(decode_instructions(
+        &bytes[(resume - vaddr) as usize..],
+        resume,
+    ));
+    UnitCode {
+        instrs,
+        len: bytes.len(),
     }
 }
 
-/// `bytes` cut at `fde_end`, but only if decoding agrees that the function ends
-/// there: the last instruction before `fde_end` has to end exactly on it and
-/// has to be one that does not fall through. Anything else — unwind info that
-/// stops mid-function, a byte range the decoder cannot walk — yields the whole
-/// of `bytes`, leaving the scan as wide as it was.
-fn instruction_extent(bytes: &[u8], vaddr: u64, fde_end: u64) -> usize {
-    use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
+/// Whether the decode agrees that a function ends at `end`: the last
+/// instruction has to end exactly on it and has to be one that does not fall
+/// through. Anything else — unwind info that stops mid-function, a bound that
+/// lands inside an instruction — is not an ending.
+fn ends_the_function(instrs: &[Instruction], end: u64) -> bool {
+    use iced_x86::FlowControl;
 
-    let Some(code_len) = fde_end
-        .checked_sub(vaddr)
-        .map(|len| len as usize)
-        .filter(|&len| len < bytes.len())
-    else {
-        return bytes.len();
-    };
-
-    let mut decoder = Decoder::with_ip(64, &bytes[..code_len], vaddr, DecoderOptions::NONE);
-    let mut instr = Instruction::default();
-    let mut last = Instruction::default();
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instr);
-        last = instr;
-    }
-
-    let ends_the_function = !last.is_invalid()
-        && last.next_ip() == fde_end
-        && matches!(
-            last.flow_control(),
-            FlowControl::Return
-                | FlowControl::UnconditionalBranch
-                | FlowControl::IndirectBranch
-                | FlowControl::Exception
-        );
-    if ends_the_function {
-        code_len
-    } else {
-        bytes.len()
-    }
+    instrs.last().is_some_and(|last| {
+        !last.is_invalid()
+            && last.next_ip() == end
+            && matches!(
+                last.flow_control(),
+                FlowControl::Return
+                    | FlowControl::UnconditionalBranch
+                    | FlowControl::IndirectBranch
+                    | FlowControl::Exception
+            )
+    })
 }
 
 /// Find a run of at least `need` bytes of alignment padding starting at
@@ -1358,17 +1398,35 @@ struct RipRelativeRef {
     addend: i64,
 }
 
-/// Scan machine code for all RIP-relative references (calls, jumps, and data accesses).
-/// Returns a list of references with their offsets and target addresses.
-fn scan_rip_relative_refs(bytes: &[u8], base_vaddr: u64) -> Vec<RipRelativeRef> {
-    use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
+/// Decode `bytes`, loaded at `vaddr`, into an instruction stream.
+pub fn decode_instructions(bytes: &[u8], vaddr: u64) -> Vec<Instruction> {
+    use iced_x86::{Decoder, DecoderOptions};
+
+    let mut decoder = Decoder::with_ip(64, bytes, vaddr, DecoderOptions::NONE);
+    let mut instrs = Vec::new();
+    while decoder.can_decode() {
+        instrs.push(decoder.decode());
+    }
+    instrs
+}
+
+/// Scan decoded machine code for all RIP-relative references (calls, jumps, and
+/// data accesses). Returns a list of references with their offsets and target
+/// addresses.
+///
+/// `bytes` is the unit the instructions were decoded from, needed to locate the
+/// encoded displacement inside each instruction; `instrs` may cover only a
+/// prefix of it.
+fn scan_rip_relative_refs(
+    instrs: &[Instruction],
+    bytes: &[u8],
+    base_vaddr: u64,
+) -> Vec<RipRelativeRef> {
+    use iced_x86::{FlowControl, OpKind};
 
     let mut refs = Vec::new();
-    let mut decoder = Decoder::with_ip(64, bytes, base_vaddr, DecoderOptions::NONE);
-    let mut instr = Instruction::default();
 
-    while decoder.can_decode() {
-        decoder.decode_out(&mut instr);
+    for instr in instrs {
         let instr_offset = (instr.ip() - base_vaddr) as usize;
 
         match instr.flow_control() {
@@ -2854,13 +2912,24 @@ mod tests {
         assert_eq!(entries, 32, "the switch tables lost their entries");
     }
 
-    /// `instruction_extent` is what keeps the instruction scanners off the
-    /// non-code tail of a text unit. It gets to cut only where the decode backs
-    /// the unwind table up.
+    /// The extent `decode_to_code_bound` settles on is what keeps the
+    /// instruction scanners off the non-code tail of a text unit. It gets to
+    /// cut only where the decode backs the unwind table up.
     mod instruction_extent_tests {
-        use super::super::instruction_extent;
-
         const VA: u64 = 0x1000;
+
+        /// How far `decode_to_code_bound` decodes, which is the extent the
+        /// instruction scanners then get.
+        fn instruction_extent(bytes: &[u8], vaddr: u64, fde_end: u64) -> usize {
+            let code = super::super::decode_to_code_bound(bytes, vaddr, Some(fde_end));
+            // Whatever the extent, the instructions handed on cover exactly it.
+            assert_eq!(
+                code.instrs.last().map_or(vaddr, |i| i.next_ip()),
+                vaddr + code.len as u64,
+                "decoded instructions do not span the reported extent"
+            );
+            code.len
+        }
 
         /// `ret` followed by the kind of string constant hand-written assembly
         /// keeps next to its code. Everything after the `ret` is data.
