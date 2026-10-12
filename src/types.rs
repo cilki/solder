@@ -209,9 +209,10 @@ pub enum SectionKind {
 /// Target of a relocation within an extracted unit.
 #[derive(Debug, Clone)]
 pub enum RelocTarget {
-    /// Another unit that is being merged into the executable.
-    /// The UnitId is initially a placeholder (u32::MAX) during extraction,
-    /// resolved in a second pass.
+    /// Another unit that is being merged into the executable. The id is the one
+    /// extraction reserved for that unit when this reference was found, so it
+    /// names the unit the merge ends up holding even though that unit may not
+    /// have been extracted yet when the relocation was recorded.
     MergedUnit(UnitId),
     /// A symbol that stays external (e.g. a glibc function).
     /// At runtime, calls go through a trampoline stub in the merged segment.

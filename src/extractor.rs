@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
-use indexmap::IndexSet;
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
@@ -48,19 +47,22 @@ struct DataBlobInfo {
 
 /// State threaded through the BFS.
 struct ExtractionState {
-    extracted: HashMap<UnitKey, UnitId>,
+    /// The id reserved for each unit the closure has reached, whether or not it
+    /// has been extracted yet (see [`ExtractionState::reserve`]).
+    reserved: HashMap<UnitKey, UnitId>,
+    /// Units whose id has been reserved but which have not been extracted yet.
+    /// Reserving an id and queueing the extraction that fulfills it are the same
+    /// step, so nothing can hand out an id for a unit it then forgets to build.
+    worklist: VecDeque<UnitKey>,
     units: Vec<ExtractedUnit>,
     /// Where in `units` each registered unit lives. A unit is reached by its
-    /// `UnitId` from several places — the jump-table scanner appends
-    /// relocations to a `.rodata` blob, the second pass resolves placeholder
-    /// targets — and `units` is not in id order, because a data blob's
-    /// relocations can pull in another blob that gets pushed first. Scanning
-    /// `units` for a matching id instead made every one of those lookups
-    /// O(units); with ~10k units and ~69k placeholders to resolve (md5sum +
-    /// libcrypto.so.3) that was most of a second of pure comparisons.
+    /// `UnitId` from elsewhere — the jump-table scanner appends relocations to
+    /// a `.rodata` blob extracted for another function — and `units` is not in
+    /// id order, because a data blob's relocations can pull in another blob
+    /// that gets pushed first. Scanning `units` for a matching id instead made
+    /// every one of those lookups O(units), which with ~10k units
+    /// (md5sum + libcrypto.so.3) was most of a second of pure comparisons.
     unit_index: HashMap<UnitId, usize>,
-    // Pending placeholder mappings: (UnitId, reloc_index) → target UnitKey
-    pending: Vec<(UnitId, usize, UnitKey)>,
     next_id: u32,
     /// Symbols that stay external (glibc etc.). Maps name → known.
     external_syms: HashSet<String>,
@@ -101,6 +103,33 @@ impl ExtractionState {
         let id = UnitId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// The id the merged copy of `key` will have, reserving one and queueing
+    /// the extraction that fulfills it if nothing has asked for `key` yet.
+    ///
+    /// A reference to a unit can be resolved the moment it is found, because
+    /// the id does not depend on anything extraction has yet to discover — only
+    /// on whether this key has been seen before. That is what lets a
+    /// relocation's target be filled in as it is collected instead of in a
+    /// second pass over the whole closure: with ~69k references into ~10k units
+    /// (`test/md5sum` + `libcrypto.so.3`) the pass was 69k hash lookups of a
+    /// `(PathBuf, String)` key, and recording the references cost a clone of
+    /// that key apiece on top.
+    fn reserve(&mut self, key: UnitKey) -> UnitId {
+        if let Some(&id) = self.reserved.get(&key) {
+            return id;
+        }
+        let id = self.alloc_id();
+        self.worklist.push_back(key.clone());
+        self.reserved.insert(key, id);
+        id
+    }
+
+    /// Record that the relocation being collected needs `dep` merged, and hand
+    /// back the target to store in it.
+    fn depend_on(&mut self, dep: UnitKey) -> RelocTarget {
+        RelocTarget::MergedUnit(self.reserve(dep))
     }
 
     /// Register a finished unit so it can be found again by its id.
@@ -182,31 +211,24 @@ impl ExtractionState {
         }
     }
 
-    /// Finish the relocations collected for unit `id`: queue the placeholder
-    /// resolutions keyed to their indices, and zero and record the copied GOT
-    /// slots in `bytes` that ld.so has to fill in.
-    ///
-    /// Hands back the unit's relocation list and the units it depends on, for
-    /// the caller to store and to enqueue. Extracting a symbol and extracting
-    /// a data section blob both end this way.
+    /// Finish the relocations collected for unit `id`: zero and record the
+    /// copied GOT slots in `bytes` that ld.so has to fill in, and hand back the
+    /// unit's relocation list for the caller to store. Extracting a symbol and
+    /// extracting a data section blob both end this way.
     fn take_unit_relocs(
         &mut self,
         id: UnitId,
         bytes: &mut [u8],
         relocs: UnitRelocs,
-    ) -> (Vec<ExtractedReloc>, IndexSet<UnitKey>) {
-        for (reloc_idx, dep_key) in relocs.pending {
-            self.pending.push((id, reloc_idx, dep_key));
-        }
+    ) -> Vec<ExtractedReloc> {
         self.register_got_slot_fixups(id, bytes, relocs.got_fixups);
-        (relocs.relocations, relocs.new_deps)
+        relocs.relocations
     }
 }
 
 /// Extract all symbols transitively reachable from `seeds` (direct imports).
-/// Returns the list of extracted units with placeholder RelocTargets resolved,
-/// along with init/fini array entries from all processed libraries and GOT
-/// slots that need re-resolution by ld.so.
+/// Returns the list of extracted units, along with init/fini array entries from
+/// all processed libraries and GOT slots that need re-resolution by ld.so.
 pub fn extract_units(
     seeds: &[crate::types::ImportedSymbol],
     exe_elf: &object::read::elf::ElfFile64<'_>,
@@ -229,10 +251,10 @@ pub fn extract_units(
         .collect();
 
     let mut state = ExtractionState {
-        extracted: HashMap::new(),
+        reserved: HashMap::new(),
+        worklist: VecDeque::new(),
         units: Vec::new(),
         unit_index: HashMap::new(),
-        pending: Vec::new(),
         next_id: 0,
         external_syms: exe_dynsym_names,
         cross_lib_syms: merged_lib_syms.clone(),
@@ -247,97 +269,59 @@ pub fn extract_units(
         plt_map_cache: HashMap::new(),
     };
 
-    let mut worklist: VecDeque<UnitKey> = VecDeque::new();
     for imp in seeds {
-        worklist.push_back(UnitKey {
+        state.reserve(UnitKey {
             lib: imp.source_library.clone(),
             sym: imp.name.clone(),
         });
     }
 
-    while let Some(key) = worklist.pop_front() {
-        if state.extracted.contains_key(&key) {
-            continue;
-        }
-
-        let new_deps = process_symbol(&key, &mut state)
+    // Every key on the worklist had an id reserved for it when it was queued,
+    // and `process_symbol` registers the unit under that id — so the queue
+    // running dry means every id handed out has a unit behind it, and every
+    // relocation already points at the right one.
+    while let Some(key) = state.worklist.pop_front() {
+        process_symbol(&key, &mut state)
             .with_context(|| format!("extracting '{}' from {}", key.sym, key.lib.display()))?;
-
-        for dep in new_deps {
-            if !state.extracted.contains_key(&dep) {
-                worklist.push_back(dep);
-            }
-        }
     }
 
-    // Second pass: point each placeholder at the unit that was in fact
-    // extracted for its target. A target nothing extracted leaves the
-    // relocation with nothing to aim at, so it is dropped.
-    let mut dropped: HashMap<UnitId, Vec<usize>> = HashMap::new();
-    for (unit_id, reloc_idx, target_key) in std::mem::take(&mut state.pending) {
-        let Some(&target) = state.extracted.get(&target_key) else {
-            warn!(
-                target=target_key.sym,
-                lib=%target_key.lib.display(),
-                "Unresolved relocation, skipping"
-            );
-            dropped.entry(unit_id).or_default().push(reloc_idx);
-            continue;
-        };
-        let unit = state.unit_mut(unit_id).expect("pending unit is registered");
-        unit.relocations[reloc_idx].target = RelocTarget::MergedUnit(target);
-    }
-
-    // Removing a relocation shifts every later index, so take them from the
-    // back. Sorting here is what makes that safe: it used to rely on `pending`
-    // happening to list a unit's relocations in ascending index order.
-    for (unit_id, mut indices) in dropped {
-        indices.sort_unstable_by(|a, b| b.cmp(a));
-        let unit = state.unit_mut(unit_id).expect("pending unit is registered");
-        for idx in indices {
-            unit.relocations.remove(idx);
-        }
+    // That is the invariant the whole scheme rests on: a `MergedUnit` target
+    // naming an id nothing built would be a reference into the middle of
+    // whatever the layout put at that id's place, with nothing to say so.
+    if let Some((key, id)) = state
+        .reserved
+        .iter()
+        .find(|(_, id)| !state.unit_index.contains_key(id))
+    {
+        bail!(
+            "internal error: id {} was reserved for '{}' in {} but no unit was \
+             extracted under it",
+            id.0,
+            key.sym,
+            key.lib.display()
+        );
     }
 
     Ok((state.units, state.init_fini, state.got_slot_fixups))
 }
 
 /// Everything collecting one unit's relocations produces: the relocations
-/// themselves, and the three things they drag along.
+/// themselves and the copied GOT slots they turned up.
 ///
-/// The four have to travel together, because a pending resolution is keyed by
-/// the index of the relocation it belongs to. Carrying them as four separate
-/// out-parameters is what took `collect_dynamic_range_relocs` to eleven
-/// arguments, and what left every caller of `depend_on` responsible for
-/// handing it the index its own relocation was about to land at.
+/// The two have to travel together, because zeroing a copied slot means
+/// reaching into the unit's bytes once the relocations over them are settled.
+/// Carrying them as separate out-parameters is what took
+/// `collect_dynamic_range_relocs` to eleven arguments.
 #[derive(Default)]
 struct UnitRelocs {
     /// The unit's relocations, in the order they were collected.
     relocations: Vec<ExtractedReloc>,
-    /// Units that have to be extracted for those relocations to have targets.
-    new_deps: IndexSet<UnitKey>,
-    /// `(index into `relocations`, target)` per placeholder target, for the
-    /// second pass in `extract_units` to resolve.
-    pending: Vec<(usize, UnitKey)>,
     /// `(offset within the unit, symbol name, weak)` per copied GOT slot that
     /// ld.so has to fill in (see `GotSlotFixup`).
     got_fixups: Vec<(u64, String, bool)>,
 }
 
 impl UnitRelocs {
-    /// Record a dependency on `dep_key`, queue the relocation that is about to
-    /// be pushed for second-pass resolution, and hand back the placeholder
-    /// target to store in it until then.
-    ///
-    /// The queued entry is keyed by that relocation's index, which is read off
-    /// `relocations` here rather than passed in — so the two cannot get out of
-    /// step.
-    fn depend_on(&mut self, dep_key: UnitKey) -> RelocTarget {
-        self.new_deps.insert(dep_key.clone());
-        self.pending.push((self.relocations.len(), dep_key));
-        RelocTarget::MergedUnit(UnitId(u32::MAX))
-    }
-
     /// Whether a relocation already covers `offset`, so a later pass leaves
     /// the target an earlier one resolved alone.
     fn covers(&self, offset: u64) -> bool {
@@ -515,9 +499,13 @@ fn reject_unliftable_dynamic_reloc(
     )
 }
 
-/// Process a single symbol: extract its bytes, parse its relocations, and
-/// return new symbols to enqueue.
-fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet<UnitKey>> {
+/// Process a single symbol: extract its bytes under the id reserved for it and
+/// parse its relocations, reserving an id for each unit they reach.
+fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
+    // The id this unit will be registered under. Knowing it up front is what
+    // lets the unit's own relocations — a jump table's entries, a recursive
+    // call — point at it as they are collected.
+    let id = state.reserve(key.clone());
     let lib_bytes = state.lib_bytes(&key.lib)?;
 
     let object_file = object::File::parse(lib_bytes.as_slice())
@@ -550,7 +538,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
             .iter()
             .chain(&lib_init_fini.fini_entries)
         {
-            relocs.new_deps.insert(UnitKey {
+            state.reserve(UnitKey {
                 lib: entry.source_lib.clone(),
                 sym: entry.unit_name.clone(),
             });
@@ -649,7 +637,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                 if state.external_syms.contains(&ts_name) || ts_name.is_empty() {
                     RelocTarget::External(ts_name)
                 } else if let Some(other_lib) = state.cross_lib_syms.get(&ts_name).cloned() {
-                    relocs.depend_on(UnitKey {
+                    state.depend_on(UnitKey {
                         lib: other_lib,
                         sym: ts_name,
                     })
@@ -674,13 +662,12 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                     // Try to extract this data section containing the symbol
                     // This will populate state.data_blobs if it's a data section
                     let extract_result = ensure_data_blob_extracted(lib, ts_vaddr, state);
-                    if let Ok(Some((blob_id, blob_base, blob_deps))) = extract_result {
+                    if let Ok(Some((blob_id, blob_base))) = extract_result {
                         let offset_in_blob = ts_vaddr - blob_base;
-                        relocs.new_deps.extend(blob_deps);
                         RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
                     } else {
                         // It's a code symbol or unknown - extract as a unit
-                        relocs.depend_on(UnitKey {
+                        state.depend_on(UnitKey {
                             lib: key.lib.clone(),
                             sym: ts_name,
                         })
@@ -762,7 +749,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                     let target = if !state.external_syms.contains(&ext_name)
                         && let Some(other_lib) = state.cross_lib_syms.get(&ext_name).cloned()
                     {
-                        relocs.depend_on(UnitKey {
+                        state.depend_on(UnitKey {
                             lib: other_lib,
                             sym: ext_name,
                         })
@@ -789,7 +776,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                             .then(|| (anon_unit_name(target_addr), 0))
                     });
                     if let Some((target_name, offset_in_target)) = dep {
-                        let target = relocs.depend_on(UnitKey {
+                        let target = state.depend_on(UnitKey {
                             lib: key.lib.clone(),
                             sym: target_name,
                         });
@@ -820,7 +807,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                 // path below.
                 if let Some((target_name, offset_in_target)) = resolve_owning_unit(lib, target_addr)
                 {
-                    let target = relocs.depend_on(UnitKey {
+                    let target = state.depend_on(UnitKey {
                         lib: key.lib.clone(),
                         sym: target_name,
                     });
@@ -833,11 +820,10 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                     continue;
                 }
                 // Otherwise try to extract the data section
-                if let Some((blob_id, blob_base, blob_deps)) =
+                if let Some((blob_id, blob_base)) =
                     ensure_data_blob_extracted(lib, target_addr, state)?
                 {
                     let offset_in_blob = target_addr - blob_base;
-                    relocs.new_deps.extend(blob_deps);
                     relocs.relocations.push(pcrel_reloc(
                         rip_ref.offset as u64,
                         32,
@@ -871,10 +857,9 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
 
         for table in jump_tables {
             // 1. Ensure .rodata blob containing table is extracted
-            if let Some((blob_id, blob_base, blob_deps)) =
+            if let Some((blob_id, blob_base)) =
                 ensure_data_blob_extracted(lib, table.table_vaddr, state)?
             {
-                relocs.new_deps.extend(blob_deps);
                 // 2. Create relocations for each table entry
                 for (idx, target_addr) in table.targets.iter().enumerate() {
                     let entry_offset_in_blob = (table.table_vaddr - blob_base) + (idx * 4) as u64;
@@ -911,27 +896,15 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
                     // Therefore: A = offset_in_target + idx*4
                     let addend = offset_in_target + (idx * 4) as i64;
 
-                    // 4. Add jump table entry relocation to the data blob
-                    let reloc_idx = blob_unit.relocations.len();
+                    // 4. Add jump table entry relocation to the data blob. Its
+                    // target is this very unit — `detect_jump_tables` keeps no
+                    // other — and this unit's id is the one reserved for it at
+                    // the top, so the entry needs no placeholder.
                     blob_unit.relocations.push(pcrel_reloc(
                         entry_offset_in_blob,
                         32,
                         addend, // offset within target function, PC-relative
-                        RelocTarget::MergedUnit(UnitId(u32::MAX)), // placeholder
-                    ));
-
-                    // The target is this very unit, which is already being
-                    // extracted, so there is no new dependency to enqueue —
-                    // only a pending resolution of the placeholder UnitId.
-                    // (Not `relocs.pending`: that one is for relocations of
-                    // the current unit, these belong to the blob.)
-                    state.pending.push((
-                        blob_id,
-                        reloc_idx,
-                        UnitKey {
-                            lib: key.lib.clone(),
-                            sym: key.sym.clone(),
-                        },
+                        RelocTarget::MergedUnit(id),
                     ));
                 }
             }
@@ -944,7 +917,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
     // short jump can reach it; for larger units (over-extended anonymous units
     // in stripped libraries), it overwrites the never-executed inter-function
     // alignment padding that follows the branch instead.
-    // (Reloc indices are preserved, so pending resolutions stay valid.)
     let mut bytes = bytes;
     for reloc in relocs.relocations.iter_mut() {
         if reloc.size != 8 {
@@ -976,11 +948,8 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
         reloc.addend -= 3;
     }
 
-    // Register this unit.
-    let id = state.alloc_id();
-    state.extracted.insert(key.clone(), id);
-
-    let (relocations, new_deps) = state.take_unit_relocs(id, &mut bytes, relocs);
+    // Register this unit under the id reserved for it.
+    let relocations = state.take_unit_relocs(id, &mut bytes, relocs);
 
     state.push_unit(ExtractedUnit {
         id,
@@ -992,7 +961,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<IndexSet
         relocations,
     });
 
-    Ok(new_deps)
+    Ok(())
 }
 
 /// Lightweight snapshot of a symbol we care about.
@@ -1740,7 +1709,7 @@ fn collect_dynamic_range_relocs(
                     // Sole provider is another merged (removed) library —
                     // resolve directly to the merged copy, as ld.so would
                     // have resolved to that library.
-                    relocs.depend_on(UnitKey {
+                    state.depend_on(UnitKey {
                         lib: other_lib,
                         sym: ts_name,
                     })
@@ -1775,7 +1744,7 @@ fn collect_dynamic_range_relocs(
                 continue;
             } else {
                 // Internal to the library
-                relocs.depend_on(UnitKey {
+                state.depend_on(UnitKey {
                     lib: lib.path.to_path_buf(),
                     sym: ts_name,
                 })
@@ -1800,11 +1769,11 @@ fn collect_dynamic_range_relocs(
                 resolve_owning_unit(lib, addend_va)
             {
                 resolved_addend = Some(offset_in_target as i64);
-                relocs.depend_on(UnitKey {
+                state.depend_on(UnitKey {
                     lib: lib.path.to_path_buf(),
                     sym: target_name,
                 })
-            } else if let Some((blob_id, blob_base, blob_deps)) =
+            } else if let Some((blob_id, blob_base)) =
                 ensure_data_blob_extracted(lib, addend_va, state)?
             {
                 // No symbol and no unwind info describe the target, but it does
@@ -1814,7 +1783,6 @@ fn collect_dynamic_range_relocs(
                 // several hundred of these). Pulling that section in and
                 // retargeting the pointer at it is the only way the copied
                 // table keeps working once the library is gone.
-                relocs.new_deps.extend(blob_deps);
                 RelocTarget::DataBlobOffset(blob_id, addend_va - blob_base)
             } else {
                 warn!(
@@ -1853,7 +1821,7 @@ fn ensure_data_blob_extracted(
     lib: Lib<'_, '_>,
     target_addr: u64,
     state: &mut ExtractionState,
-) -> Result<Option<(UnitId, u64, IndexSet<UnitKey>)>> {
+) -> Result<Option<(UnitId, u64)>> {
     // Find the section containing this address
     let Some(sec) = find_section_for_address(lib.elf, target_addr) else {
         return Ok(None); // Address not in any extractable section
@@ -1871,7 +1839,7 @@ fn ensure_data_blob_extracted(
 
     // Check if already extracted
     if let Some(info) = state.data_blobs.get(&blob_key) {
-        return Ok(Some((info.id, info.base_vaddr, IndexSet::new())));
+        return Ok(Some((info.id, info.base_vaddr)));
     }
 
     // Only now that the section is known to need copying are its bytes worth
@@ -1915,7 +1883,7 @@ fn ensure_data_blob_extracted(
     )?;
 
     let mut sec_data = sec_data;
-    let (relocations, new_deps) = state.take_unit_relocs(id, &mut sec_data, relocs);
+    let relocations = state.take_unit_relocs(id, &mut sec_data, relocs);
 
     if !relocations.is_empty() {
         debug!(
@@ -1939,7 +1907,7 @@ fn ensure_data_blob_extracted(
         relocations,
     });
 
-    Ok(Some((id, sec_addr, new_deps)))
+    Ok(Some((id, sec_addr)))
 }
 
 /// Infer the size of a symbol whose `st_size` is 0, by bounding it with the
@@ -2108,10 +2076,10 @@ mod tests {
 
     fn test_state() -> ExtractionState {
         ExtractionState {
-            extracted: HashMap::new(),
+            reserved: HashMap::new(),
+            worklist: VecDeque::new(),
             units: Vec::new(),
             unit_index: HashMap::new(),
-            pending: Vec::new(),
             next_id: 0,
             external_syms: HashSet::new(),
             cross_lib_syms: HashMap::new(),
@@ -2202,7 +2170,7 @@ mod tests {
 
     /// Whether anything extracted so far asked for the unit named `sym`.
     fn depends_on(state: &ExtractionState, sym: &str) -> bool {
-        state.pending.iter().any(|(_, _, key)| key.sym == sym)
+        state.reserved.keys().any(|key| key.sym == sym)
     }
 
     /// A variable the executable copy-relocates lives in the executable's own
@@ -2468,24 +2436,19 @@ mod tests {
             );
 
             // The markers are referenced by the clone-table helpers the array
-            // entries call, so follow the entries' dependencies too.
-            let mut queue: VecDeque<UnitKey> = arrays
-                .init_entries
-                .iter()
-                .chain(&arrays.fini_entries)
-                .map(|entry| UnitKey {
+            // entries call, so follow the entries' dependencies too — which is
+            // what draining the worklist `process_symbol` reserves onto does.
+            for entry in arrays.init_entries.iter().chain(&arrays.fini_entries) {
+                state.reserve(UnitKey {
                     lib: lib.clone(),
                     sym: entry.unit_name.clone(),
-                })
-                .collect();
-            let mut seen: HashSet<UnitKey> = queue.iter().cloned().collect();
-            while let Some(key) = queue.pop_front() {
-                let deps = process_symbol(&key, &mut state).expect("extract the CRT glue");
-                for dep in deps {
-                    if dep.lib == lib && seen.insert(dep.clone()) {
-                        queue.push_back(dep);
-                    }
+                });
+            }
+            while let Some(key) = state.worklist.pop_front() {
+                if key.lib != lib {
+                    continue; // another merged library, outside this test
                 }
+                process_symbol(&key, &mut state).expect("extract the CRT glue");
             }
 
             let blob = state
@@ -2536,7 +2499,7 @@ mod tests {
             elf: elf64,
             index: &index,
         };
-        let (blob_id, base, _) = ensure_data_blob_extracted(handle, data, &mut state)
+        let (blob_id, base) = ensure_data_blob_extracted(handle, data, &mut state)
             .expect("extract .data")
             .expect(".data is extractable");
         assert_eq!(base, data);
@@ -2553,6 +2516,83 @@ mod tests {
             )),
             "no self-referential pointer resolved to the blob itself"
         );
+    }
+
+    /// A reference out of one unit into another is resolved the moment it is
+    /// found, against an id reserved for a unit that does not exist yet — so
+    /// what every such reference has to name is the unit the closure goes on to
+    /// build for that key, and nothing else.
+    ///
+    /// `pcre2_config_8` exercises both halves of that in one symbol. Its two
+    /// switch tables live in a `.rodata` blob whose entries have to branch back
+    /// into `pcre2_config_8` itself, which is only reachable through the id the
+    /// function reserved before its own extraction began; and the functions it
+    /// calls are reserved as the scan finds them and extracted afterwards.
+    #[test]
+    fn every_reference_into_the_closure_names_the_unit_that_was_built_for_it() {
+        let lib = test_lib("libpcre2-8.so.0");
+        let mut state = test_state();
+        state.reserve(UnitKey {
+            lib: lib.clone(),
+            sym: "pcre2_config_8".to_string(),
+        });
+        while let Some(key) = state.worklist.pop_front() {
+            if key.lib != lib {
+                continue; // another merged library, outside this test
+            }
+            process_symbol(&key, &mut state)
+                .unwrap_or_else(|e| panic!("extracting '{}': {e:#}", key.sym));
+        }
+
+        let by_id: HashMap<UnitId, &ExtractedUnit> =
+            state.units.iter().map(|u| (u.id, u)).collect();
+        let mut refs = 0;
+        for unit in &state.units {
+            for reloc in &unit.relocations {
+                let RelocTarget::MergedUnit(target) = reloc.target else {
+                    continue;
+                };
+                refs += 1;
+                let target = by_id.get(&target).unwrap_or_else(|| {
+                    panic!(
+                        "'{}' points at UnitId({}), which no unit was built for",
+                        unit.name, target.0
+                    )
+                });
+                assert_eq!(
+                    state.reserved.get(&UnitKey {
+                        lib: target.source_lib.clone(),
+                        sym: target.name.clone(),
+                    }),
+                    Some(&target.id),
+                    "'{}' in '{}' is not the unit its key reserved",
+                    target.name,
+                    unit.name
+                );
+            }
+        }
+        assert!(
+            state.units.len() > 5 && refs > 25,
+            "expected a real closure, found {} units and {refs} references",
+            state.units.len()
+        );
+
+        // The jump-table entries are the references whose target is the unit
+        // being extracted when they are recorded. Both tables are 16 entries.
+        let owner = state
+            .units
+            .iter()
+            .find(|u| u.name == "pcre2_config_8")
+            .expect("pcre2_config_8 unit")
+            .id;
+        let entries = state
+            .units
+            .iter()
+            .filter(|u| u.name.ends_with(":.rodata"))
+            .flat_map(|u| &u.relocations)
+            .filter(|r| matches!(r.target, RelocTarget::MergedUnit(id) if id == owner))
+            .count();
+        assert_eq!(entries, 32, "the switch tables lost their entries");
     }
 
     /// `instruction_extent` is what keeps the instruction scanners off the
