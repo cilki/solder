@@ -278,7 +278,11 @@ dynamic, or relink against a soname.
   new mappings. `readelf`, `nm` and `gdb` read section headers rather than
   `PT_DYNAMIC`, so without this the merged binary still looks exactly like the
   input to all of them — down to `readelf -x .fini_array` printing the
-  destructor list the merge replaced
+  destructor list the merge replaced. Only a section the executable already had
+  is repointed: an executable linked without a preinit array — which is every
+  one a linker emits by default — ends up with `DT_PREINIT_ARRAY` pointing into
+  the merged region and no section header naming it, exactly as nothing named
+  the array it didn't have before
 
 ## Limitations
 
