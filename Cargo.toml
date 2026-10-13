@@ -11,7 +11,16 @@ name = "solder"
 path = "src/main.rs"
 
 [dependencies]
-object = { version = "0.40", features = ["read_core", "elf"] }
+# `default-features = false` drops object's `compression` feature, which solder
+# never uses: it only decompresses `SHF_COMPRESSED`/`.zdebug_*` sections, and
+# nothing here calls `uncompressed_data`. Left on, it pulled `ruzstd` and
+# `flate2` — and with them a zstd decompression bomb (RUSTSEC-2026-0344) — into
+# a tool whose whole input is attacker-supplied ELF.
+object = { version = "0.40", default-features = false, features = [
+    "read_core",
+    "elf",
+    "std",
+] }
 goblin = "0.10"
 memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }
