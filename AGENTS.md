@@ -19,8 +19,11 @@ cargo build --release
 
 `test/` holds real dynamically linked binaries together with the libraries they
 link against, in `test/libs`. Those sonames are not the host's, so `-L
-test/libs` is required — without it `solder` cannot resolve the `DT_NEEDED`
-entry and exits with an error.
+test/libs` is required: without it the entry resolves nowhere, and `solder`
+leaves it in `DT_NEEDED` and merges nothing (`-m` turns the same miss into an
+error, since a library named there has to be merged). Every fixture and library
+is x86-64, so merging them works on any host but *running* a merged one needs
+an x86-64 machine.
 
 `--dry-run` writes nothing, so it can be pointed straight at a fixture. It is
 the quickest way to see what a change did to extraction:
