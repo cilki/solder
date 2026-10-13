@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
@@ -589,20 +589,37 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
     let section_vaddr = section.address();
     let offset_in_section = (sym_vaddr - section_vaddr) as usize;
 
-    let bytes = if section.kind() == ObjSectionKind::UninitializedData {
-        // .bss has no file-backed data — emit zero-filled bytes
-        vec![0u8; sym_size]
+    // A symbol cannot reach past the section that defines it, and `st_size`
+    // is only as trustworthy as any other number in the file. The file-backed
+    // case has always been bounded by the bytes it slices; `.bss` has no bytes
+    // to slice, so its length was unbounded — a doctored `st_size` on a `.bss`
+    // symbol went straight into `vec![0u8; st_size]` and ended the run as
+    // `memory allocation of 1152921504606846976 bytes failed`, an abort naming
+    // neither the symbol nor the library it came from.
+    let nobits = section.kind() == ObjSectionKind::UninitializedData;
+    let declared = if nobits {
+        section.size() as usize
     } else {
-        if offset_in_section + sym_size > section_data.len() {
-            bail!(
+        section_data.len()
+    };
+    let sym_end = offset_in_section
+        .checked_add(sym_size)
+        .filter(|end| *end <= declared)
+        .with_context(|| {
+            format!(
                 "symbol '{}' byte range [{}, {}) overflows section of size {}",
                 key.sym,
                 offset_in_section,
-                offset_in_section + sym_size,
-                section_data.len()
-            );
-        }
-        section_data[offset_in_section..offset_in_section + sym_size].to_vec()
+                offset_in_section.saturating_add(sym_size),
+                declared
+            )
+        })?;
+
+    let bytes = if nobits {
+        // .bss has no file-backed data — emit zero-filled bytes
+        zero_fill(sym_size as u64).with_context(|| format!("zero-filling symbol '{}'", key.sym))?
+    } else {
+        section_data[offset_in_section..sym_end].to_vec()
     };
     let alignment = section.align().max(1);
 
@@ -1605,19 +1622,27 @@ fn is_alloc(section: &object::read::elf::ElfSection64<'_, '_>) -> bool {
 /// extract that kind of section.
 fn describe_section(section: &object::read::elf::ElfSection64<'_, '_>) -> Option<SectionInfo> {
     let name = section.name().ok()?.to_string();
-    let kind = match section.kind() {
+    let obj_kind = section.kind();
+    let kind = match obj_kind {
         ObjSectionKind::Text => SectionKind::Text,
         ObjSectionKind::ReadOnlyData | ObjSectionKind::ReadOnlyString => SectionKind::ReadOnlyData,
         ObjSectionKind::Data | ObjSectionKind::UninitializedData => SectionKind::Data,
         _ => return None, // Skip unsupported section types
     };
     // `data()` only slices what is already mapped, so asking for it here costs
-    // nothing and tells us both how long the contents are and — for anything
-    // but a NOBITS section, whose zero fill `section_contents` synthesizes —
-    // whether they can be read at all.
+    // nothing and tells us how long the contents are. It comes back empty for
+    // two unrelated reasons, and only one of them leaves `sh_size` worth
+    // believing. A NOBITS section (`.bss`, `.tbss`) genuinely holds none of its
+    // bytes in the file and the loader zero-fills `sh_size` of them, so
+    // `section_contents` does too. Any other section reads empty because its
+    // `sh_offset`/`sh_size` describe bytes the file does not have — readelf
+    // says "Size of section N is larger than the entire file!" of the same
+    // header — which makes `sh_size` a length nothing backs. Zero-filling to it
+    // put zeros where the section has real contents, and at the sizes a
+    // corrupted header reaches it took the process down on the allocation.
     let size = match section.data() {
         Ok(d) if !d.is_empty() => d.len() as u64,
-        _ if kind == SectionKind::Data => section.size(),
+        _ if obj_kind == ObjSectionKind::UninitializedData => section.size(),
         _ => return None,
     };
     Some(SectionInfo {
@@ -1637,10 +1662,34 @@ fn section_contents(elf: &object::read::elf::ElfFile64<'_>, info: &SectionInfo) 
     let section = elf
         .section_by_index(info.index)
         .with_context(|| format!("section {} vanished between lookups", info.name))?;
-    Ok(match section.data() {
-        Ok(d) if !d.is_empty() => d.to_vec(),
-        _ => vec![0u8; info.size as usize],
-    })
+    match section.data() {
+        Ok(d) if !d.is_empty() => Ok(d.to_vec()),
+        _ => zero_fill(info.size)
+            .with_context(|| format!("zero-filling NOBITS section {}", info.name)),
+    }
+}
+
+/// `len` zero bytes, or an error when that many cannot be had.
+///
+/// Only a NOBITS section ever needs this, and its length is the one number in
+/// a library that no bytes in the file have to back: `.bss` costs the file
+/// nothing however large its `sh_size` says it is, and the `st_size` of a
+/// symbol inside it is bounded by that same `sh_size` and nothing else. So the
+/// length reaching here is unvalidated input, and `vec![0u8; len]` is the
+/// wrong way to spend it — an allocation failure there aborts the process
+/// (`memory allocation of 281474976710656 bytes failed`) without unwinding,
+/// so there is nothing to attach the library's name to and nothing a caller
+/// can report.
+fn zero_fill(len: u64) -> Result<Vec<u8>> {
+    let len = usize::try_from(len)
+        .ok()
+        .with_context(|| format!("{len} bytes of zero fill do not fit in an address space"))?;
+    let mut zeros: Vec<u8> = Vec::new();
+    zeros
+        .try_reserve_exact(len)
+        .map_err(|_| anyhow!("cannot allocate {len} bytes of zero fill"))?;
+    zeros.resize(len, 0);
+    Ok(zeros)
 }
 
 /// Collect the dynamic relocations (.rela.dyn) that fall within `range` into
@@ -2334,6 +2383,178 @@ mod tests {
         match object::File::parse(bytes).expect("parse library") {
             object::File::Elf64(elf64) => elf64,
             _ => panic!("not ELF64"),
+        }
+    }
+
+    /// `test/libs/libpcre2-8.so.0` with one section header's `sh_size`
+    /// overwritten.
+    ///
+    /// A section header is where every length the extractor allocates from
+    /// comes from, and the only thing vouching for one is the file itself.
+    fn lib_with_section_size(section: &str, sh_size: u64) -> Vec<u8> {
+        use object::read::elf::FileHeader;
+
+        let mut bytes = std::fs::read(test_lib("libpcre2-8.so.0")).expect("read libpcre2-8.so.0");
+        let at = {
+            let elf = parse_lib(&bytes);
+            let endian = elf.endian();
+            let header = elf.elf_header();
+            let index = elf
+                .section_by_name(section)
+                .unwrap_or_else(|| panic!("libpcre2-8.so.0 has no {section} section"))
+                .index()
+                .0;
+            header.e_shoff(endian) as usize
+                + index * header.e_shentsize(endian) as usize
+                + crate::elf_reader::SH_SIZE
+        };
+        bytes[at..at + 8].copy_from_slice(&sh_size.to_le_bytes());
+        bytes
+    }
+
+    /// `test/libs/libtinfo.so.6` with the `st_size` of the `.dynsym` entry for
+    /// `sym` overwritten, written to a temporary file.
+    fn lib_with_symbol_size(sym: &str, st_size: u64) -> tempfile::NamedTempFile {
+        use object::read::elf::SectionHeader;
+
+        let mut bytes = std::fs::read(test_lib("libtinfo.so.6")).expect("read libtinfo.so.6");
+        let at = {
+            let elf = parse_lib(&bytes);
+            let endian = elf.endian();
+            let index = elf
+                .dynamic_symbols()
+                .find(|s| s.name() == Ok(sym))
+                .unwrap_or_else(|| panic!("libtinfo.so.6 has no {sym}"))
+                .index()
+                .0;
+            let dynsym = elf
+                .elf_section_table()
+                .iter()
+                .find(|sec| sec.sh_type(endian) == object::elf::SHT_DYNSYM)
+                .expect(".dynsym");
+            // Elf64_Sym is st_name(4), st_info(1), st_other(1), st_shndx(2),
+            // st_value(8), st_size(8).
+            dynsym.sh_offset(endian) as usize + index * 24 + 16
+        };
+        bytes[at..at + 8].copy_from_slice(&st_size.to_le_bytes());
+
+        // The offset above is arithmetic on the file's own headers, so check it
+        // landed where it was meant to rather than somewhere else entirely.
+        assert_eq!(
+            parse_lib(&bytes)
+                .dynamic_symbols()
+                .find(|s| s.name() == Ok(sym))
+                .expect(sym)
+                .size(),
+            st_size,
+            "the doctored st_size did not take"
+        );
+
+        let out = tempfile::Builder::new()
+            .suffix(".so.6")
+            .tempfile()
+            .expect("temp library");
+        std::fs::write(out.path(), &bytes).expect("write the doctored library");
+        out
+    }
+
+    /// A `.bss` symbol's `st_size` is bounded by the section's own `sh_size`
+    /// and nothing else, neither of them being backed by bytes in the file.
+    /// The file-backed branch beside it has always checked that a symbol stays
+    /// inside the section that defines it; the zero-filled one checked nothing
+    /// and allocated `st_size` bytes, so a corrupted size ended the run as
+    /// `memory allocation of 1152921504606846976 bytes failed` — an abort,
+    /// naming neither the symbol nor the library.
+    #[test]
+    fn a_bss_symbol_reaching_past_its_section_is_an_error_rather_than_an_abort() {
+        let lib = lib_with_symbol_size("ospeed", 1 << 60);
+        let key = UnitKey {
+            lib: lib.path().to_path_buf(),
+            sym: "ospeed".to_string(),
+        };
+        let err = match process_symbol(&key, &mut test_state()) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("an exbibyte of .bss cannot be extracted from a 220K library"),
+        };
+        assert!(err.contains("ospeed"), "the symbol is not named: {err}");
+        assert!(
+            err.contains("overflows section"),
+            "the section bound is not reported: {err}"
+        );
+
+        // The control: at its real size the same symbol still extracts, zero
+        // filled to the length `.bss` declares for it.
+        let key = UnitKey {
+            lib: test_lib("libtinfo.so.6"),
+            sym: "ospeed".to_string(),
+        };
+        let mut state = test_state();
+        process_symbol(&key, &mut state).expect("extract ospeed");
+        let unit = state
+            .units
+            .iter()
+            .find(|u| u.name == "ospeed")
+            .expect("ospeed unit");
+        assert_eq!(
+            unit.bytes,
+            vec![0u8; 2],
+            "a .bss symbol is zero fill at its declared size"
+        );
+    }
+
+    /// A NOBITS section's `sh_size` is the one length in a library that no
+    /// bytes in the file have to back — `.bss` costs the file nothing however
+    /// much of it the header claims — so a corrupted one is only caught where
+    /// the zero fill is allocated. It was not caught there at all:
+    /// `vec![0u8; sh_size]` aborted the process on the failed allocation
+    /// (`memory allocation of 281474976710656 bytes failed`), without
+    /// unwinding, so nothing named the library it came from.
+    #[test]
+    fn a_nobits_section_overstating_its_size_is_an_error_rather_than_an_abort() {
+        let bytes = lib_with_section_size(".bss", 1 << 60);
+        let elf = parse_lib(&bytes);
+        let bss = elf.section_by_name(".bss").expect(".bss").address();
+
+        let sec = find_section_for_address(&elf, bss).expect(".bss still owns its own address");
+        assert_eq!(sec.name, ".bss");
+        let err = section_contents(&elf, &sec)
+            .expect_err("an exbibyte of zero fill is not allocatable anywhere");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(".bss"), "the section is not named: {msg}");
+    }
+
+    /// `.got.plt` is PROGBITS: its bytes are in the file, so a `sh_size`
+    /// running past the end of the file makes the header a liar rather than a
+    /// description of zero fill — readelf says "Size of section 22 is larger
+    /// than the entire file!" of the same header. The extractor read an empty
+    /// `data()` as "NOBITS, synthesize the fill" whatever the section's type,
+    /// so it copied `sh_size` zeros over a section that has a real GOT in it,
+    /// and for the sizes a corrupted header reaches aborted on the allocation
+    /// instead.
+    #[test]
+    fn a_section_whose_contents_are_not_in_the_file_is_not_extractable() {
+        const SECTION: &str = ".got.plt";
+
+        let pristine = std::fs::read(test_lib("libpcre2-8.so.0")).expect("read libpcre2-8.so.0");
+        let elf = parse_lib(&pristine);
+        let got = elf.section_by_name(SECTION).expect(SECTION);
+        let (addr, size) = (got.address(), got.size());
+        let sec = find_section_for_address(&elf, addr).expect("the section owns its own address");
+        assert_eq!((sec.name.as_str(), sec.size), (SECTION, size));
+        assert_eq!(
+            section_contents(&elf, &sec).expect("contents").len() as u64,
+            size,
+            "the pristine section's bytes come from the file"
+        );
+
+        for overstated in [size + 0x1000, 1 << 60] {
+            let bytes = lib_with_section_size(SECTION, overstated);
+            let elf = parse_lib(&bytes);
+            assert!(
+                find_section_for_address(&elf, addr).is_none(),
+                "{SECTION} claiming {overstated} bytes describes contents the file does \
+                 not have, so there is nothing to copy out of it"
+            );
         }
     }
 
