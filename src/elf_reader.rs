@@ -358,6 +358,22 @@ impl DynamicTable {
         }
 
         let (offset, filesz) = dynamic.context("no PT_DYNAMIC segment")?;
+
+        // `p_filesz` counts bytes of the file, so the segment has to be *in*
+        // the file. Reading the entries below would catch one that is not —
+        // `read_u64` is bounds-checked — but the table is sized from
+        // `p_filesz` before the first of them is read, and an infallible
+        // allocation of an unvalidated length aborts the process rather than
+        // failing: one byte of `p_filesz` turned a merge into
+        // `memory allocation of 288230376151711744 bytes failed`.
+        let end = (offset as u64).checked_add(filesz);
+        if end.is_none_or(|end| end > bytes.len() as u64) {
+            bail!(
+                "PT_DYNAMIC covers {filesz} bytes from file offset {offset:#x}, past the end \
+                 of this {} byte file",
+                bytes.len()
+            );
+        }
         let capacity = filesz as usize / DYN_ENTRY_SIZE;
 
         let mut entries = Vec::with_capacity(capacity);
@@ -809,6 +825,52 @@ mod dynamic_table_tests {
         // DT_SONAME is an attribute of a shared object, not an executable.
         assert_eq!(table.value_of(goblin::elf::dynamic::DT_SONAME), None);
         assert!(table.entries_of(DT_NEEDED).count() >= 1);
+    }
+
+    /// `p_filesz` counts bytes of the file, so `PT_DYNAMIC` has to be *in* the
+    /// file. Every other length `parse` reads goes through the bounds-checked
+    /// `read_*` helpers, and this one would have too — the entry loop reads
+    /// each slot — but the table was sized from `p_filesz` before the first of
+    /// them, and an infallible allocation of an unvalidated length does not
+    /// fail, it aborts: one byte of `p_filesz` turned a merge into
+    /// `memory allocation of 288230376151711744 bytes failed` with no
+    /// unwinding and nothing naming the file.
+    #[test]
+    fn a_pt_dynamic_reaching_past_the_end_of_the_file_is_an_error_rather_than_an_abort() {
+        for name in TEST_BINARIES {
+            let mut bytes = read_test_binary(name);
+            let used = DynamicTable::parse(&bytes).expect("parse .dynamic").used();
+
+            // `p_filesz` of `PT_DYNAMIC`, found the way `parse` finds it.
+            let phoff = read_u64(&bytes, 0x20).expect("e_phoff") as usize;
+            let phentsize = read_u16(&bytes, 0x36).expect("e_phentsize") as usize;
+            let phnum = read_u16(&bytes, 0x38).expect("e_phnum") as usize;
+            let filesz_at = (0..phnum)
+                .map(|i| phoff + i * phentsize)
+                .find(|&ph| read_u32(&bytes, ph).expect("p_type") == object::elf::PT_DYNAMIC.0)
+                .expect("PT_DYNAMIC")
+                + 32;
+            let real = read_u64(&bytes, filesz_at).expect("p_filesz");
+
+            for filesz in [u64::MAX, 1 << 60, bytes.len() as u64] {
+                bytes[filesz_at..filesz_at + 8].copy_from_slice(&filesz.to_le_bytes());
+                let err = DynamicTable::parse(&bytes).err().unwrap_or_else(|| {
+                    panic!(
+                        "{name}: {filesz} bytes of .dynamic are not in a {} byte file",
+                        bytes.len()
+                    )
+                });
+                assert!(format!("{err:#}").contains("PT_DYNAMIC"), "{name}: {err:#}");
+            }
+
+            // The control: at its real size the same table still parses.
+            bytes[filesz_at..filesz_at + 8].copy_from_slice(&real.to_le_bytes());
+            assert_eq!(
+                DynamicTable::parse(&bytes).expect("parse .dynamic").used(),
+                used,
+                "{name}"
+            );
+        }
     }
 
     #[test]
