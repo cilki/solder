@@ -94,8 +94,6 @@ struct ExtractionState {
     lib_bytes_cache: HashMap<PathBuf, Rc<Vec<u8>>>,
     /// Precomputed symbol lookups per library (see `LibIndex`).
     lib_index_cache: HashMap<PathBuf, Rc<LibIndex>>,
-    /// Precomputed PLT stub → external symbol maps per library (see `PltMap`).
-    plt_map_cache: HashMap<PathBuf, Rc<PltMap>>,
 }
 
 impl ExtractionState {
@@ -178,16 +176,6 @@ impl ExtractionState {
         idx
     }
 
-    /// Return the PLT map for `lib`, building and caching it on first use.
-    fn plt_map(&mut self, lib: &Path, lib_bytes: Rc<Vec<u8>>) -> Rc<PltMap> {
-        if let Some(m) = self.plt_map_cache.get(lib) {
-            return Rc::clone(m);
-        }
-        let m = Rc::new(PltMap::build(lib_bytes));
-        self.plt_map_cache.insert(lib.to_path_buf(), Rc::clone(&m));
-        m
-    }
-
     /// Zero the copied GOT slots at `slots` within `bytes` and register a fixup
     /// for each: the copied bytes hold stale library VAs, and ld.so's GLOB_DAT
     /// overwrites them at startup anyway (see `GotSlotFixup`).
@@ -266,7 +254,6 @@ pub fn extract_units(
         got_slot_fixups: Vec::new(),
         lib_bytes_cache: HashMap::new(),
         lib_index_cache: HashMap::new(),
-        plt_map_cache: HashMap::new(),
     };
 
     for imp in seeds {
@@ -730,7 +717,6 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
     // Scan for RIP-relative references (calls, jumps, and data accesses).
     // Create synthetic relocations for each reference so they get patched correctly.
     if section_kind == SectionKind::Text {
-        let plt_map = state.plt_map(&key.lib, Rc::clone(&lib_bytes));
         let rip_refs = scan_rip_relative_refs(&bytes[..code_len], sym_vaddr);
         for rip_ref in rip_refs {
             let target_addr = rip_ref.target_vaddr;
@@ -750,7 +736,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                 // relocator verifies the final offset still fits.
                 let reloc_size: u8 = if rip_ref.disp_size == 1 { 8 } else { 32 };
                 // First check if this is a PLT call (call to external symbol)
-                if let Some(ext_name) = plt_map.target(target_addr) {
+                if let Some(ext_name) = plt_target(lib, target_addr) {
                     // PLT call resolution order:
                     //   1. Another merged library defines the symbol, and the
                     //      executable's own .dynsym does not mention it →
@@ -1008,6 +994,13 @@ struct LibIndex {
     /// `usize`, since `SectionIndex` isn't `Ord`), sorted by address, for
     /// `infer_symbol_size`'s "next symbol boundary" search.
     addrs_by_section: Vec<(u64, usize)>,
+    /// `(start address, size, section index)` of each PLT section, so a
+    /// scanned code reference can be recognised as a stub (see `plt_target`).
+    plt_spans: Vec<(u64, u64, object::SectionIndex)>,
+    /// GOT slot address → the external symbol ld.so resolves into it, from the
+    /// library's own dynamic relocations. A PLT stub jumps through such a
+    /// slot, which is what names the stub (see `plt_target`).
+    got_to_name: HashMap<u64, String>,
     /// Exact function bounds from `.eh_frame`, which cover code the symbol
     /// tables say nothing about (see `resolve_owning_unit`).
     fdes: crate::eh_frame::FdeTable,
@@ -1046,6 +1039,33 @@ impl LibIndex {
         addrs_by_section.sort_unstable();
         addrs_by_section.dedup();
 
+        let plt_spans: Vec<(u64, u64, object::SectionIndex)> = elf
+            .sections()
+            .filter(|s| matches!(s.name().unwrap_or(""), ".plt" | ".plt.got" | ".plt.sec"))
+            .map(|s| (s.address(), s.size(), s.index()))
+            .collect();
+
+        // `dynamic_relocations` covers every relocation table bound to
+        // `.dynsym` — `.rela.plt`, whose JUMP_SLOTs name the classic PLT
+        // stubs, and `.rela.dyn`, whose GLOB_DATs name the `.plt.got`-style
+        // ones. The first entry naming a slot wins; nothing legitimately
+        // relocates one slot twice.
+        let mut got_to_name: HashMap<u64, String> = HashMap::new();
+        for (got_vaddr, reloc) in elf.dynamic_relocations().into_iter().flatten() {
+            let object::RelocationTarget::Symbol(si) = reloc.target() else {
+                continue;
+            };
+            let Some(name) = dynamic_symbol_by_index(elf, si).and_then(|sym| sym.name().ok())
+            else {
+                continue;
+            };
+            if !name.is_empty() {
+                got_to_name
+                    .entry(got_vaddr)
+                    .or_insert_with(|| name.to_owned());
+            }
+        }
+
         let fdes = elf
             .section_by_name(".eh_frame")
             .and_then(|s| s.data().ok().map(|d| (d, s.address())))
@@ -1056,6 +1076,8 @@ impl LibIndex {
             by_name,
             addr_to_name,
             addrs_by_section,
+            plt_spans,
+            got_to_name,
             fdes,
         }
     }
@@ -1409,107 +1431,42 @@ fn scan_rip_relative_refs(bytes: &[u8], base_vaddr: u64) -> Vec<RipRelativeRef> 
     refs
 }
 
-/// Precomputed PLT-resolution data for a library. `find_plt_target` is called
-/// for every code reference into a PLT stub during extraction; parsing the whole
-/// library with goblin each time (as the original did) was a major quadratic
-/// cost. This captures the small amount that lookup actually needs so it can be
-/// built once per library.
-struct PltMap {
-    /// Each PLT section's (start_va, file_offset, size), so a stub's address can
-    /// be recognised and its bytes located without reparsing.
-    plt_spans: Vec<(u64, u64, u64)>,
-    /// GOT slot VA → external symbol name, from JUMP_SLOT/GLOB_DAT relocations.
-    got_to_name: HashMap<u64, String>,
-    /// Symbol address → name (dynsym), for the fallback path.
-    addr_to_name: HashMap<u64, String>,
-    /// Raw library bytes (needed to read a stub's disp32 at lookup time), shared
-    /// with `ExtractionState::lib_bytes_cache`.
-    bytes: Rc<Vec<u8>>,
-}
+/// The external symbol the PLT stub at `addr` jumps to, or `None` when `addr`
+/// is not a stub.
+///
+/// The stub is decoded rather than looked up by entry index: every flavor
+/// (.plt, .plt.got, .plt.sec) starts with an optional endbr64 and/or bnd
+/// prefix followed by `ff 25 <disp32>` (jmp [rip+disp32]) through its GOT
+/// slot, and the dynamic relocation against that slot — JUMP_SLOT for classic
+/// PLT entries, GLOB_DAT for .plt.got-style stubs like `__cxa_finalize@plt` —
+/// names the symbol. Both halves of that lookup come out of the library's
+/// [`LibIndex`], built once per library.
+fn plt_target(lib: Lib<'_, '_>, addr: u64) -> Option<String> {
+    let &(sec_addr, _, section) = lib
+        .index
+        .plt_spans
+        .iter()
+        .find(|&&(start, size, _)| addr >= start && addr < start + size)?;
+    let sec_data = lib.elf.section_by_index(section).ok()?.data().ok()?;
 
-impl PltMap {
-    fn build(lib_bytes: Rc<Vec<u8>>) -> Self {
-        let mut plt_spans = Vec::new();
-        let mut got_to_name = HashMap::new();
-        let mut addr_to_name = HashMap::new();
-
-        if let Ok(g) = goblin::elf::Elf::parse(&lib_bytes) {
-            for sh in &g.section_headers {
-                let Some(name) = g.shdr_strtab.get_at(sh.sh_name) else {
-                    continue;
-                };
-                if name == ".plt" || name == ".plt.got" || name == ".plt.sec" {
-                    plt_spans.push((sh.sh_addr, sh.sh_offset, sh.sh_size));
-                }
-            }
-
-            for rela in g.pltrelocs.iter().chain(g.dynrelas.iter()) {
-                if let Some(sym) = g.dynsyms.get(rela.r_sym)
-                    && let Some(name) = g.dynstrtab.get_at(sym.st_name)
-                    && !name.is_empty()
-                {
-                    got_to_name
-                        .entry(rela.r_offset)
-                        .or_insert_with(|| name.to_string());
-                }
-            }
-
-            for sym in g.dynsyms.iter() {
-                if let Some(name) = g.dynstrtab.get_at(sym.st_name)
-                    && !name.is_empty()
-                {
-                    addr_to_name
-                        .entry(sym.st_value)
-                        .or_insert_with(|| name.to_string());
-                }
-            }
-        }
-
-        PltMap {
-            plt_spans,
-            got_to_name,
-            addr_to_name,
-            bytes: lib_bytes,
-        }
+    let mut off = (addr - sec_addr) as usize;
+    if sec_data.len() >= off + 4 && sec_data[off..off + 4] == [0xf3, 0x0f, 0x1e, 0xfa] {
+        off += 4; // endbr64
     }
-
-    /// If `addr` lands in a PLT stub, return the external symbol it resolves to.
-    fn target(&self, addr: u64) -> Option<String> {
-        // Locate the stub's bytes via the containing PLT section's file span.
-        let (sec_addr, sec_off, sec_size) = self
-            .plt_spans
-            .iter()
-            .copied()
-            .find(|&(start, _, size)| addr >= start && addr < start + size)?;
-        let sec_data = self
-            .bytes
-            .get(sec_off as usize..(sec_off + sec_size) as usize)?;
-
-        // Decode the stub itself instead of guessing by entry index: every
-        // flavor (.plt, .plt.got, .plt.sec) starts with an optional endbr64
-        // and/or bnd prefix followed by `ff 25 <disp32>` (jmp [rip+disp32])
-        // through its GOT slot. The slot's dynamic relocation — JUMP_SLOT for
-        // classic PLT entries, GLOB_DAT for .plt.got-style stubs like
-        // __cxa_finalize@plt — names the symbol.
-        let mut off = (addr - sec_addr) as usize;
-        if sec_data.len() >= off + 4 && sec_data[off..off + 4] == [0xf3, 0x0f, 0x1e, 0xfa] {
-            off += 4; // endbr64
-        }
-        if sec_data.get(off) == Some(&0xf2) {
-            off += 1; // bnd prefix
-        }
-        if sec_data.len() < off + 6 || sec_data[off] != 0xff || sec_data[off + 1] != 0x25 {
-            return None; // not an indirect-jump stub (e.g. the PLT0 resolver)
-        }
-        let disp = i32::from_le_bytes(sec_data[off + 2..off + 6].try_into().expect("4 bytes"));
-        let got_va = (sec_addr + off as u64 + 6).wrapping_add(disp as i64 as u64);
-
-        if let Some(name) = self.got_to_name.get(&got_va) {
-            return Some(name.clone());
-        }
-        // Fallback: a symbol defined at this exact address.
-        self.addr_to_name.get(&addr).cloned()
+    if sec_data.get(off) == Some(&0xf2) {
+        off += 1; // bnd prefix
     }
+    if sec_data.len() < off + 6 || sec_data[off] != 0xff || sec_data[off + 1] != 0x25 {
+        return None; // not an indirect-jump stub (e.g. the PLT0 resolver)
+    }
+    let disp = i32::from_le_bytes(sec_data[off + 2..off + 6].try_into().expect("4 bytes"));
+    let got_va = (sec_addr + off as u64 + 6).wrapping_add(disp as i64 as u64);
+
+    if let Some(name) = lib.index.got_to_name.get(&got_va) {
+        return Some(name.clone());
+    }
+    // Fallback: a symbol defined at this exact address.
+    find_symbol_at_address(lib.index, addr)
 }
 
 /// Check if a virtual address falls within an already-extracted data blob.
@@ -2140,7 +2097,6 @@ mod tests {
             got_slot_fixups: Vec::new(),
             lib_bytes_cache: HashMap::new(),
             lib_index_cache: HashMap::new(),
-            plt_map_cache: HashMap::new(),
         }
     }
 
@@ -2378,6 +2334,88 @@ mod tests {
     /// Every committed fixture library, so a trait of the linker's output is
     /// checked against more than one build.
     const TEST_LIBS: [&str; 3] = ["libtinfo.so.6", "libpcre2-8.so.0", "libcrypto.so.3"];
+
+    /// Every stub in a real library's `.plt` resolves to the symbol its
+    /// `.rela.plt` entry names, and the `.plt.got` stub beside it to the one
+    /// its `R_X86_64_GLOB_DAT` names.
+    ///
+    /// This lookup is what turns a call the extracted code makes through the
+    /// PLT into a direct call to the merged copy of the callee, or into a
+    /// trampoline for a callee that stays external. A stub it fails to
+    /// recognise leaves the call with the displacement the library was linked
+    /// with, which reaches nothing once the library is gone from `DT_NEEDED`.
+    ///
+    /// The linker lays `.plt` out as the PLT0 resolver thunk followed by one
+    /// 16-byte stub per `.rela.plt` entry, in that table's order, so the
+    /// relocations are an oracle for what each stub has to come back as that
+    /// does not go through the stub's own bytes.
+    #[test]
+    fn every_plt_stub_names_the_symbol_its_relocation_does() {
+        for name in TEST_LIBS {
+            let path = test_lib(name);
+            let bytes = std::fs::read(&path).expect("read the library");
+            let elf = parse_lib(&bytes);
+            let index = LibIndex::build(&elf);
+            let lib = Lib {
+                path: &path,
+                elf: &elf,
+                index: &index,
+            };
+
+            let relocated = |r_type: u32| -> Vec<(u64, String)> {
+                elf.dynamic_relocations()
+                    .expect("a shared library has dynamic relocations")
+                    .filter(|(_, reloc)| elf_r_type(reloc) == Some(r_type))
+                    .filter_map(|(slot, reloc)| match reloc.target() {
+                        object::RelocationTarget::Symbol(si) => {
+                            let sym = dynamic_symbol_by_index(&elf, si)?;
+                            Some((slot, sym.name().ok()?.to_owned()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+
+            let jump_slots = relocated(object::elf::R_X86_64_JUMP_SLOT.0);
+            assert!(
+                jump_slots.len() > 10,
+                "{name}: only {} JUMP_SLOT relocations",
+                jump_slots.len()
+            );
+
+            let plt = elf.section_by_name(".plt").expect(".plt");
+            assert_eq!(
+                plt.size(),
+                (jump_slots.len() as u64 + 1) * 16,
+                "{name}: .plt is not PLT0 followed by one 16-byte stub per JUMP_SLOT"
+            );
+            assert_eq!(
+                plt_target(lib, plt.address()),
+                None,
+                "{name}: PLT0 jumps through the loader's own slot, not a symbol's"
+            );
+            for (i, (_, expected)) in jump_slots.iter().enumerate() {
+                let stub = plt.address() + (i as u64 + 1) * 16;
+                assert_eq!(
+                    plt_target(lib, stub).as_deref(),
+                    Some(expected.as_str()),
+                    "{name}: the stub at {stub:#x}"
+                );
+            }
+
+            // A `.plt.got` stub is reached the same way but relocated with a
+            // GLOB_DAT in `.rela.dyn`, which is the half of `got_to_name` the
+            // `.plt` entries never exercise.
+            let plt_got = elf.section_by_name(".plt.got").expect(".plt.got");
+            let glob_dats = relocated(object::elf::R_X86_64_GLOB_DAT.0);
+            let resolved = plt_target(lib, plt_got.address())
+                .unwrap_or_else(|| panic!("{name}: the first .plt.got stub went unresolved"));
+            assert!(
+                glob_dats.iter().any(|(_, sym)| *sym == resolved),
+                "{name}: '{resolved}' is not the symbol of any GLOB_DAT"
+            );
+        }
+    }
 
     fn parse_lib(bytes: &[u8]) -> object::read::elf::ElfFile64<'_> {
         match object::File::parse(bytes).expect("parse library") {
