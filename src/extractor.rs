@@ -25,18 +25,36 @@ fn describe_reloc(
     }
 }
 
+/// One of the libraries extraction is reading, named by position in
+/// [`ExtractionState::lib_paths`] rather than by path.
+///
+/// Every key extraction hashes names a library, and the merge of a single
+/// large library hashes those keys hundreds of thousands of times: once per
+/// reference resolved ([`ExtractionState::reserve`]) and once per address
+/// attributed to a data section ([`ensure_data_blob_extracted`]). Hashing a
+/// `PathBuf` walks the whole path string every time, which made hashing alone
+/// a quarter of the run on `test/md5sum` + `libcrypto.so.3`. Interning the
+/// path once leaves a `u32` to hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LibId(u32);
+
 /// Key used to deduplicate units during BFS.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct UnitKey {
-    lib: PathBuf,
+    lib: LibId,
     sym: String,
 }
 
-/// Key for data blob deduplication: (library_path, section_name)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Key for data blob deduplication: (library, section index).
+///
+/// The section is identified by its index rather than its name for the same
+/// reason the library is: the name has to be read out of `.shstrtab` and
+/// copied before it can be hashed, and this key is built for every address a
+/// scanned reference or a dynamic relocation points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct DataBlobKey {
-    lib: PathBuf,
-    section: String,
+    lib: LibId,
+    section: object::SectionIndex,
 }
 
 /// Info about an extracted data section blob.
@@ -71,7 +89,7 @@ struct ExtractionState {
     /// defines them. Used to redirect cross-library PLT calls (e.g. libssl
     /// calling into libcore) to direct merged-unit references instead of
     /// leaving the original library-relative PLT offset in place.
-    cross_lib_syms: HashMap<String, PathBuf>,
+    cross_lib_syms: HashMap<String, LibId>,
     /// Symbols the executable actually DEFINES (subset of `external_syms`,
     /// which also contains the executable's undefined imports).
     exe_defined_syms: HashSet<String>,
@@ -80,21 +98,26 @@ struct ExtractionState {
     /// `RelaTables::copy_reloc_symbols`).
     exe_copy_relocated: HashSet<String>,
     /// Libraries we've already extracted init/fini arrays from.
-    processed_libs: HashSet<PathBuf>,
+    processed_libs: HashSet<LibId>,
     /// Accumulated init/fini entries from all processed libraries.
     init_fini: InitFiniArrays,
-    /// Extracted data section blobs: maps (lib, section_name) → blob info
+    /// Extracted data section blobs: maps (lib, section index) → blob info
     data_blobs: HashMap<DataBlobKey, DataBlobInfo>,
     /// Copied GOT slots that need a GLOB_DAT in the output (see GotSlotFixup).
     got_slot_fixups: Vec<GotSlotFixup>,
-    /// Cache of raw library bytes keyed by path. `process_symbol` runs once per
-    /// extracted symbol, and a large library (e.g. libcrypto.so.3 at ~6MB) can
-    /// yield thousands of symbols; re-reading the whole file from disk each time
-    /// dominated the runtime. The parse itself is lazy and cheap, so only the
-    /// bytes need caching.
-    lib_bytes_cache: HashMap<PathBuf, Rc<Vec<u8>>>,
+    /// Every library extraction has touched, in the order it first saw them;
+    /// a [`LibId`] is a position in here (see [`ExtractionState::lib_id`]).
+    lib_paths: Vec<Rc<Path>>,
+    /// The reverse of `lib_paths`, consulted only when a path first turns up.
+    lib_ids: HashMap<Rc<Path>, LibId>,
+    /// Cache of raw library bytes, indexed by [`LibId`]. `process_symbol` runs
+    /// once per extracted symbol, and a large library (e.g. libcrypto.so.3 at
+    /// ~6MB) can yield thousands of symbols; re-reading the whole file from
+    /// disk each time dominated the runtime. The parse itself is lazy and
+    /// cheap, so only the bytes need caching.
+    lib_bytes_cache: Vec<Option<Rc<Vec<u8>>>>,
     /// Precomputed symbol lookups per library (see `LibIndex`).
-    lib_index_cache: HashMap<PathBuf, Rc<LibIndex>>,
+    lib_index_cache: Vec<Option<Rc<LibIndex>>>,
 }
 
 impl ExtractionState {
@@ -148,32 +171,50 @@ impl ExtractionState {
         self.units.get_mut(idx)
     }
 
+    /// The id `path` is interned under, assigning it one on first sight.
+    fn lib_id(&mut self, path: &Path) -> LibId {
+        if let Some(&id) = self.lib_ids.get(path) {
+            return id;
+        }
+        let id = LibId(self.lib_paths.len() as u32);
+        let path: Rc<Path> = Rc::from(path);
+        self.lib_paths.push(Rc::clone(&path));
+        self.lib_ids.insert(path, id);
+        self.lib_bytes_cache.push(None);
+        self.lib_index_cache.push(None);
+        id
+    }
+
+    /// The path `lib` was interned from.
+    fn lib_path(&self, lib: LibId) -> Rc<Path> {
+        Rc::clone(&self.lib_paths[lib.0 as usize])
+    }
+
     /// Return the raw bytes of `lib`, reading and caching them on first use.
-    fn lib_bytes(&mut self, lib: &Path) -> Result<Rc<Vec<u8>>> {
-        if let Some(bytes) = self.lib_bytes_cache.get(lib) {
+    fn lib_bytes(&mut self, lib: LibId) -> Result<Rc<Vec<u8>>> {
+        if let Some(bytes) = &self.lib_bytes_cache[lib.0 as usize] {
             return Ok(Rc::clone(bytes));
         }
+        let path = self.lib_path(lib);
         let bytes =
-            Rc::new(std::fs::read(lib).with_context(|| format!("reading {}", lib.display()))?);
-        self.lib_bytes_cache
-            .insert(lib.to_path_buf(), Rc::clone(&bytes));
+            Rc::new(std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?);
+        self.lib_bytes_cache[lib.0 as usize] = Some(Rc::clone(&bytes));
         Ok(bytes)
     }
 
     /// Return the symbol index for `lib`, building and caching it on first use.
-    fn lib_index(&mut self, lib: &Path, elf: &object::read::elf::ElfFile64<'_>) -> Rc<LibIndex> {
-        if let Some(idx) = self.lib_index_cache.get(lib) {
+    fn lib_index(&mut self, lib: LibId, elf: &object::read::elf::ElfFile64<'_>) -> Rc<LibIndex> {
+        if let Some(idx) = &self.lib_index_cache[lib.0 as usize] {
             return Rc::clone(idx);
         }
         let idx = Rc::new(LibIndex::build(elf));
         debug!(
-            lib = %lib.display(),
+            lib = %self.lib_path(lib).display(),
             symbols = idx.by_name.len(),
             fdes = idx.fdes.fde_count(),
             "Indexed library"
         );
-        self.lib_index_cache
-            .insert(lib.to_path_buf(), Rc::clone(&idx));
+        self.lib_index_cache[lib.0 as usize] = Some(Rc::clone(&idx));
         idx
     }
 
@@ -246,20 +287,32 @@ pub fn extract_units(
         unit_index: HashMap::new(),
         next_id: 0,
         external_syms: exe_dynsym_names,
-        cross_lib_syms: merged_lib_syms.clone(),
+        cross_lib_syms: HashMap::new(),
         exe_defined_syms,
         exe_copy_relocated: exe_copy_relocated.clone(),
         processed_libs: HashSet::new(),
         init_fini: InitFiniArrays::default(),
         data_blobs: HashMap::new(),
         got_slot_fixups: Vec::new(),
-        lib_bytes_cache: HashMap::new(),
-        lib_index_cache: HashMap::new(),
+        lib_paths: Vec::new(),
+        lib_ids: HashMap::new(),
+        lib_bytes_cache: Vec::new(),
+        lib_index_cache: Vec::new(),
     };
 
+    // Interning the defining library of every symbol the merged libraries
+    // export up front is what keeps the lookup on the hot path a `LibId`
+    // comparison rather than a path hash.
+    let cross_lib_syms = merged_lib_syms
+        .iter()
+        .map(|(sym, path)| (sym.clone(), state.lib_id(path)))
+        .collect();
+    state.cross_lib_syms = cross_lib_syms;
+
     for imp in seeds {
+        let lib = state.lib_id(&imp.source_library);
         state.reserve(UnitKey {
-            lib: imp.source_library.clone(),
+            lib,
             sym: imp.name.clone(),
         });
     }
@@ -269,8 +322,9 @@ pub fn extract_units(
     // running dry means every id handed out has a unit behind it, and every
     // relocation already points at the right one.
     while let Some(key) = state.worklist.pop_front() {
+        let lib = state.lib_path(key.lib);
         process_symbol(&key, &mut state)
-            .with_context(|| format!("extracting '{}' from {}", key.sym, key.lib.display()))?;
+            .with_context(|| format!("extracting '{}' from {}", key.sym, lib.display()))?;
     }
 
     // That is the invariant the whole scheme rests on: a `MergedUnit` target
@@ -286,7 +340,7 @@ pub fn extract_units(
              extracted under it",
             id.0,
             key.sym,
-            key.lib.display()
+            state.lib_path(key.lib).display()
         );
     }
 
@@ -494,18 +548,20 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
     // lets the unit's own relocations — a jump table's entries, a recursive
     // call — point at it as they are collected.
     let id = state.reserve(key.clone());
-    let lib_bytes = state.lib_bytes(&key.lib)?;
+    let lib_path = state.lib_path(key.lib);
+    let lib_bytes = state.lib_bytes(key.lib)?;
 
     let object_file = object::File::parse(lib_bytes.as_slice())
-        .with_context(|| format!("object parse {}", key.lib.display()))?;
+        .with_context(|| format!("object parse {}", lib_path.display()))?;
 
     let object::File::Elf64(elf64) = &object_file else {
-        bail!("{}: not a 64-bit ELF shared library", key.lib.display());
+        bail!("{}: not a 64-bit ELF shared library", lib_path.display());
     };
 
-    let lib_index = state.lib_index(&key.lib, elf64);
+    let lib_index = state.lib_index(key.lib, elf64);
     let lib = Lib {
-        path: &key.lib,
+        id: key.lib,
+        path: &lib_path,
         elf: elf64,
         index: &lib_index,
     };
@@ -519,15 +575,16 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
     // identically. Provably no-op CRT glue is skipped inside
     // extract_init_fini_arrays.
     if !state.processed_libs.contains(&key.lib) {
-        state.processed_libs.insert(key.lib.clone());
+        state.processed_libs.insert(key.lib);
         let lib_init_fini = extract_init_fini_arrays(lib)?;
         for entry in lib_init_fini
             .init_entries
             .iter()
             .chain(&lib_init_fini.fini_entries)
         {
+            let lib = state.lib_id(&entry.source_lib);
             state.reserve(UnitKey {
-                lib: entry.source_lib.clone(),
+                lib,
                 sym: entry.unit_name.clone(),
             });
         }
@@ -543,7 +600,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
 
     // Find the symbol in .symtab first, fall back to .dynsym.
     let sym = find_symbol(lib, &key.sym)
-        .with_context(|| format!("symbol '{}' in {}", key.sym, key.lib.display()))?;
+        .with_context(|| format!("symbol '{}' in {}", key.sym, lib_path.display()))?;
 
     // Determine symbol size.
     let sym_size = if sym.size > 0 {
@@ -557,7 +614,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
         bail!(
             "cannot determine size of symbol '{}' in {} (st_size=0 and no adjacent symbol)",
             key.sym,
-            key.lib.display()
+            lib_path.display()
         );
     }
 
@@ -622,7 +679,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
         // Validate relocation kind.
         let kind = reloc.kind();
         let encoding = reloc.encoding();
-        reject_got_reloc(kind, encoding, &key.sym, &key.lib)?;
+        reject_got_reloc(kind, encoding, &key.sym, &lib_path)?;
 
         // Resolve the relocation target symbol.
         let target_sym = match reloc.target() {
@@ -651,7 +708,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                         "symbol '{}' in {}: references external symbol '{}' which is not \
                          exported by the executable — cannot merge this library",
                         key.sym,
-                        key.lib.display(),
+                        lib_path.display(),
                         ts_name
                     );
                 }
@@ -673,7 +730,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                     } else {
                         // It's a code symbol or unknown - extract as a unit
                         state.depend_on(UnitKey {
-                            lib: key.lib.clone(),
+                            lib: key.lib,
                             sym: ts_name,
                         })
                     }
@@ -789,7 +846,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                     });
                     if let Some((target_name, offset_in_target)) = dep {
                         let target = state.depend_on(UnitKey {
-                            lib: key.lib.clone(),
+                            lib: key.lib,
                             sym: target_name,
                         });
                         // The relocator computes S + A - P against the unit's
@@ -820,7 +877,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                 if let Some((target_name, offset_in_target)) = resolve_owning_unit(lib, target_addr)
                 {
                     let target = state.depend_on(UnitKey {
-                        lib: key.lib.clone(),
+                        lib: key.lib,
                         sym: target_name,
                     });
                     relocs.relocations.push(pcrel_reloc(
@@ -971,7 +1028,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
     state.push_unit(ExtractedUnit {
         id,
         name: key.sym.clone(),
-        source_lib: key.lib.clone(),
+        source_lib: lib_path.to_path_buf(),
         bytes,
         section_kind,
         alignment,
@@ -1128,6 +1185,10 @@ impl LibIndex {
 /// parameters repeated down the call chain.
 #[derive(Clone, Copy)]
 struct Lib<'a, 'data> {
+    /// The library's interned id, which is what the keys extraction builds
+    /// name it by (see [`LibId`]). `path` is the same library spelled out,
+    /// for the messages and unit names that want it in words.
+    id: LibId,
     path: &'a Path,
     elf: &'a object::read::elf::ElfFile64<'data>,
     index: &'a LibIndex,
@@ -1546,9 +1607,12 @@ fn find_existing_data_blob(addr: u64, state: &ExtractionState) -> Option<(UnitId
 /// megabytes in `libcrypto.so.3` — once per lookup only to drop it again, which
 /// was two thirds of the entire run. `section_contents` materializes them once
 /// the caller knows it needs them.
-struct SectionInfo {
+struct SectionInfo<'data> {
     index: object::SectionIndex,
-    name: String,
+    /// Borrowed out of the library's `.shstrtab`: this is built for every
+    /// address a scanned reference or a dynamic relocation points at, and
+    /// copying the name into a `String` each time was pure allocation.
+    name: &'data str,
     /// Base virtual address; the caller reaches the address it asked about
     /// through `addr - vaddr`, which for the gap case is past the end of the
     /// contents.
@@ -1586,10 +1650,10 @@ struct SectionInfo {
 /// boundary, and from attributing anything at all to an address outside the
 /// image — a decoding artifact from a unit that ran past the end of its
 /// function, say.
-fn find_section_for_address(
-    elf: &object::read::elf::ElfFile64<'_>,
+fn find_section_for_address<'data>(
+    elf: &object::read::elf::ElfFile64<'data>,
     addr: u64,
-) -> Option<SectionInfo> {
+) -> Option<SectionInfo<'data>> {
     if let Some(section) = crate::elf_reader::section_at_address(elf, addr) {
         return describe_section(&section);
     }
@@ -1623,8 +1687,10 @@ fn loaded_together(elf: &object::read::elf::ElfFile64<'_>, a: u64, b: u64) -> bo
 
 /// A section's name, base vaddr, length and kind, or `None` if solder does not
 /// extract that kind of section.
-fn describe_section(section: &object::read::elf::ElfSection64<'_, '_>) -> Option<SectionInfo> {
-    let name = section.name().ok()?.to_string();
+fn describe_section<'data>(
+    section: &object::read::elf::ElfSection64<'data, '_>,
+) -> Option<SectionInfo<'data>> {
+    let name = section.name().ok()?;
     let obj_kind = section.kind();
     let kind = match obj_kind {
         ObjSectionKind::Text => SectionKind::Text,
@@ -1661,7 +1727,10 @@ fn describe_section(section: &object::read::elf::ElfSection64<'_, '_>) -> Option
 ///
 /// A NOBITS section (`.bss`, `.tbss`) has no contents in the file; the loader
 /// zero-fills it, and so does the merge.
-fn section_contents(elf: &object::read::elf::ElfFile64<'_>, info: &SectionInfo) -> Result<Vec<u8>> {
+fn section_contents(
+    elf: &object::read::elf::ElfFile64<'_>,
+    info: &SectionInfo<'_>,
+) -> Result<Vec<u8>> {
     let section = elf
         .section_by_index(info.index)
         .with_context(|| format!("section {} vanished between lookups", info.name))?;
@@ -1797,7 +1866,7 @@ fn collect_dynamic_range_relocs(
             } else {
                 // Internal to the library
                 state.depend_on(UnitKey {
-                    lib: lib.path.to_path_buf(),
+                    lib: lib.id,
                     sym: ts_name,
                 })
             }
@@ -1822,7 +1891,7 @@ fn collect_dynamic_range_relocs(
             {
                 resolved_addend = Some(offset_in_target as i64);
                 state.depend_on(UnitKey {
-                    lib: lib.path.to_path_buf(),
+                    lib: lib.id,
                     sym: target_name,
                 })
             } else if let Some((blob_id, blob_base)) =
@@ -1885,8 +1954,8 @@ fn ensure_data_blob_extracted(
     }
 
     let blob_key = DataBlobKey {
-        lib: lib.path.to_path_buf(),
-        section: sec.name.clone(),
+        lib: lib.id,
+        section: sec.index,
     };
 
     // Check if already extracted
@@ -1928,7 +1997,7 @@ fn ensure_data_blob_extracted(
     let mut relocs = UnitRelocs::default();
     collect_dynamic_range_relocs(
         lib,
-        &sec_name,
+        sec_name,
         sec_addr..sec_addr + sec_data.len() as u64,
         state,
         &mut relocs,
@@ -2140,13 +2209,24 @@ mod tests {
             init_fini: InitFiniArrays::default(),
             data_blobs: HashMap::new(),
             got_slot_fixups: Vec::new(),
-            lib_bytes_cache: HashMap::new(),
-            lib_index_cache: HashMap::new(),
+            lib_paths: Vec::new(),
+            lib_ids: HashMap::new(),
+            lib_bytes_cache: Vec::new(),
+            lib_index_cache: Vec::new(),
         }
     }
 
     fn test_lib(name: &str) -> PathBuf {
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs")).join(name)
+    }
+
+    /// The key for `sym` in `lib`, interning the path in `state` the way
+    /// `extract_units` does before queueing a seed.
+    fn key_in(state: &mut ExtractionState, lib: &Path, sym: &str) -> UnitKey {
+        UnitKey {
+            lib: state.lib_id(lib),
+            sym: sym.to_string(),
+        }
     }
 
     /// Every R_X86_64_RELATIVE slot inside an extracted unit has to come out
@@ -2160,11 +2240,8 @@ mod tests {
     #[test]
     fn every_relative_slot_in_a_pointer_table_is_retargeted() {
         let lib = test_lib("libtinfo.so.6");
-        let key = UnitKey {
-            lib: lib.clone(),
-            sym: "strnames".to_string(),
-        };
         let mut state = test_state();
+        let key = key_in(&mut state, &lib, "strnames");
         process_symbol(&key, &mut state).expect("extract strnames");
 
         let unit = state
@@ -2182,7 +2259,8 @@ mod tests {
         let object::File::Elf64(elf64) = &elf else {
             panic!("not ELF64")
         };
-        let sym_vaddr = state.lib_index(&lib, elf64).by_name["strnames"].vaddr;
+        let lib_id = state.lib_id(&lib);
+        let sym_vaddr = state.lib_index(lib_id, elf64).by_name["strnames"].vaddr;
 
         let relative_slots: Vec<u64> = elf64
             .dynamic_relocations()
@@ -2238,11 +2316,8 @@ mod tests {
     /// to.
     #[test]
     fn a_variable_the_executable_copy_relocates_is_left_to_ld_so() {
-        let key = UnitKey {
-            lib: test_lib("libtinfo.so.6"),
-            sym: "tputs".to_string(),
-        };
         let mut state = test_state();
+        let key = key_in(&mut state, &test_lib("libtinfo.so.6"), "tputs");
         state.exe_copy_relocated = ["UP", "PC", "BC"].iter().map(|s| (*s).to_owned()).collect();
         process_symbol(&key, &mut state).expect("extract tputs");
 
@@ -2339,11 +2414,9 @@ mod tests {
             (object::elf::R_X86_64_IRELATIVE.0, "R_X86_64_IRELATIVE"),
         ] {
             let lib = lib_with_retyped_strnames_reloc(r_type);
-            let key = UnitKey {
-                lib: lib.path().to_path_buf(),
-                sym: "strnames".to_string(),
-            };
-            let err = match process_symbol(&key, &mut test_state()) {
+            let mut state = test_state();
+            let key = key_in(&mut state, lib.path(), "strnames");
+            let err = match process_symbol(&key, &mut state) {
                 Err(e) => e,
                 Ok(_) => panic!("{expected} is not a pointer slot but extraction succeeded"),
             };
@@ -2367,11 +2440,9 @@ mod tests {
             object::elf::R_X86_64_JUMP_SLOT.0,
         ] {
             let lib = lib_with_retyped_strnames_reloc(r_type);
-            let key = UnitKey {
-                lib: lib.path().to_path_buf(),
-                sym: "strnames".to_string(),
-            };
-            process_symbol(&key, &mut test_state())
+            let mut state = test_state();
+            let key = key_in(&mut state, lib.path(), "strnames");
+            process_symbol(&key, &mut state)
                 .unwrap_or_else(|e| panic!("r_type {r_type} should still extract: {e:#}"));
         }
     }
@@ -2402,6 +2473,9 @@ mod tests {
             let elf = parse_lib(&bytes);
             let index = LibIndex::build(&elf);
             let lib = Lib {
+                // Nothing under test here reaches an `ExtractionState`, so the
+                // id this handle carries is never used to key anything.
+                id: LibId(0),
                 path: &path,
                 elf: &elf,
                 index: &index,
@@ -2551,11 +2625,9 @@ mod tests {
     #[test]
     fn a_bss_symbol_reaching_past_its_section_is_an_error_rather_than_an_abort() {
         let lib = lib_with_symbol_size("ospeed", 1 << 60);
-        let key = UnitKey {
-            lib: lib.path().to_path_buf(),
-            sym: "ospeed".to_string(),
-        };
-        let err = match process_symbol(&key, &mut test_state()) {
+        let mut state = test_state();
+        let key = key_in(&mut state, lib.path(), "ospeed");
+        let err = match process_symbol(&key, &mut state) {
             Err(e) => format!("{e:#}"),
             Ok(_) => panic!("an exbibyte of .bss cannot be extracted from a 220K library"),
         };
@@ -2567,11 +2639,8 @@ mod tests {
 
         // The control: at its real size the same symbol still extracts, zero
         // filled to the length `.bss` declares for it.
-        let key = UnitKey {
-            lib: test_lib("libtinfo.so.6"),
-            sym: "ospeed".to_string(),
-        };
         let mut state = test_state();
+        let key = key_in(&mut state, &test_lib("libtinfo.so.6"), "ospeed");
         process_symbol(&key, &mut state).expect("extract ospeed");
         let unit = state
             .units
@@ -2623,7 +2692,7 @@ mod tests {
         let got = elf.section_by_name(SECTION).expect(SECTION);
         let (addr, size) = (got.address(), got.size());
         let sec = find_section_for_address(&elf, addr).expect("the section owns its own address");
-        assert_eq!((sec.name.as_str(), sec.size), (SECTION, size));
+        assert_eq!((sec.name, sec.size), (SECTION, size));
         assert_eq!(
             section_contents(&elf, &sec).expect("contents").len() as u64,
             size,
@@ -2727,8 +2796,10 @@ mod tests {
             let data_size = elf.section_by_name(".data").expect(".data").size();
 
             let mut state = test_state();
-            let index = state.lib_index(&lib, &elf);
+            let lib_id = state.lib_id(&lib);
+            let index = state.lib_index(lib_id, &elf);
             let arrays = extract_init_fini_arrays(Lib {
+                id: lib_id,
                 path: &lib,
                 elf: &elf,
                 index: &index,
@@ -2744,12 +2815,12 @@ mod tests {
             // what draining the worklist `process_symbol` reserves onto does.
             for entry in arrays.init_entries.iter().chain(&arrays.fini_entries) {
                 state.reserve(UnitKey {
-                    lib: lib.clone(),
+                    lib: lib_id,
                     sym: entry.unit_name.clone(),
                 });
             }
             while let Some(key) = state.worklist.pop_front() {
-                if key.lib != lib {
+                if key.lib != lib_id {
                     continue; // another merged library, outside this test
                 }
                 process_symbol(&key, &mut state).expect("extract the CRT glue");
@@ -2758,8 +2829,8 @@ mod tests {
             let blob = state
                 .data_blobs
                 .get(&DataBlobKey {
-                    lib: lib.clone(),
-                    section: ".data".to_string(),
+                    lib: lib_id,
+                    section: elf.section_by_name(".data").expect(".data").index(),
                 })
                 .expect(".data was not extracted")
                 .id;
@@ -2795,10 +2866,12 @@ mod tests {
         let object::File::Elf64(elf64) = &elf else {
             panic!("not ELF64")
         };
-        let index = state.lib_index(&lib, elf64);
+        let lib_id = state.lib_id(&lib);
+        let index = state.lib_index(lib_id, elf64);
         let data = elf64.section_by_name(".data").expect(".data").address();
 
         let handle = Lib {
+            id: lib_id,
             path: &lib,
             elf: elf64,
             index: &index,
@@ -2836,12 +2909,13 @@ mod tests {
     fn every_reference_into_the_closure_names_the_unit_that_was_built_for_it() {
         let lib = test_lib("libpcre2-8.so.0");
         let mut state = test_state();
+        let lib_id = state.lib_id(&lib);
         state.reserve(UnitKey {
-            lib: lib.clone(),
+            lib: lib_id,
             sym: "pcre2_config_8".to_string(),
         });
         while let Some(key) = state.worklist.pop_front() {
-            if key.lib != lib {
+            if key.lib != lib_id {
                 continue; // another merged library, outside this test
             }
             process_symbol(&key, &mut state)
@@ -2863,9 +2937,10 @@ mod tests {
                         unit.name, target.0
                     )
                 });
+                let target_lib = state.lib_ids[target.source_lib.as_path()];
                 assert_eq!(
                     state.reserved.get(&UnitKey {
-                        lib: target.source_lib.clone(),
+                        lib: target_lib,
                         sym: target.name.clone(),
                     }),
                     Some(&target.id),
@@ -2993,7 +3068,8 @@ mod tests {
         let mut state = test_state();
         let bytes = std::fs::read(&lib).expect("read library");
         let elf = parse_lib(&bytes);
-        let index = state.lib_index(&lib, &elf);
+        let lib_id = state.lib_id(&lib);
+        let index = state.lib_index(lib_id, &elf);
         assert_eq!(
             index.fdes.containing(FUNC),
             Some((FUNC, FUNC_END)),
@@ -3001,7 +3077,7 @@ mod tests {
         );
 
         let key = UnitKey {
-            lib: lib.clone(),
+            lib: lib_id,
             sym: anon_unit_name(FUNC),
         };
         process_symbol(&key, &mut state).expect("extract the X25519 primitive");
