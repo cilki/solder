@@ -276,6 +276,23 @@ fn run() -> Result<()> {
     };
     info!(add_needed=?plan.add_needed, "DT_NEEDED entries to add");
 
+    // ── Step 3.6: every symbol the loader is left looking for has a home ─────
+    // A symbol the library solder read does not define is left dynamic, while
+    // that library's soname goes out of DT_NEEDED with the code that was
+    // merged. If the copy solder found is not the one the executable was
+    // linked against, that pairing leaves a live relocation against a symbol
+    // nothing in the link defines any more.
+    let merged_names: HashSet<String> = imports.iter().map(|i| i.name.clone()).collect();
+    refuse_unresolvable_imports(
+        &exe_elf,
+        &rela,
+        &dyn_info,
+        &plan,
+        &merged_names,
+        &ldso_cache,
+        &library_path,
+    )?;
+
     // The loader protects the range `PT_GNU_RELRO` names and nothing else, and
     // the merged region is necessarily outside it. Say so before writing
     // anything, since the result is a binary whose function-pointer tables are
@@ -294,7 +311,6 @@ fn run() -> Result<()> {
 
     // ── Step 5: patch executable in-place (GOT, JUMP_SLOTs, DT_NEEDED) ───────
     // Find JUMP_SLOT reloc file offsets for the merged symbols.
-    let merged_names: HashSet<String> = imports.iter().map(|i| i.name.clone()).collect();
     plan.jump_slot_reloc_offsets =
         symbol_analysis::find_jump_slot_reloc_offsets(&rela, &merged_names);
 
@@ -345,6 +361,124 @@ fn run() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Stop a merge that would leave the executable importing a symbol none of the
+/// libraries it is still linked against defines.
+///
+/// Such a binary does not run: solder forces `DF_BIND_NOW`, so the loader
+/// resolves every remaining JUMP_SLOT and GLOB_DAT before `main` and fails the
+/// whole process when one of them has no definition. It is worth a refusal
+/// rather than a warning because there is no half of it worth keeping — the
+/// executable that was there before the merge still runs, and the one solder
+/// would write in its place does not.
+///
+/// The check needs to read every object the merged executable would be linked
+/// against, so anything solder cannot find makes it inconclusive and the merge
+/// goes ahead unjudged: that is the same file set the loader will search, and
+/// the entry solder cannot open may well be the one defining the symbol.
+fn refuse_unresolvable_imports(
+    exe_elf: &object::read::elf::ElfFile64<'_>,
+    rela: &RelaTables,
+    dyn_info: &symbol_analysis::DynamicInfo,
+    plan: &types::MergePlan,
+    merged: &HashSet<String>,
+    ldso_cache: &LdsoCache,
+    library_path: &[PathBuf],
+) -> Result<()> {
+    let loader_resolved = rela.loader_resolved_imports(merged);
+    if loader_resolved.is_empty() {
+        return Ok(());
+    }
+
+    // What the executable's DT_NEEDED says after the merge: the entries no
+    // merged library took with it, plus the ones inherited from the libraries
+    // that did go. The interpreter rides along, defining symbols of its own
+    // without ever being listed.
+    let remaining: Vec<&str> = dyn_info
+        .needed
+        .iter()
+        .map(String::as_str)
+        .filter(|needed| !plan.remove_needed.iter().any(|gone| gone == needed))
+        .chain(plan.add_needed.iter().map(String::as_str))
+        .chain(elf_reader::interpreter(exe_elf))
+        .collect();
+
+    let mut exe_rpath = dyn_info.search_rpath().to_vec();
+    exe_rpath.extend_from_slice(library_path);
+    let mut unreadable = None;
+    let mut consulted: Vec<String> = Vec::new();
+    let mut resolve = |entry: &str| -> Option<HashSet<String>> {
+        // Every one of these is looked up the way the loader looks it up for
+        // the *executable*, which is what each one of them is a dependency of
+        // once the merge is done.
+        let found = resolve_library(
+            entry,
+            &exe_rpath,
+            &dyn_info.runpath,
+            ldso_cache,
+            &dyn_info.origin,
+        )
+        .and_then(|path| {
+            symbol_analysis::read_library_dynamic(&path).map(|lib| (path, lib.defined))
+        });
+        match found {
+            Ok((path, defined)) => {
+                consulted.push(format!("{} ({entry})", path.display()));
+                Some(defined)
+            }
+            Err(e) => {
+                unreadable = Some(format!("{entry}: {e:#}"));
+                None
+            }
+        }
+    };
+
+    let Some(unprovided) = symbol_analysis::unprovided_imports(
+        &loader_resolved,
+        remaining.iter().copied(),
+        &mut resolve,
+    ) else {
+        warn!(
+            reason = unreadable,
+            "Cannot check that the symbols the merged binary still imports will resolve: \
+             one of the libraries it stays linked against could not be read. Point -L or \
+             $SYSROOT at it to have the merge verify that"
+        );
+        return Ok(());
+    };
+    if unprovided.is_empty() {
+        return Ok(());
+    }
+
+    // Listing every missing symbol helps nobody once there are dozens of them;
+    // the first few are enough to recognize which library is the wrong one.
+    const SHOWN: usize = 8;
+    let shown = unprovided
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "the merged executable would import {} that nothing it is still linked against \
+         defines: {shown}{}. A library that does not define everything the executable \
+         imports from it is not the copy the executable was linked against, so the merge \
+         would take its code and leave those symbols for a loader with nowhere to find \
+         them — the binary would fail to start. Libraries consulted: {}. Point -L or \
+         $SYSROOT at the matching copy, or leave that library out of the merge with -m.",
+        if unprovided.len() == 1 {
+            "a symbol".to_owned()
+        } else {
+            format!("{} symbols", unprovided.len())
+        },
+        if unprovided.len() > SHOWN {
+            format!(", and {} more", unprovided.len() - SHOWN)
+        } else {
+            String::new()
+        },
+        consulted.join(", "),
+    )
 }
 
 /// Print the merge plan for `--dry-run`.

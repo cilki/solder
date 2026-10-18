@@ -198,6 +198,26 @@ pub fn merged_load_address(elf: &ElfFile64<'_>) -> u64 {
     (image_end.max(past_file_end) + 0xfff) & !0xfff
 }
 
+/// The dynamic loader the executable names in `PT_INTERP`.
+///
+/// The interpreter is linked into every dynamic executable without ever being
+/// named in `DT_NEEDED`, and it defines symbols of its own — `__tls_get_addr`,
+/// `_dl_find_object` — so anything reasoning about what will resolve at load
+/// time has to count it among the libraries the executable is linked against.
+pub fn interpreter<'a>(elf: &'a ElfFile64<'a>) -> Option<&'a str> {
+    use object::read::elf::ProgramHeader;
+
+    let endian = elf.endian();
+    elf.elf_program_headers()
+        .iter()
+        .find(|seg| seg.p_type(endian) == object::elf::PT_INTERP)
+        .and_then(|seg| seg.data(endian, elf.data()).ok())
+        .and_then(|path| {
+            let path = path.split(|&b| b == 0).next().unwrap_or(path);
+            std::str::from_utf8(path).ok().filter(|s| !s.is_empty())
+        })
+}
+
 /// Validate that the input ELF is a supported target:
 /// - 64-bit ELF
 /// - ET_EXEC or ET_DYN (PIE)

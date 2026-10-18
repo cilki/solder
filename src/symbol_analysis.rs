@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -391,10 +391,17 @@ pub struct RelaTables {
     jump_slot: Vec<RelaEntry>,
     /// `.rela.dyn`, which mixes GLOB_DAT with RELATIVE, COPY and TLS entries.
     dynamic: Vec<RelaEntry>,
+    /// Names of the `.dynsym` symbols some other object has to define: the
+    /// undefined ones that are not weak, so the loader fails the executable
+    /// outright rather than resolving them to zero.
+    strong_undefined: HashSet<String>,
 }
 
 impl RelaTables {
     pub fn read(elf: &ElfFile64<'_>) -> Result<Self> {
+        use goblin::elf::section_header::SHN_UNDEF;
+        use goblin::elf::sym::STB_WEAK;
+
         // Relocation symbol indices address .dynsym, so resolve them there.
         let goblin_elf =
             goblin::elf::Elf::parse(elf.data()).context("goblin parse of executable")?;
@@ -404,10 +411,46 @@ impl RelaTables {
             .map(|sym| goblin_elf.dynstrtab.get_at(sym.st_name).unwrap_or(""))
             .collect();
 
+        // A name the executable defines itself is one the loader resolves
+        // without leaving the executable, however many undefined entries also
+        // carry it — two versions of the same name, say.
+        let defined_here: HashSet<&str> = goblin_elf
+            .dynsyms
+            .iter()
+            .enumerate()
+            .filter(|(_, sym)| sym.st_shndx != SHN_UNDEF as usize)
+            .filter_map(|(i, _)| names.get(i).copied())
+            .collect();
+        let strong_undefined = goblin_elf
+            .dynsyms
+            .iter()
+            .enumerate()
+            .filter(|(_, sym)| sym.st_shndx == SHN_UNDEF as usize && sym.st_bind() != STB_WEAK)
+            .filter_map(|(i, _)| names.get(i).copied())
+            .filter(|name| !name.is_empty() && !defined_here.contains(name))
+            .map(str::to_owned)
+            .collect();
+
         Ok(Self {
             jump_slot: read_rela_section(elf, ".rela.plt", &names)?,
             dynamic: read_rela_section(elf, ".rela.dyn", &names)?,
+            strong_undefined,
         })
+    }
+
+    /// The symbols the loader still has to find for this executable once the
+    /// merge has taken `merged` out of it.
+    ///
+    /// Every JUMP_SLOT and GLOB_DAT naming a merged symbol is neutralized by
+    /// the patcher, because the merge fills that GOT slot itself. What is left
+    /// is what the loader is still asked to look up: undefined, not weak — a
+    /// weak one resolves to zero instead of failing the load — and not merged.
+    pub fn loader_resolved_imports(&self, merged: &HashSet<String>) -> BTreeSet<String> {
+        self.imports()
+            .map(|(entry, _)| entry.symbol.as_str())
+            .filter(|name| self.strong_undefined.contains(*name) && !merged.contains(*name))
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The `.rela.dyn` entries of one relocation type.
@@ -692,6 +735,48 @@ pub fn inherited_needed<'a>(
     }
 
     Ok(inherited)
+}
+
+/// The symbols the merged executable would still ask the loader for that no
+/// library it is left linked against defines.
+///
+/// Solder picks the code it merges out of whichever copy of a soname its search
+/// path turns up, but the executable was linked against the copy that was on
+/// the machine that built it. When those are not the same file, the copy here
+/// can be missing a symbol the executable imports: nothing defines it, so no
+/// GOT slot is pre-filled for it and its relocation stays live — against a
+/// soname the merge has just taken out of `DT_NEEDED`. The merge reports
+/// success and the binary it wrote dies before `main` with "symbol lookup
+/// error: undefined symbol", since solder also forces `DF_BIND_NOW` and the
+/// loader resolves every such relocation up front.
+///
+/// So each symbol the loader is still asked for has to be defined by one of the
+/// objects the executable is left linked against: every `DT_NEEDED` entry that
+/// survives the merge, the ones inherited from the merged libraries included,
+/// plus the interpreter, which is loaded without ever appearing in `DT_NEEDED`
+/// and is where glibc keeps `__tls_get_addr` and friends.
+///
+/// `resolve` maps one of those entries to the symbols that file defines, or
+/// `None` when solder cannot read it. A single `None` makes the whole answer
+/// `None`: a library solder could not look at may define anything, and
+/// refusing a merge over a symbol that an unread file defines after all would
+/// be worse than letting it through.
+pub fn unprovided_imports<'a>(
+    loader_resolved: &BTreeSet<String>,
+    remaining: impl IntoIterator<Item = &'a str>,
+    resolve: &mut dyn FnMut(&str) -> Option<HashSet<String>>,
+) -> Option<Vec<String>> {
+    let mut unprovided: BTreeSet<&str> = loader_resolved.iter().map(String::as_str).collect();
+    for entry in remaining {
+        // Everything left is accounted for; whether the rest of the link can be
+        // read no longer changes the answer.
+        if unprovided.is_empty() {
+            break;
+        }
+        let defined = resolve(entry)?;
+        unprovided.retain(|name| !defined.contains(*name));
+    }
+    Some(unprovided.into_iter().map(str::to_owned).collect())
 }
 
 /// For a given set of imported symbols, find the file offsets of their JUMP_SLOT
@@ -1357,5 +1442,177 @@ mod merge_filter_tests {
         // "lib" matches libc (excluded) *and* libpcre2 (mergeable), so the
         // invocation still has something to do.
         validate_merge_filter(&needed(), &filter(&["lib"])).expect("mixed prefix");
+    }
+}
+
+#[cfg(test)]
+mod unprovided_import_tests {
+    use super::*;
+    use crate::elf_reader::MappedElf;
+
+    const GREP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep");
+    const PCRE2: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs/libpcre2-8.so.0");
+
+    fn names(symbols: &[&str]) -> BTreeSet<String> {
+        symbols.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn defines(symbols: &[&str]) -> HashSet<String> {
+        symbols.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// A copy of `test/libs/libpcre2-8.so.0` that no longer exports
+    /// `pcre2_match_8`: the symbol is renamed in `.dynstr`, which is what an
+    /// executable meets when the copy of a soname on the search path is not the
+    /// build it was linked against.
+    ///
+    /// The replacement is the same length, since `.dynstr` is a run of
+    /// NUL-terminated strings indexed by offset and a shorter one would move
+    /// every string behind it.
+    fn libpcre2_without_match(dir: &Path) {
+        let mut bytes = std::fs::read(PCRE2).expect("read libpcre2-8.so.0");
+        let from = b"pcre2_match_8\0";
+        let at = bytes
+            .windows(from.len())
+            .position(|w| w == from)
+            .expect("libpcre2-8.so.0 exports pcre2_match_8");
+        bytes[at + from.len() - 2] = b'9';
+
+        std::fs::write(dir.join("libpcre2-8.so.0"), &bytes).expect("write the doctored library");
+    }
+
+    /// The symbols `test/grep` still leaves to the loader after merging
+    /// whatever the library in `lib_dir` could provide.
+    fn still_imported(lib_dir: &Path) -> BTreeSet<String> {
+        let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
+        let exe = mapped.parse().expect("parse test/grep");
+        let dyn_info = parse_dynamic(&exe, Path::new(GREP)).expect("parse .dynamic");
+        let rela = RelaTables::read(&exe).expect("read .rela tables");
+
+        let info = collect_imports(
+            &exe,
+            &rela,
+            &dyn_info,
+            &LdsoCache::load(),
+            &[lib_dir.to_path_buf()],
+            None,
+        )
+        .expect("collect imports");
+
+        let merged: HashSet<String> = info.imports.iter().map(|i| i.name.clone()).collect();
+        rela.loader_resolved_imports(&merged)
+    }
+
+    /// The case the whole check exists for: the library on the search path is
+    /// missing a symbol the executable imports from it, so the merge takes the
+    /// rest of its code — dropping its `DT_NEEDED` entry — and leaves that one
+    /// symbol for a loader that now has nowhere to look it up.
+    #[test]
+    fn a_symbol_the_merged_library_never_defined_is_left_unprovided() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        libpcre2_without_match(dir.path());
+        let left = still_imported(dir.path());
+        assert!(
+            left.contains("pcre2_match_8"),
+            "the symbol the library no longer defines is still imported: {left:?}"
+        );
+        assert!(
+            !left.contains("pcre2_compile_8"),
+            "a symbol the merge did take must not be counted: {left:?}"
+        );
+
+        // Everything else grep imports comes from libc, which is what stays.
+        let libc = defines(
+            &left
+                .iter()
+                .filter(|n| !n.starts_with("pcre2_"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        let unprovided = unprovided_imports(&left, ["libc.so.6"], &mut |_| Some(libc.clone()))
+            .expect("every remaining library was readable");
+        assert_eq!(unprovided, ["pcre2_match_8"]);
+    }
+
+    /// The same executable merged against the real library leaves nothing
+    /// behind: every pcre2 symbol it imports is merged, and libc keeps the
+    /// rest.
+    #[test]
+    fn the_matching_library_leaves_nothing_unprovided() {
+        let left = still_imported(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs")));
+        assert!(
+            !left.iter().any(|n| n.starts_with("pcre2_")),
+            "the matching library provides every pcre2 symbol grep imports: {left:?}"
+        );
+
+        let libc = defines(&left.iter().map(String::as_str).collect::<Vec<_>>());
+        let unprovided = unprovided_imports(&left, ["libc.so.6"], &mut |_| Some(libc.clone()))
+            .expect("every remaining library was readable");
+        assert!(unprovided.is_empty(), "{unprovided:?}");
+    }
+
+    /// `__gmon_start__` and the `_ITM_*` pair are undefined in nearly every
+    /// glibc binary and defined by nothing unless a profiler or a transactional
+    /// memory runtime is loaded. They are weak, so the loader resolves them to
+    /// zero instead of failing — counting them would refuse every merge there
+    /// is.
+    #[test]
+    fn a_weak_undefined_symbol_is_not_something_the_loader_has_to_find() {
+        let left = still_imported(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs")));
+        for weak in ["__gmon_start__", "_ITM_registerTMCloneTable"] {
+            assert!(
+                !left.contains(weak),
+                "{weak} is weak and undefined in test/grep, with a relocation of its own"
+            );
+        }
+    }
+
+    /// The interpreter is never named in `DT_NEEDED` and still defines symbols
+    /// executables import, so it counts as one of the objects the merged
+    /// binary is linked against.
+    #[test]
+    fn the_interpreter_provides_symbols_no_dt_needed_entry_does() {
+        let left = names(&["__tls_get_addr"]);
+        let unprovided = unprovided_imports(
+            &left,
+            ["libc.so.6", "/lib64/ld-linux-x86-64.so.2"],
+            &mut |entry| {
+                Some(match entry {
+                    "/lib64/ld-linux-x86-64.so.2" => defines(&["__tls_get_addr"]),
+                    _ => defines(&["malloc"]),
+                })
+            },
+        )
+        .expect("both were readable");
+        assert!(unprovided.is_empty(), "{unprovided:?}");
+    }
+
+    /// A library solder cannot read may define anything, so the answer is "no
+    /// idea" rather than "nothing defines it" — refusing a merge over a symbol
+    /// that an unread file turns out to define would block work that is fine.
+    #[test]
+    fn a_library_that_cannot_be_read_makes_the_answer_inconclusive() {
+        let left = names(&["pcre2_match_8"]);
+        assert!(
+            unprovided_imports(&left, ["libwhoknows.so.1"], &mut |_| None).is_none(),
+            "an unreadable library leaves the question open"
+        );
+    }
+
+    /// Once every symbol has a provider the rest of the link does not matter,
+    /// including the part of it solder cannot read.
+    #[test]
+    fn an_unreadable_library_behind_a_complete_answer_does_not_matter() {
+        let left = names(&["getenv"]);
+        let unprovided = unprovided_imports(
+            &left,
+            ["libc.so.6", "libwhoknows.so.1"],
+            &mut |entry| match entry {
+                "libc.so.6" => Some(defines(&["getenv"])),
+                _ => None,
+            },
+        )
+        .expect("libc already accounted for everything");
+        assert!(unprovided.is_empty(), "{unprovided:?}");
     }
 }

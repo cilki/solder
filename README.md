@@ -199,6 +199,35 @@ that only exists on the machine the binary ships to — a plugin library, a
 sysroot that doesn't carry all of them — no longer costs you the merge of the
 libraries that *are* on the search path.
 
+### The copy that turns up is not always the right one
+
+Whichever file the search finds is the one the merge takes code out of, and the
+executable was linked against whatever copy of that soname was on the machine
+that built it. When those differ — a sysroot a release behind, a `-L` pointing
+at another build of the same library — the copy here can be missing a symbol
+the executable imports from it. Nothing defines that symbol, so no GOT slot is
+pre-filled for it and its relocation stays live, against a soname the merge has
+just taken out of `DT_NEEDED`. `solder` forces `DF_BIND_NOW`, so the loader
+resolves that relocation before `main` and the binary dies there: `symbol
+lookup error: undefined symbol`.
+
+So the merge checks, before writing anything, that every symbol it leaves to
+the loader is defined by something the executable is still linked against: the
+`DT_NEEDED` entries that survive, the ones inherited from the merged libraries,
+and the interpreter, which is loaded without ever being named in `DT_NEEDED`. A
+symbol none of them defines fails the merge, naming the symbols, so the
+executable that is there keeps running and you can point `-L` or `$SYSROOT` at
+the copy it was built against — or leave that library out of the merge with
+`-m`. Undefined *weak* symbols are not counted: the loader resolves those to
+zero rather than failing, which is how `__gmon_start__` sits undefined in
+nearly every binary.
+
+The check needs to read every library that stays, so one it cannot find — the
+usual case being a sysroot that carries the libraries you are merging but not
+libc — leaves the question open. Then it says so and the merge goes ahead
+unjudged, rather than refusing over a symbol the file it could not read may
+well define.
+
 ### Dependencies recorded as a path
 
 A `DT_NEEDED` entry containing a slash — what the linker writes when the
