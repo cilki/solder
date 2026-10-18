@@ -103,6 +103,10 @@ struct ExtractionState {
     init_fini: InitFiniArrays,
     /// Extracted data section blobs: maps (lib, section index) → blob info
     data_blobs: HashMap<DataBlobKey, DataBlobInfo>,
+    /// What each address a reference pointed at resolved to, so the resolution
+    /// is done once per address rather than once per reference to it (see
+    /// [`reserve_unit_at`]).
+    units_at: HashMap<(LibId, u64), Option<UnitRef>>,
     /// Copied GOT slots that need a GLOB_DAT in the output (see GotSlotFixup).
     got_slot_fixups: Vec<GotSlotFixup>,
     /// Every library extraction has touched, in the order it first saw them;
@@ -293,6 +297,7 @@ pub fn extract_units(
         processed_libs: HashSet::new(),
         init_fini: InitFiniArrays::default(),
         data_blobs: HashMap::new(),
+        units_at: HashMap::new(),
         got_slot_fixups: Vec::new(),
         lib_paths: Vec::new(),
         lib_ids: HashMap::new(),
@@ -840,23 +845,25 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                     // MD5_Update/MD5_Final call directly. Without this, the call
                     // bytes were copied verbatim and the stale displacement
                     // pointed into unmapped memory, crashing at runtime.
-                    let dep = resolve_owning_unit(lib, target_addr).or_else(|| {
-                        anon_target_is_extractable(lib, target_addr)
-                            .then(|| (anon_unit_name(target_addr), 0))
-                    });
-                    if let Some((target_name, offset_in_target)) = dep {
-                        let target = state.depend_on(UnitKey {
-                            lib: key.lib,
-                            sym: target_name,
+                    let mut dep = reserve_unit_at(lib, target_addr, state);
+                    if dep.is_none() && anon_target_is_extractable(lib, target_addr) {
+                        dep = Some(UnitRef {
+                            id: state.reserve(UnitKey {
+                                lib: key.lib,
+                                sym: anon_unit_name(target_addr),
+                            }),
+                            offset: 0,
                         });
+                    }
+                    if let Some(dep) = dep {
                         // The relocator computes S + A - P against the unit's
                         // base, so an interior target is reached through the
                         // addend.
                         relocs.relocations.push(pcrel_reloc(
                             rip_ref.offset as u64,
                             reloc_size,
-                            rip_ref.addend + offset_in_target as i64,
-                            target,
+                            rip_ref.addend + dep.offset as i64,
+                            RelocTarget::MergedUnit(dep.id),
                         ));
                     } else {
                         warn!(
@@ -874,17 +881,12 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                 // label inside the function doing the load). Resolve it to an
                 // owning unit first; anything else falls through to the blob
                 // path below.
-                if let Some((target_name, offset_in_target)) = resolve_owning_unit(lib, target_addr)
-                {
-                    let target = state.depend_on(UnitKey {
-                        lib: key.lib,
-                        sym: target_name,
-                    });
+                if let Some(dep) = reserve_unit_at(lib, target_addr, state) {
                     relocs.relocations.push(pcrel_reloc(
                         rip_ref.offset as u64,
                         32,
-                        rip_ref.addend + offset_in_target as i64,
-                        target,
+                        rip_ref.addend + dep.offset as i64,
+                        RelocTarget::MergedUnit(dep.id),
                     ));
                     continue;
                 }
@@ -1300,6 +1302,41 @@ fn resolve_owning_unit(lib: Lib<'_, '_>, addr: u64) -> Option<(String, u64)> {
     anon_target_is_extractable(lib, fde_start).then(|| (anon_unit_name(fde_start), offset))
 }
 
+/// [`resolve_owning_unit`] followed by the reservation of the unit it names,
+/// memoized on the address.
+///
+/// Every reference the instruction scanner and the dynamic relocations turn up
+/// ends here, and the same address is reached over and over: the whole point of
+/// extracting a function once is that all its callers name it, so each `call`
+/// of a hot helper in `libcrypto.so.3` resolves the same entry point again.
+/// Resolving one is an `.eh_frame` binary search, a symbol lookup, a size
+/// inference and a copy of the symbol's name, and that name is then hashed into
+/// `reserved` only to come back with the id the last caller already got.
+/// Merging `libcrypto.so.3` into `test/md5sum` asks this of 44742 addresses, of
+/// which 30859 — just over two in three — have been asked before.
+fn reserve_unit_at(lib: Lib<'_, '_>, addr: u64, state: &mut ExtractionState) -> Option<UnitRef> {
+    if let Some(&hit) = state.units_at.get(&(lib.id, addr)) {
+        return hit;
+    }
+    let resolved = resolve_owning_unit(lib, addr).map(|(name, offset)| UnitRef {
+        id: state.reserve(UnitKey {
+            lib: lib.id,
+            sym: name,
+        }),
+        offset,
+    });
+    state.units_at.insert((lib.id, addr), resolved);
+    resolved
+}
+
+/// The merged unit an address resolved to, and how far into it the address
+/// lands.
+#[derive(Clone, Copy)]
+struct UnitRef {
+    id: UnitId,
+    offset: u64,
+}
+
 /// The size `process_symbol` would extract for `name`, or `None` if the symbol
 /// cannot be resolved at all.
 fn symbol_unit_size(lib: Lib<'_, '_>, name: &str) -> Option<usize> {
@@ -1467,9 +1504,19 @@ pub fn decode_instructions(bytes: &[u8], vaddr: u64) -> Vec<Instruction> {
     use iced_x86::{Decoder, DecoderOptions};
 
     let mut decoder = Decoder::with_ip(64, bytes, vaddr, DecoderOptions::NONE);
-    let mut instrs = Vec::new();
+    // An `Instruction` is forty bytes and x86-64 instructions average rather
+    // under four, so growing the vector from nothing copies the stream several
+    // times over on the way up — and the stream is every text byte solder
+    // extracts, 3.6 MB of it for `test/md5sum` against `libcrypto.so.3`. Three
+    // bytes an instruction is a deliberate under-estimate of the length: it
+    // leaves room for the densest real code without over-allocating by much on
+    // the rest, and a stream that beats it still only grows the once.
+    let mut instrs = Vec::with_capacity(bytes.len() / 3 + 1);
     while decoder.can_decode() {
-        instrs.push(decoder.decode());
+        // Decoding into the vector's own slot is one forty-byte copy rather
+        // than two: `decode` returns by value and `push` then moves it in.
+        instrs.push(Instruction::default());
+        decoder.decode_out(instrs.last_mut().expect("just pushed"));
     }
     instrs
 }
@@ -1886,14 +1933,9 @@ fn collect_dynamic_range_relocs(
             if let Some((blob_id, blob_base)) = find_existing_data_blob(addend_va, state) {
                 let offset_in_blob = addend_va - blob_base;
                 RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
-            } else if let Some((target_name, offset_in_target)) =
-                resolve_owning_unit(lib, addend_va)
-            {
-                resolved_addend = Some(offset_in_target as i64);
-                state.depend_on(UnitKey {
-                    lib: lib.id,
-                    sym: target_name,
-                })
+            } else if let Some(dep) = reserve_unit_at(lib, addend_va, state) {
+                resolved_addend = Some(dep.offset as i64);
+                RelocTarget::MergedUnit(dep.id)
             } else if let Some((blob_id, blob_base)) =
                 ensure_data_blob_extracted(lib, addend_va, state)?
             {
@@ -2208,6 +2250,7 @@ mod tests {
             processed_libs: HashSet::new(),
             init_fini: InitFiniArrays::default(),
             data_blobs: HashMap::new(),
+            units_at: HashMap::new(),
             got_slot_fixups: Vec::new(),
             lib_paths: Vec::new(),
             lib_ids: HashMap::new(),

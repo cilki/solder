@@ -116,6 +116,21 @@ pub fn detect_jump_tables(
         return Ok(Vec::new());
     }
 
+    // A table is only ever confirmed by an indirect branch through a register
+    // the pass below tracked a computed target into, so a function holding no
+    // indirect branch has none to find whatever that pass models. The great
+    // majority of functions are in that case: of the 8601 `libcrypto.so.3`
+    // functions `test/md5sum` drags in, 310 hold an indirect branch. Settling
+    // that with a flow-control read per instruction skips the modelling for the
+    // other 8291, which is otherwise a register-state update per instruction
+    // and a section lookup per RIP-relative `lea`.
+    if !instrs
+        .iter()
+        .any(|i| i.flow_control() == FlowControl::IndirectBranch)
+    {
+        return Ok(Vec::new());
+    }
+
     debug!(symbol = symbol_name, "Scanning for jump tables");
 
     // Symbolic execution pass
