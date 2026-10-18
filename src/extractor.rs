@@ -784,7 +784,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                     // bytes were copied verbatim and the stale displacement
                     // pointed into unmapped memory, crashing at runtime.
                     let dep = resolve_owning_unit(lib, target_addr).or_else(|| {
-                        anon_target_is_extractable(lib.elf, target_addr)
+                        anon_target_is_extractable(lib, target_addr)
                             .then(|| (anon_unit_name(target_addr), 0))
                     });
                     if let Some((target_name, offset_in_target)) = dep {
@@ -1096,6 +1096,19 @@ impl LibIndex {
         }
     }
 
+    /// The PLT section covering `addr`, as `(section address, section index)`.
+    ///
+    /// A stub there is resolved to the symbol its GOT slot is relocated
+    /// against ([`plt_target`]) rather than extracted as a unit of its own
+    /// ([`anon_target_is_extractable`]), so both want the same question
+    /// answered against the same list of PLT sections.
+    fn plt_span_at(&self, addr: u64) -> Option<(u64, object::SectionIndex)> {
+        self.plt_spans
+            .iter()
+            .find(|&&(start, size, _)| addr >= start && addr - start < size)
+            .map(|&(start, _, section)| (start, section))
+    }
+
     /// Smallest defined-symbol address greater than `addr` within `section`.
     fn next_addr_in_section(&self, addr: u64, section: object::SectionIndex) -> Option<u64> {
         let start = self.addrs_by_section.partition_point(|&(a, _)| a <= addr);
@@ -1129,20 +1142,16 @@ fn find_symbol(lib: Lib<'_, '_>, name: &str) -> Result<SymInfo> {
     if let Some(hex) = name.strip_prefix(ANON_UNIT_PREFIX) {
         let addr = u64::from_str_radix(hex.trim_start_matches("0x"), 16)
             .with_context(|| format!("malformed anonymous unit name '{name}'"))?;
-        for section in lib.elf.sections() {
-            let sec_addr = section.address();
-            if addr >= sec_addr
-                && addr < sec_addr + section.size()
-                && section.kind() == ObjSectionKind::Text
-            {
-                return Ok(SymInfo {
-                    vaddr: addr,
-                    size: 0,
-                    section: section.index(),
-                });
-            }
-        }
-        bail!("anonymous unit address {addr:#x} not in any executable section");
+        let section = crate::elf_reader::section_at_address(lib.elf, addr)
+            .filter(|section| section.kind() == ObjSectionKind::Text)
+            .with_context(|| {
+                format!("anonymous unit address {addr:#x} not in any executable section")
+            })?;
+        return Ok(SymInfo {
+            vaddr: addr,
+            size: 0,
+            section: section.index(),
+        });
     }
 
     lib.index
@@ -1227,7 +1236,7 @@ fn resolve_owning_unit(lib: Lib<'_, '_>, addr: u64) -> Option<(String, u64)> {
     {
         return Some((name, offset));
     }
-    anon_target_is_extractable(lib.elf, fde_start).then(|| (anon_unit_name(fde_start), offset))
+    anon_target_is_extractable(lib, fde_start).then(|| (anon_unit_name(fde_start), offset))
 }
 
 /// The size `process_symbol` would extract for `name`, or `None` if the symbol
@@ -1242,18 +1251,12 @@ fn symbol_unit_size(lib: Lib<'_, '_>, name: &str) -> Option<usize> {
 }
 
 /// Whether `addr` points into executable code we can extract as an anonymous
-/// unit. Excludes PLT sections (those are resolved via `find_plt_target`) so we
+/// unit. Excludes PLT sections (those are resolved via [`plt_target`]) so we
 /// never mistake a PLT stub for a mergeable function.
-fn anon_target_is_extractable(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> bool {
-    for section in elf.sections() {
-        let sec_addr = section.address();
-        if addr >= sec_addr && addr < sec_addr + section.size() {
-            let name = section.name().unwrap_or("");
-            let is_plt = matches!(name, ".plt" | ".plt.got" | ".plt.sec");
-            return section.kind() == ObjSectionKind::Text && !is_plt;
-        }
-    }
-    false
+fn anon_target_is_extractable(lib: Lib<'_, '_>, addr: u64) -> bool {
+    lib.index.plt_span_at(addr).is_none()
+        && crate::elf_reader::section_at_address(lib.elf, addr)
+            .is_some_and(|section| section.kind() == ObjSectionKind::Text)
 }
 
 /// A text unit's instruction stream, and how many of the unit's leading bytes
@@ -1500,11 +1503,7 @@ fn scan_rip_relative_refs(
 /// names the symbol. Both halves of that lookup come out of the library's
 /// [`LibIndex`], built once per library.
 fn plt_target(lib: Lib<'_, '_>, addr: u64) -> Option<String> {
-    let &(sec_addr, _, section) = lib
-        .index
-        .plt_spans
-        .iter()
-        .find(|&&(start, size, _)| addr >= start && addr < start + size)?;
+    let (sec_addr, section) = lib.index.plt_span_at(addr)?;
     let sec_data = lib.elf.section_by_index(section).ok()?.data().ok()?;
 
     let mut off = (addr - sec_addr) as usize;
@@ -1591,22 +1590,19 @@ fn find_section_for_address(
     elf: &object::read::elf::ElfFile64<'_>,
     addr: u64,
 ) -> Option<SectionInfo> {
-    let mut preceding: Option<(u64, object::read::elf::ElfSection64<'_, '_>)> = None;
+    if let Some(section) = crate::elf_reader::section_at_address(elf, addr) {
+        return describe_section(&section);
+    }
 
+    // Nothing contains `addr`, so look for the loaded section that ends
+    // closest below it.
+    let mut preceding: Option<(u64, object::read::elf::ElfSection64<'_, '_>)> = None;
     for section in elf.sections() {
         let sec_addr = section.address();
         let sec_size = section.size();
-        if addr >= sec_addr && addr < sec_addr + sec_size {
-            return describe_section(&section);
-        }
-        // Only loaded sections can precede the address: a non-allocated one
-        // (`.shstrtab`, `.gnu_debuglink`) reports address 0 and would otherwise
-        // claim an address by its size alone.
-        if sec_addr > addr || sec_size == 0 || !is_alloc(&section) {
+        if sec_addr > addr || sec_size == 0 || !crate::elf_reader::is_alloc(&section) {
             continue;
         }
-        // Nothing contains `addr`, so this section ends at or before it; keep
-        // the one that ends closest to it.
         let sec_end = sec_addr + sec_size;
         if preceding.as_ref().is_none_or(|(end, _)| sec_end > *end) {
             preceding = Some((sec_end, section));
@@ -1623,14 +1619,6 @@ fn loaded_together(elf: &object::read::elf::ElfFile64<'_>, a: u64, b: u64) -> bo
         let mapped = seg.vaddr..=seg.vaddr + seg.memsz;
         mapped.contains(&a) && mapped.contains(&b)
     })
-}
-
-/// Whether a section is part of the loaded image (`SHF_ALLOC`).
-fn is_alloc(section: &object::read::elf::ElfSection64<'_, '_>) -> bool {
-    match section.flags() {
-        object::SectionFlags::Elf { sh_flags, .. } => (sh_flags & object::elf::SHF_ALLOC).0 != 0,
-        _ => false,
-    }
 }
 
 /// A section's name, base vaddr, length and kind, or `None` if solder does not
@@ -2105,8 +2093,7 @@ fn extract_init_fini_arrays(lib: Lib<'_, '_>) -> Result<InitFiniArrays> {
             let unit_name = sym_name
                 .filter(|n| find_symbol(lib, n).is_ok())
                 .or_else(|| {
-                    anon_target_is_extractable(lib.elf, func_vaddr)
-                        .then(|| anon_unit_name(func_vaddr))
+                    anon_target_is_extractable(lib, func_vaddr).then(|| anon_unit_name(func_vaddr))
                 })
                 .with_context(|| {
                     format!(

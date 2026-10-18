@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
 use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
-use object::{Object, ObjectSection};
+use object::ObjectSection;
 use tracing::debug;
 
 /// A detected jump table in .rodata
@@ -242,18 +242,12 @@ fn combine(a: Option<&AbstractValue>, b: Option<&AbstractValue>) -> Option<Abstr
 
 /// Check if an address falls within a read-only data section (.rodata, .data.rel.ro, etc.)
 fn is_rodata_address(elf: &object::read::elf::ElfFile64<'_>, addr: u64) -> bool {
-    for section in elf.sections() {
-        let section_addr = section.address();
-        let section_size = section.size();
-        if addr >= section_addr && addr < section_addr + section_size {
-            let kind = section.kind();
-            return matches!(
-                kind,
-                object::SectionKind::ReadOnlyData | object::SectionKind::Data
-            );
-        }
-    }
-    false
+    crate::elf_reader::section_at_address(elf, addr).is_some_and(|section| {
+        matches!(
+            section.kind(),
+            object::SectionKind::ReadOnlyData | object::SectionKind::Data
+        )
+    })
 }
 
 /// Determine jump table bounds by reading consecutive i32 values and validating targets.
@@ -273,14 +267,7 @@ fn identify_table_bounds(
     func_size: u64,
     next_table: Option<u64>,
 ) -> Result<JumpTable> {
-    // Find section containing the table
-    let section = elf
-        .sections()
-        .find(|s| {
-            let addr = s.address();
-            let size = s.size();
-            table_base >= addr && table_base < addr + size
-        })
+    let section = crate::elf_reader::section_at_address(elf, table_base)
         .context("Could not find section containing jump table")?;
 
     let section_data = section.data().context("Could not read section data")?;

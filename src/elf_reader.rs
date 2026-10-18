@@ -96,6 +96,48 @@ pub fn gnu_relro(elf: &ElfFile64<'_>) -> Option<std::ops::Range<u64>> {
         })
 }
 
+/// Whether a section is part of the loaded image (`SHF_ALLOC`).
+///
+/// One that is not has no virtual address at all, and says so by reporting
+/// `sh_addr` as 0 — which in a shared library, where the image starts at 0, is
+/// as ordinary an address as any other. So `.shstrtab`, `.symtab` and
+/// `.gnu_debuglink` each claim the first `sh_size` addresses of the image
+/// purely by being as long as they are, and anything resolving an address
+/// against `sh_addr`/`sh_size` has to rule them out first.
+pub fn is_alloc(section: &object::read::elf::ElfSection64<'_, '_>) -> bool {
+    use object::ObjectSection;
+    match section.flags() {
+        object::SectionFlags::Elf { sh_flags, .. } => (sh_flags & object::elf::SHF_ALLOC).0 != 0,
+        _ => false,
+    }
+}
+
+/// The loaded section whose address range covers `addr`.
+///
+/// Five callers want exactly this and each used to walk `elf.sections()`
+/// itself: the extractor's section lookup for a data address, its two checks
+/// that an address is extractable code, and the jump-table scanner's
+/// read-only-data test and its table lookup. Five copies of one loop, each
+/// applying its own predicate to whatever came out, and each with its own idea
+/// of whether a section with no address can own one — only the extractor's
+/// ruled out the sections that are not in the loaded image, and only on the
+/// path that handles an address no section contains.
+pub fn section_at_address<'data, 'file>(
+    elf: &'file ElfFile64<'data>,
+    addr: u64,
+) -> Option<object::read::elf::ElfSection64<'data, 'file>> {
+    use object::Object;
+    elf.sections()
+        .find(|section| is_alloc(section) && covers(section, addr))
+}
+
+/// Whether `section` is laid out over `addr`.
+fn covers(section: &object::read::elf::ElfSection64<'_, '_>, addr: u64) -> bool {
+    use object::ObjectSection;
+    let start = section.address();
+    addr >= start && addr - start < section.size()
+}
+
 /// Convert a virtual address in a parsed ELF to a file offset.
 /// Returns None if the VA is not covered by any PT_LOAD segment.
 pub fn va_to_file_offset(elf: &ElfFile64<'_>, va: u64) -> Option<u64> {
@@ -624,6 +666,94 @@ pub fn file_offset_to_va(elf: &ElfFile64<'_>, offset: u64) -> Option<u64> {
     pt_loads(elf)
         .find(|seg| (seg.offset..seg.offset + seg.filesz).contains(&offset))
         .map(|seg| offset - seg.offset + seg.vaddr)
+}
+
+#[cfg(test)]
+mod section_lookup_tests {
+    use super::*;
+    use object::{Object, ObjectSection};
+
+    const TEST_LIBS: [&str; 3] = ["libpcre2-8.so.0", "libcrypto.so.3", "libtinfo.so.6"];
+
+    fn read_test_lib(name: &str) -> Vec<u8> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs/").to_string() + name;
+        std::fs::read(&path).expect("test library")
+    }
+
+    /// Every loaded section owns the addresses it is laid out over and the
+    /// lookup finds it there. The extractor resolves a data address to the
+    /// section it has to copy through this, so a disagreement with the section
+    /// header table is a wrong blob or none at all.
+    #[test]
+    fn a_loaded_section_owns_its_own_addresses() {
+        for name in TEST_LIBS {
+            let bytes = read_test_lib(name);
+            let elf = ElfFile64::<object::Endianness>::parse(bytes.as_slice()).expect("parse");
+            let mut checked = 0;
+            for section in elf.sections().filter(|s| is_alloc(s) && s.size() > 0) {
+                let (start, size) = (section.address(), section.size());
+                for addr in [start, start + size / 2, start + size - 1] {
+                    let found = section_at_address(&elf, addr)
+                        .unwrap_or_else(|| panic!("{name}: {addr:#x} resolved to no section"));
+                    assert_eq!(
+                        found.index(),
+                        section.index(),
+                        "{name}: {addr:#x} is in {:?}, not {:?}",
+                        found.name(),
+                        section.name()
+                    );
+                }
+                checked += 1;
+            }
+            assert!(checked > 10, "{name}: only {checked} loaded sections");
+        }
+    }
+
+    /// A section that is not part of the loaded image has no address of its
+    /// own: `sh_addr` reads 0, which in a shared library is as ordinary an
+    /// address as any other. Resolving an address by `sh_addr`/`sh_size`
+    /// alone — which is what each of the four lookups this replaced did —
+    /// therefore let `.shstrtab` and `.gnu_debuglink` claim every address
+    /// below their own length, an area of the image no section covers at all.
+    #[test]
+    fn a_section_outside_the_loaded_image_claims_no_address() {
+        for name in TEST_LIBS {
+            let bytes = read_test_lib(name);
+            let elf = ElfFile64::<object::Endianness>::parse(bytes.as_slice()).expect("parse");
+
+            // How far an unloaded section would reach if its `sh_addr` of 0
+            // were taken for an address.
+            let reach = elf
+                .sections()
+                .filter(|s| !is_alloc(s))
+                .map(|s| s.size())
+                .max()
+                .expect("an unloaded section");
+            assert!(reach > 0, "{name}: no unloaded section has any length");
+
+            // Those addresses are below every loaded section, so they are in
+            // no section at all.
+            let first_loaded = elf
+                .sections()
+                .filter(|s| is_alloc(s) && s.size() > 0)
+                .map(|s| s.address())
+                .min()
+                .expect("a loaded section");
+            assert!(
+                first_loaded > reach,
+                "{name}: the image starts at {first_loaded:#x}, inside the {reach:#x} \
+                 bytes an unloaded section would claim"
+            );
+            for addr in [0, reach - 1, first_loaded - 1] {
+                let found = section_at_address(&elf, addr);
+                assert!(
+                    found.is_none(),
+                    "{name}: {addr:#x} resolved to {:?}",
+                    found.and_then(|s| s.name().ok().map(str::to_owned))
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
