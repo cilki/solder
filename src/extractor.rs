@@ -671,7 +671,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
     } else {
         section_data[offset_in_section..sym_end].to_vec()
     };
-    let alignment = section.align().max(1);
+    let alignment = unit_alignment(sym_vaddr, section.align());
 
     // Collect relocations that fall within this symbol's byte range.
     for (roff, reloc) in section.relocations() {
@@ -1038,6 +1038,39 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
     });
 
     Ok(())
+}
+
+/// How far a unit extracted at `sym_vaddr` has to be aligned in the merged
+/// segment — which is *not* the alignment of the section it came out of.
+///
+/// `sh_addralign` constrains where the linker put the section's first byte and
+/// says nothing about the symbols inside it. Debian's `libcrypto.so.3` has a
+/// `.text` aligned to 4096, and taking that as every unit's own requirement
+/// padded each of the 8858 units extracted from it up to a page boundary: 3.1
+/// MB of merged code became a 36 MB executable run, over 90% of it zeroes,
+/// because each function was rounded up to 4 KiB.
+///
+/// Whatever alignment the unit actually needs, the address the linker gave it
+/// already satisfies — a function or constant that had to be 16-aligned sits at
+/// a 16-aligned address — so the largest power of two dividing `sym_vaddr` is
+/// an upper bound on the requirement, and keeping exactly that reproduces the
+/// alignment the unit had in the library. (A shared object's `p_vaddr` is
+/// congruent to its load address modulo the page size, so those low bits are
+/// the ones the unit really ran at.) The section's own alignment still caps the
+/// result: nothing inside it can need more than the section itself was given.
+///
+/// That bound covers what is *inside* the unit as well. A symbol's address
+/// satisfies the strictest alignment anything in it asked for — a function
+/// loading a 16-byte constant with `movaps` is itself placed so that constant
+/// lands 16-aligned — so any interior requirement divides the alignment kept
+/// here, and dividing it, it is satisfied wherever the unit is placed.
+fn unit_alignment(sym_vaddr: u64, section_align: u64) -> u64 {
+    let section_align = section_align.max(1);
+    if sym_vaddr == 0 {
+        // Nothing to infer from — every power of two divides 0.
+        return section_align;
+    }
+    section_align.min(1u64 << sym_vaddr.trailing_zeros())
 }
 
 /// Lightweight snapshot of a symbol we care about.
@@ -2610,6 +2643,107 @@ mod tests {
         };
         bytes[at..at + 8].copy_from_slice(&sh_size.to_le_bytes());
         bytes
+    }
+
+    /// `test/libs/libpcre2-8.so.0` with one section header's `sh_addralign`
+    /// overwritten, written to a temporary file.
+    ///
+    /// No committed fixture has a page-aligned `.text`, but Debian's
+    /// `libcrypto.so.3` and `libssl.so.3` both do, and a section alignment is
+    /// one number in one header — so raising a fixture's reproduces exactly the
+    /// input whose every unit used to be padded up to 4 KiB.
+    fn lib_with_section_alignment(section: &str, sh_addralign: u64) -> tempfile::NamedTempFile {
+        use object::read::elf::FileHeader;
+
+        let mut bytes = std::fs::read(test_lib("libpcre2-8.so.0")).expect("read libpcre2-8.so.0");
+        let at = {
+            let elf = parse_lib(&bytes);
+            let endian = elf.endian();
+            let header = elf.elf_header();
+            let index = elf
+                .section_by_name(section)
+                .unwrap_or_else(|| panic!("libpcre2-8.so.0 has no {section} section"))
+                .index()
+                .0;
+            header.e_shoff(endian) as usize
+                + index * header.e_shentsize(endian) as usize
+                + crate::elf_reader::SH_ADDRALIGN
+        };
+        bytes[at..at + 8].copy_from_slice(&sh_addralign.to_le_bytes());
+
+        // The offset above is arithmetic on the file's own headers, so check it
+        // landed where it was meant to rather than somewhere else entirely.
+        assert_eq!(
+            parse_lib(&bytes)
+                .section_by_name(section)
+                .expect(section)
+                .align(),
+            sh_addralign,
+            "the doctored sh_addralign did not take"
+        );
+
+        let out = tempfile::Builder::new()
+            .suffix(".so.0")
+            .tempfile()
+            .expect("temp library");
+        std::fs::write(out.path(), &bytes).expect("write the realigned library");
+        out
+    }
+
+    /// A unit's alignment is its own, not that of the section it came out of.
+    ///
+    /// `sh_addralign` says where the linker put the section's first byte, not
+    /// what every symbol inside it needs. Taking it as each unit's requirement
+    /// padded all 8858 units extracted from Debian's `libcrypto.so.3` — whose
+    /// `.text` is aligned to 4096 — up to a page boundary each: merging it and
+    /// `libssl.so.3` into `/usr/bin/openssl` laid out a 37,761,024-byte region
+    /// for 3,601,340 bytes of extracted code and data, over 90% of it zeroes.
+    #[test]
+    fn a_units_alignment_is_its_own_and_not_its_sections() {
+        const SYM: &str = "pcre2_maketables_8";
+        const PAGE: u64 = 0x1000;
+
+        let lib = lib_with_section_alignment(".text", PAGE);
+        let bytes = std::fs::read(lib.path()).expect("read the realigned library");
+        let vaddr = parse_lib(&bytes)
+            .dynamic_symbols()
+            .find(|s| s.name() == Ok(SYM))
+            .expect(SYM)
+            .address();
+        let own = 1u64 << vaddr.trailing_zeros();
+        assert!(
+            own < PAGE,
+            "{SYM} is at {vaddr:#x}, which is page aligned — it cannot show the difference"
+        );
+
+        let mut state = test_state();
+        let key = key_in(&mut state, lib.path(), SYM);
+        process_symbol(&key, &mut state).unwrap_or_else(|e| panic!("extract {SYM}: {e:#}"));
+        let unit = state
+            .units
+            .iter()
+            .find(|u| u.name == SYM)
+            .unwrap_or_else(|| panic!("{SYM} unit"));
+        assert_eq!(
+            unit.alignment, own,
+            "{SYM} sits at {vaddr:#x} in a .text aligned to {PAGE:#x}, so {own} is all the \
+             alignment it can need"
+        );
+    }
+
+    /// The section's alignment is still a ceiling: a unit the linker happened
+    /// to put at a well-aligned address does not thereby need that alignment,
+    /// and a unit at address 0 says nothing at all about its requirement.
+    #[test]
+    fn a_units_alignment_is_capped_by_its_sections() {
+        // 0x1000 divides the address, but .text only promised 64.
+        assert_eq!(unit_alignment(0x3000, 64), 64);
+        // 16 divides it, and that is less than the section's 64.
+        assert_eq!(unit_alignment(0x3010, 64), 16);
+        // Nothing to infer from, so the section's alignment stands.
+        assert_eq!(unit_alignment(0, 64), 64);
+        // A section that declares no alignment constrains nothing.
+        assert_eq!(unit_alignment(0x3010, 0), 1);
     }
 
     /// `test/libs/libtinfo.so.6` with the `st_size` of the `.dynsym` entry for
