@@ -61,7 +61,6 @@ struct DataBlobKey {
 struct DataBlobInfo {
     id: UnitId,
     base_vaddr: u64,
-    size: usize,
 }
 
 /// State threaded through the BFS.
@@ -718,27 +717,22 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                     );
                 }
             } else {
-                // Internal to the library (or another merged lib).
-                // Check if this is a data symbol - if so, try to use data blob offset
+                // Internal to the library (or another merged lib). A data
+                // symbol is reached through the blob holding its whole
+                // section, which `ensure_data_blob_extracted` copies on the
+                // first reference into that section and finds again on every
+                // later one.
                 let ts_vaddr = ts.address();
-                if let Some((blob_id, blob_base)) = find_existing_data_blob(ts_vaddr, state) {
-                    // Target is in an already-extracted data blob
-                    let offset_in_blob = ts_vaddr - blob_base;
-                    RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
-                } else {
-                    // Try to extract this data section containing the symbol
-                    // This will populate state.data_blobs if it's a data section
-                    let extract_result = ensure_data_blob_extracted(lib, ts_vaddr, state);
-                    if let Ok(Some((blob_id, blob_base))) = extract_result {
-                        let offset_in_blob = ts_vaddr - blob_base;
-                        RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
-                    } else {
-                        // It's a code symbol or unknown - extract as a unit
-                        state.depend_on(UnitKey {
-                            lib: key.lib,
-                            sym: ts_name,
-                        })
+                match ensure_data_blob_extracted(lib, ts_vaddr, state) {
+                    Ok(Some((blob_id, blob_base))) => {
+                        RelocTarget::DataBlobOffset(blob_id, ts_vaddr - blob_base)
                     }
+                    // Not in a data section: a code symbol or something
+                    // unrecognized, extracted as a unit of its own.
+                    _ => state.depend_on(UnitKey {
+                        lib: key.lib,
+                        sym: ts_name,
+                    }),
                 }
             }
         } else {
@@ -1667,17 +1661,6 @@ fn plt_target(lib: Lib<'_, '_>, addr: u64) -> Option<String> {
     find_symbol_at_address(lib.index, addr)
 }
 
-/// Check if a virtual address falls within an already-extracted data blob.
-/// Returns (blob_id, blob_base_vaddr) if found.
-fn find_existing_data_blob(addr: u64, state: &ExtractionState) -> Option<(UnitId, u64)> {
-    for info in state.data_blobs.values() {
-        if addr >= info.base_vaddr && addr < info.base_vaddr + info.size as u64 {
-            return Some((info.id, info.base_vaddr));
-        }
-    }
-    None
-}
-
 /// Where an address resolved to, without its contents.
 ///
 /// The contents are deliberately not part of this: `ensure_data_blob_extracted`
@@ -1962,11 +1945,7 @@ fn collect_dynamic_range_relocs(
             resolved_addend = Some(0);
             let addend_va = reloc.addend() as u64;
 
-            // Check if the target is within an already-extracted data blob
-            if let Some((blob_id, blob_base)) = find_existing_data_blob(addend_va, state) {
-                let offset_in_blob = addend_va - blob_base;
-                RelocTarget::DataBlobOffset(blob_id, offset_in_blob)
-            } else if let Some(dep) = reserve_unit_at(lib, addend_va, state) {
+            if let Some(dep) = reserve_unit_at(lib, addend_va, state) {
                 resolved_addend = Some(dep.offset as i64);
                 RelocTarget::MergedUnit(dep.id)
             } else if let Some((blob_id, blob_base)) =
@@ -2052,10 +2031,10 @@ fn ensure_data_blob_extracted(
     // Claim the blob's id and register it *before* collecting its relocations.
     // Resolving those relocations can lead back to this same section — directly
     // (a pointer in .data to the start of .data) or through another section
-    // whose own pointers come back here — and `find_existing_data_blob` has to
-    // be able to see the blob while that happens. Registering afterwards made
-    // such a target look unresolvable, and the copied bytes kept the library's
-    // own load-time VA, which points into unmapped memory once the library is
+    // whose own pointers come back here — and the lookup above has to be able
+    // to see the blob while that happens. Registering afterwards made such a
+    // target look unresolvable, and the copied bytes kept the library's own
+    // load-time VA, which points into unmapped memory once the library is
     // dropped from DT_NEEDED. It also bounds the mutual recursion with
     // `collect_dynamic_range_relocs` at one visit per section.
     let id = state.alloc_id();
@@ -2064,7 +2043,6 @@ fn ensure_data_blob_extracted(
         DataBlobInfo {
             id,
             base_vaddr: sec_addr,
-            size: sec_data.len(),
         },
     );
 
@@ -2369,6 +2347,67 @@ mod tests {
                 "slot {offset:#x} resolved to {:?}",
                 reloc.target
             );
+        }
+    }
+
+    /// `test/libs/libtinfo.so.6` under a path of its own, so that two
+    /// libraries whose data sections sit at the same virtual addresses can be
+    /// extracted side by side.
+    ///
+    /// Two libraries' addresses are not comparable: each is linked on its own
+    /// and position-independent code starts low, so the same `.rodata` address
+    /// names a different byte in each. Copying one fixture twice is the
+    /// sharpest form of that — every address collides.
+    fn lib_under_its_own_path() -> tempfile::NamedTempFile {
+        let out = tempfile::Builder::new()
+            .suffix(".so.6")
+            .tempfile()
+            .expect("temp library");
+        std::fs::copy(test_lib("libtinfo.so.6"), out.path()).expect("copy the fixture");
+        out
+    }
+
+    /// A reference found in one library has to resolve to a blob extracted
+    /// from that library. Matching the address against every blob extracted so
+    /// far, whichever library it came from, pointed the second library's
+    /// `strnames` at the first library's copy of `.rodata` — every string the
+    /// table names read out of the wrong library.
+    #[test]
+    fn a_data_reference_resolves_within_its_own_library() {
+        let libs = [lib_under_its_own_path(), lib_under_its_own_path()];
+        let mut state = test_state();
+
+        for lib in &libs {
+            let key = key_in(&mut state, lib.path(), "strnames");
+            process_symbol(&key, &mut state).expect("extract strnames");
+        }
+
+        for lib in &libs {
+            let unit = state
+                .units
+                .iter()
+                .find(|u| u.name == "strnames" && u.source_lib == lib.path())
+                .unwrap_or_else(|| panic!("no strnames unit from {}", lib.path().display()));
+            let blobs: Vec<UnitId> = unit
+                .relocations
+                .iter()
+                .filter_map(|r| match r.target {
+                    RelocTarget::DataBlobOffset(id, _) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            assert!(!blobs.is_empty(), "strnames reached no blob at all");
+            for id in blobs {
+                let blob = &state.units[state.unit_index[&id]];
+                assert_eq!(
+                    blob.source_lib,
+                    lib.path(),
+                    "a pointer in {}'s strnames reaches '{}' extracted from {}",
+                    lib.path().display(),
+                    blob.name,
+                    blob.source_lib.display()
+                );
+            }
         }
     }
 
