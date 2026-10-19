@@ -68,10 +68,12 @@ struct ExtractionState {
     /// The id reserved for each unit the closure has reached, whether or not it
     /// has been extracted yet (see [`ExtractionState::reserve`]).
     reserved: HashMap<UnitKey, UnitId>,
-    /// Units whose id has been reserved but which have not been extracted yet.
-    /// Reserving an id and queueing the extraction that fulfills it are the same
-    /// step, so nothing can hand out an id for a unit it then forgets to build.
-    worklist: VecDeque<UnitKey>,
+    /// Units whose id has been reserved but which have not been extracted yet,
+    /// each with the id reserved for it. Reserving an id and queueing the
+    /// extraction that fulfills it are the same step, so nothing can hand out
+    /// an id for a unit it then forgets to build — and the extraction is handed
+    /// the id rather than looking the key up again to find it.
+    worklist: VecDeque<(UnitKey, UnitId)>,
     units: Vec<ExtractedUnit>,
     /// Where in `units` each registered unit lives. A unit is reached by its
     /// `UnitId` from elsewhere — the jump-table scanner appends relocations to
@@ -106,6 +108,9 @@ struct ExtractionState {
     /// is done once per address rather than once per reference to it (see
     /// [`reserve_unit_at`]).
     units_at: HashMap<(LibId, u64), Option<UnitRef>>,
+    /// What the PLT stub at each address resolved to, so a stub is resolved
+    /// once rather than once per call site (see [`plt_reference`]).
+    plt_refs: HashMap<(LibId, u64), Option<RelocTarget>>,
     /// Copied GOT slots that need a GLOB_DAT in the output (see GotSlotFixup).
     got_slot_fixups: Vec<GotSlotFixup>,
     /// Every library extraction has touched, in the order it first saw them;
@@ -146,7 +151,7 @@ impl ExtractionState {
             return id;
         }
         let id = self.alloc_id();
-        self.worklist.push_back(key.clone());
+        self.worklist.push_back((key.clone(), id));
         self.reserved.insert(key, id);
         id
     }
@@ -297,6 +302,7 @@ pub fn extract_units(
         init_fini: InitFiniArrays::default(),
         data_blobs: HashMap::new(),
         units_at: HashMap::new(),
+        plt_refs: HashMap::new(),
         got_slot_fixups: Vec::new(),
         lib_paths: Vec::new(),
         lib_ids: HashMap::new(),
@@ -325,9 +331,9 @@ pub fn extract_units(
     // and `process_symbol` registers the unit under that id — so the queue
     // running dry means every id handed out has a unit behind it, and every
     // relocation already points at the right one.
-    while let Some(key) = state.worklist.pop_front() {
+    while let Some((key, id)) = state.worklist.pop_front() {
         let lib = state.lib_path(key.lib);
-        process_symbol(&key, &mut state)
+        process_symbol(&key, id, &mut state)
             .with_context(|| format!("extracting '{}' from {}", key.sym, lib.display()))?;
     }
 
@@ -547,11 +553,12 @@ fn reject_unliftable_dynamic_reloc(
 
 /// Process a single symbol: extract its bytes under the id reserved for it and
 /// parse its relocations, reserving an id for each unit they reach.
-fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
-    // The id this unit will be registered under. Knowing it up front is what
-    // lets the unit's own relocations — a jump table's entries, a recursive
-    // call — point at it as they are collected.
-    let id = state.reserve(key.clone());
+///
+/// `id` is the id the queue reserved for this unit, under which everything
+/// already pointing at it expects to find it. Having it passed in is also what
+/// lets the unit's own relocations — a jump table's entries, a recursive call —
+/// point at it as they are collected.
+fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Result<()> {
     let lib_path = state.lib_path(key.lib);
     let lib_bytes = state.lib_bytes(key.lib)?;
 
@@ -801,29 +808,7 @@ fn process_symbol(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
                 // relocator verifies the final offset still fits.
                 let reloc_size: u8 = if rip_ref.disp_size == 1 { 8 } else { 32 };
                 // First check if this is a PLT call (call to external symbol)
-                if let Some(ext_name) = plt_target(lib, target_addr) {
-                    // PLT call resolution order:
-                    //   1. Another merged library defines the symbol, and the
-                    //      executable's own .dynsym does not mention it →
-                    //      extract from that library and create a direct
-                    //      merged-unit reference.
-                    //   2. Otherwise the symbol stays external. Either the
-                    //      executable already exports or imports it, in which
-                    //      case the reference trampolines through the exe's
-                    //      GOT, or it is a libc/runtime symbol the executable
-                    //      does not import yet, in which case the writer
-                    //      injects a .dynsym entry and a GLOB_DAT relocation
-                    //      so ld.so resolves it at load time.
-                    let target = if !state.external_syms.contains(&ext_name)
-                        && let Some(other_lib) = state.cross_lib_syms.get(&ext_name).cloned()
-                    {
-                        state.depend_on(UnitKey {
-                            lib: other_lib,
-                            sym: ext_name,
-                        })
-                    } else {
-                        RelocTarget::External(ext_name)
-                    };
+                if let Some(target) = plt_reference(lib, target_addr, state) {
                     relocs.relocations.push(pcrel_reloc(
                         rip_ref.offset as u64,
                         reloc_size,
@@ -1065,6 +1050,14 @@ fn unit_alignment(sym_vaddr: u64, section_align: u64) -> u64 {
         return section_align;
     }
     section_align.min(1u64 << sym_vaddr.trailing_zeros())
+}
+
+/// Reserve an id for `key` and extract it under that id, which is what the
+/// worklist loop in [`extract_units`] does for every unit it reaches.
+#[cfg(test)]
+fn reserve_and_extract(key: &UnitKey, state: &mut ExtractionState) -> Result<()> {
+    let id = state.reserve(key.clone());
+    process_symbol(key, id, state)
 }
 
 /// Lightweight snapshot of a symbol we care about.
@@ -1596,10 +1589,18 @@ fn scan_rip_relative_refs(
                     }
                 }
             }
+            // `is_ip_rel_memory_operand` describes the instruction and not any
+            // one of its operands, so an instruction that addresses nothing
+            // through RIP has no operand worth looking at. Asking once settles
+            // the great majority of the stream — the scan sees every text byte
+            // the merge extracts, 3.6 MB of it for `test/md5sum` against
+            // `libcrypto.so.3` — where asking inside the loop walked the
+            // operands of each of them first.
+            _ if !instr.is_ip_rel_memory_operand() => {}
             _ => {
                 // Check all operands for RIP-relative memory references
                 for op_idx in 0..instr.op_count() {
-                    if instr.op_kind(op_idx) == OpKind::Memory && instr.is_ip_rel_memory_operand() {
+                    if instr.op_kind(op_idx) == OpKind::Memory {
                         let target = instr.ip_rel_memory_address();
                         // Find the displacement bytes within the instruction.
                         // The disp32 encodes (target - next_ip) as a signed 32-bit value.
@@ -1659,6 +1660,49 @@ fn plt_target(lib: Lib<'_, '_>, addr: u64) -> Option<String> {
     }
     // Fallback: a symbol defined at this exact address.
     find_symbol_at_address(lib.index, addr)
+}
+
+/// The target a call to the PLT stub at `addr` gets, or `None` when `addr` is
+/// not a stub at all and the caller has to resolve it as a direct internal
+/// reference.
+///
+/// PLT call resolution order:
+///   1. Another merged library defines the symbol, and the executable's own
+///      `.dynsym` does not mention it → extract from that library and create a
+///      direct merged-unit reference.
+///   2. Otherwise the symbol stays external. Either the executable already
+///      exports or imports it, in which case the reference trampolines through
+///      the exe's GOT, or it is a libc/runtime symbol the executable does not
+///      import yet, in which case the writer injects a `.dynsym` entry and a
+///      `GLOB_DAT` relocation so ld.so resolves it at load time.
+///
+/// Every scanned code reference is asked about here, and the same addresses
+/// arrive over and over: the whole point of a PLT stub is that every call site
+/// of the symbol shares it, and the direct calls in between all name the same
+/// handful of entry points. Merging `libcrypto.so.3` into `test/md5sum` asks
+/// about 53810 addresses, of which 5532 are distinct. Answering one costs a
+/// walk of the stub's encoding, a GOT-slot lookup, a copy of the symbol's name
+/// and then two hashes of that name to decide between the two cases above — all
+/// of it settled by the address alone, so it is settled once per address, "not
+/// a stub" included.
+fn plt_reference(lib: Lib<'_, '_>, addr: u64, state: &mut ExtractionState) -> Option<RelocTarget> {
+    if let Some(hit) = state.plt_refs.get(&(lib.id, addr)) {
+        return hit.clone();
+    }
+    let resolved = plt_target(lib, addr).map(|ext_name| {
+        if !state.external_syms.contains(&ext_name)
+            && let Some(other_lib) = state.cross_lib_syms.get(&ext_name).cloned()
+        {
+            state.depend_on(UnitKey {
+                lib: other_lib,
+                sym: ext_name,
+            })
+        } else {
+            RelocTarget::External(ext_name)
+        }
+    });
+    state.plt_refs.insert((lib.id, addr), resolved.clone());
+    resolved
 }
 
 /// Where an address resolved to, without its contents.
@@ -2262,6 +2306,7 @@ mod tests {
             init_fini: InitFiniArrays::default(),
             data_blobs: HashMap::new(),
             units_at: HashMap::new(),
+            plt_refs: HashMap::new(),
             got_slot_fixups: Vec::new(),
             lib_paths: Vec::new(),
             lib_ids: HashMap::new(),
@@ -2296,7 +2341,7 @@ mod tests {
         let lib = test_lib("libtinfo.so.6");
         let mut state = test_state();
         let key = key_in(&mut state, &lib, "strnames");
-        process_symbol(&key, &mut state).expect("extract strnames");
+        reserve_and_extract(&key, &mut state).expect("extract strnames");
 
         let unit = state
             .units
@@ -2379,7 +2424,7 @@ mod tests {
 
         for lib in &libs {
             let key = key_in(&mut state, lib.path(), "strnames");
-            process_symbol(&key, &mut state).expect("extract strnames");
+            reserve_and_extract(&key, &mut state).expect("extract strnames");
         }
 
         for lib in &libs {
@@ -2434,7 +2479,7 @@ mod tests {
         let mut state = test_state();
         let key = key_in(&mut state, &test_lib("libtinfo.so.6"), "tputs");
         state.exe_copy_relocated = ["UP", "PC", "BC"].iter().map(|s| (*s).to_owned()).collect();
-        process_symbol(&key, &mut state).expect("extract tputs");
+        reserve_and_extract(&key, &mut state).expect("extract tputs");
 
         let fixups: Vec<&str> = state
             .got_slot_fixups
@@ -2531,7 +2576,7 @@ mod tests {
             let lib = lib_with_retyped_strnames_reloc(r_type);
             let mut state = test_state();
             let key = key_in(&mut state, lib.path(), "strnames");
-            let err = match process_symbol(&key, &mut state) {
+            let err = match reserve_and_extract(&key, &mut state) {
                 Err(e) => e,
                 Ok(_) => panic!("{expected} is not a pointer slot but extraction succeeded"),
             };
@@ -2557,7 +2602,7 @@ mod tests {
             let lib = lib_with_retyped_strnames_reloc(r_type);
             let mut state = test_state();
             let key = key_in(&mut state, lib.path(), "strnames");
-            process_symbol(&key, &mut state)
+            reserve_and_extract(&key, &mut state)
                 .unwrap_or_else(|e| panic!("r_type {r_type} should still extract: {e:#}"));
         }
     }
@@ -2757,7 +2802,7 @@ mod tests {
 
         let mut state = test_state();
         let key = key_in(&mut state, lib.path(), SYM);
-        process_symbol(&key, &mut state).unwrap_or_else(|e| panic!("extract {SYM}: {e:#}"));
+        reserve_and_extract(&key, &mut state).unwrap_or_else(|e| panic!("extract {SYM}: {e:#}"));
         let unit = state
             .units
             .iter()
@@ -2843,7 +2888,7 @@ mod tests {
         let lib = lib_with_symbol_size("ospeed", 1 << 60);
         let mut state = test_state();
         let key = key_in(&mut state, lib.path(), "ospeed");
-        let err = match process_symbol(&key, &mut state) {
+        let err = match reserve_and_extract(&key, &mut state) {
             Err(e) => format!("{e:#}"),
             Ok(_) => panic!("an exbibyte of .bss cannot be extracted from a 220K library"),
         };
@@ -2857,7 +2902,7 @@ mod tests {
         // filled to the length `.bss` declares for it.
         let mut state = test_state();
         let key = key_in(&mut state, &test_lib("libtinfo.so.6"), "ospeed");
-        process_symbol(&key, &mut state).expect("extract ospeed");
+        reserve_and_extract(&key, &mut state).expect("extract ospeed");
         let unit = state
             .units
             .iter()
@@ -3035,11 +3080,11 @@ mod tests {
                     sym: entry.unit_name.clone(),
                 });
             }
-            while let Some(key) = state.worklist.pop_front() {
+            while let Some((key, id)) = state.worklist.pop_front() {
                 if key.lib != lib_id {
                     continue; // another merged library, outside this test
                 }
-                process_symbol(&key, &mut state).expect("extract the CRT glue");
+                process_symbol(&key, id, &mut state).expect("extract the CRT glue");
             }
 
             let blob = state
@@ -3130,11 +3175,11 @@ mod tests {
             lib: lib_id,
             sym: "pcre2_config_8".to_string(),
         });
-        while let Some(key) = state.worklist.pop_front() {
+        while let Some((key, id)) = state.worklist.pop_front() {
             if key.lib != lib_id {
                 continue; // another merged library, outside this test
             }
-            process_symbol(&key, &mut state)
+            process_symbol(&key, id, &mut state)
                 .unwrap_or_else(|e| panic!("extracting '{}': {e:#}", key.sym));
         }
 
@@ -3296,7 +3341,7 @@ mod tests {
             lib: lib_id,
             sym: anon_unit_name(FUNC),
         };
-        process_symbol(&key, &mut state).expect("extract the X25519 primitive");
+        reserve_and_extract(&key, &mut state).expect("extract the X25519 primitive");
         let unit = state.units.last().expect("the extracted unit");
 
         let code_len = (FUNC_END - FUNC) as usize;

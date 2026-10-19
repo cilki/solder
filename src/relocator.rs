@@ -13,11 +13,13 @@ use crate::types::{AssignedUnit, MergePlan, RelativeReloc, RelocTarget};
 pub fn apply_all_relocations(plan: &mut MergePlan) -> Result<()> {
     // Collect the lookup tables we need before borrowing plan mutably for iteration.
     // (unit_id → vaddr, trampoline_name → vaddr)
-    let id_to_vaddr: std::collections::HashMap<crate::types::UnitId, u64> = plan
-        .units
-        .iter()
-        .map(|au| (au.unit.id, au.assigned_vaddr))
-        .collect();
+    //
+    // A `UnitId` is the position at which extraction handed the id out, so the
+    // ids in a plan are the dense range `0..next_id` and an array indexes them
+    // directly. This table is consulted once per relocation — 110091 times for
+    // `test/md5sum` against `libcrypto.so.3` — and that many lookups are worth
+    // an index rather than a hash of the id into a 10218-entry map.
+    let id_to_vaddr = UnitVaddrs::of(plan);
 
     let tramp_to_vaddr: std::collections::HashMap<String, u64> = plan
         .trampoline_stubs
@@ -35,9 +37,35 @@ pub fn apply_all_relocations(plan: &mut MergePlan) -> Result<()> {
     Ok(())
 }
 
+/// The address each unit in the plan was assigned, indexed by its `UnitId`.
+struct UnitVaddrs(Vec<Option<u64>>);
+
+impl UnitVaddrs {
+    fn of(plan: &MergePlan) -> Self {
+        let len = plan
+            .units
+            .iter()
+            .map(|au| au.unit.id.0 as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut vaddrs = vec![None; len];
+        for au in &plan.units {
+            vaddrs[au.unit.id.0 as usize] = Some(au.assigned_vaddr);
+        }
+        Self(vaddrs)
+    }
+
+    /// The address of the unit with `id`, or `None` for an id no unit in the
+    /// plan was registered under — a dangling relocation target, which the
+    /// caller reports rather than patches.
+    fn get(&self, id: crate::types::UnitId) -> Option<u64> {
+        *self.0.get(id.0 as usize)?
+    }
+}
+
 fn apply_unit_relocations(
     au: &mut AssignedUnit,
-    id_to_vaddr: &std::collections::HashMap<crate::types::UnitId, u64>,
+    id_to_vaddr: &UnitVaddrs,
     tramp_to_vaddr: &std::collections::HashMap<String, u64>,
     is_pie: bool,
     new_relative: &mut Vec<RelativeReloc>,
@@ -49,14 +77,14 @@ fn apply_unit_relocations(
 
         // S = target symbol VA
         let s: u64 = match &reloc.target {
-            RelocTarget::MergedUnit(id) => *id_to_vaddr
-                .get(id)
+            RelocTarget::MergedUnit(id) => id_to_vaddr
+                .get(*id)
                 .with_context(|| format!("reloc target UnitId({}) not found in plan", id.0))?,
             RelocTarget::External(name) => *tramp_to_vaddr
                 .get(name)
                 .with_context(|| format!("no trampoline for external symbol '{name}'"))?,
             RelocTarget::DataBlobOffset(blob_id, offset) => {
-                let blob_base = *id_to_vaddr.get(blob_id).with_context(|| {
+                let blob_base = id_to_vaddr.get(*blob_id).with_context(|| {
                     format!("data blob UnitId({}) not found in plan", blob_id.0)
                 })?;
                 blob_base + offset
