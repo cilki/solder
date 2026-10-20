@@ -554,6 +554,7 @@ pub const SH_SIZE: usize = 32;
 /// `DT_VERNEEDNUM`.
 pub const SH_INFO: usize = 44;
 pub const SH_ADDRALIGN: usize = 48;
+pub const SH_ENTSIZE: usize = 56;
 
 /// `SHN_XINDEX` / `SHN_LORESERVE`: section counts and `e_shstrndx` values at or
 /// above this are escapes into the extended-numbering fields of section 0.

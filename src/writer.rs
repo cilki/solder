@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, bail};
 
 use crate::elf_reader::{
-    DynamicTable, SH_ADDR, SH_ADDRALIGN, SH_FLAGS, SH_NAME, SH_OFFSET, SH_SIZE, SH_TYPE, SHDR_SIZE,
-    SectionTable, VER_NDX_GLOBAL, va_to_file_offset,
+    DynamicTable, SH_ADDR, SH_ADDRALIGN, SH_ENTSIZE, SH_FLAGS, SH_NAME, SH_OFFSET, SH_SIZE,
+    SH_TYPE, SHDR_SIZE, SectionTable, VER_NDX_GLOBAL, va_to_file_offset,
 };
 use crate::layout::align_up;
-use crate::types::{MergePlan, RelativeReloc};
+use crate::types::{ARRAY_ENTRY_SIZE, InitFiniKind, MergePlan, RelativeReloc};
 
 /// Build the merged segment bytes (all units + trampoline stubs) in one flat buffer.
 ///
@@ -450,7 +450,8 @@ fn create_temp_beside(
 /// relocations still referenced them by index.
 ///
 /// So: repoint the headers of the rebuilt sections, add one covering each
-/// mapping of the merged region, and write a fresh section header table and
+/// mapping of the merged region, add one for each rebuilt init/fini array the
+/// executable had no header for, and write a fresh section header table and
 /// `.shstrtab` at the end of the file.
 fn rewrite_section_headers(
     out: &mut Vec<u8>,
@@ -484,27 +485,34 @@ fn rewrite_section_headers(
     //
     // An array the merge did not rebuild is left alone, matching
     // `update_dynamic_entries`: with no entries there is no copy to point at.
-    let rebuilt_arrays: Vec<(&'static str, u64, u64)> = plan
+    let rebuilt_arrays: Vec<(InitFiniKind, u64, u64)> = plan
         .init_fini
         .iter()
         .flat_map(|init_fini| init_fini.arrays())
         .filter(|(_, array)| !array.entries.is_empty())
-        .map(|(kind, array)| (kind.section(), array.vaddr, array.size()))
+        .map(|(kind, array)| (kind, array.vaddr, array.size()))
         .collect();
 
-    // Repoint the sections the merge rebuilt. A section the executable does not
-    // have is skipped: nothing described the old table either.
-    for &(section, vaddr, size) in ext.rebuilt_sections.iter().chain(&rebuilt_arrays) {
+    // File offset of a merged-region address, which is where every rebuilt
+    // section and every array above now lives.
+    let offset_of = |vaddr: u64| seg_file_offset + (vaddr - plan.load_address);
+
+    // Repoint the sections the merge rebuilt. A *table* the executable does not
+    // have a header for is skipped: nothing described the old copy either, and
+    // the merge did not invent it. The arrays are the other way round — see
+    // below.
+    let rebuilt = ext.rebuilt_sections.iter().copied().chain(
+        rebuilt_arrays
+            .iter()
+            .map(|&(kind, vaddr, size)| (kind.section(), vaddr, size)),
+    );
+    for (section, vaddr, size) in rebuilt {
         let Some(header) = table.by_name(section) else {
             continue;
         };
         let base = header.index * SHDR_SIZE;
         write_u64_le(&mut shdrs, base + SH_ADDR, vaddr);
-        write_u64_le(
-            &mut shdrs,
-            base + SH_OFFSET,
-            seg_file_offset + (vaddr - plan.load_address),
-        );
+        write_u64_le(&mut shdrs, base + SH_OFFSET, offset_of(vaddr));
         write_u64_le(&mut shdrs, base + SH_SIZE, size);
     }
 
@@ -539,6 +547,38 @@ fn rewrite_section_headers(
         write_u64_le(&mut shdr, SH_OFFSET, seg_file_offset + region.range.start);
         write_u64_le(&mut shdr, SH_SIZE, region.size());
         write_u64_le(&mut shdr, SH_ADDRALIGN, crate::layout::PAGE_SIZE);
+        shdrs.extend_from_slice(&shdr);
+        added += 1;
+    }
+
+    // An array the merge rebuilt that the executable had no header for needs
+    // one added rather than repointed, and `.preinit_array` is that for
+    // essentially every executable: the merge is what introduces the preinit
+    // array, so a linker had no reason to emit a header for it. Left out, the
+    // merged binary carried a live `DT_PREINIT_ARRAY` naming the merged
+    // libraries' constructors while the section table said nothing about them
+    // — `readelf -x .preinit_array` answered "does not exist", and the only
+    // header covering those bytes was `.solder.data`, which describes them as
+    // untyped `SHT_PROGBITS`. That is the same gap repointing `.fini_array`
+    // closed for the destructors, and the constructors still had it.
+    for &(kind, vaddr, size) in &rebuilt_arrays {
+        if table.by_name(kind.section()).is_some() {
+            continue;
+        }
+        let name_off = append_name(&mut names, kind.section());
+
+        let mut shdr = [0u8; SHDR_SIZE];
+        write_u32_le(&mut shdr, SH_NAME, name_off);
+        write_u32_le(&mut shdr, SH_TYPE, kind.section_type());
+        // `SHF_ALLOC | SHF_WRITE` is what a linker gives these arrays, and it
+        // is what the merged region's writable run actually is: the array sits
+        // there because `ld.so` rebases each entry before calling it.
+        write_u64_le(&mut shdr, SH_FLAGS, (SHF_ALLOC | SHF_WRITE).0);
+        write_u64_le(&mut shdr, SH_ADDR, vaddr);
+        write_u64_le(&mut shdr, SH_OFFSET, offset_of(vaddr));
+        write_u64_le(&mut shdr, SH_SIZE, size);
+        write_u64_le(&mut shdr, SH_ADDRALIGN, ARRAY_ENTRY_SIZE);
+        write_u64_le(&mut shdr, SH_ENTSIZE, ARRAY_ENTRY_SIZE);
         shdrs.extend_from_slice(&shdr);
         added += 1;
     }
@@ -1409,6 +1449,99 @@ mod section_header_tests {
         assert_eq!(
             described, fini.entries,
             "'.fini_array' at offset {at:#x} names the wrong bytes"
+        );
+    }
+
+    /// The merged libraries' constructors go into a `DT_PREINIT_ARRAY` the
+    /// executable did not have, so — unlike every other table the merge
+    /// rebuilds — there is no header to repoint and one has to be added.
+    /// Without it the merged binary named the constructors in `.dynamic` and
+    /// nowhere else: `readelf -x .preinit_array` reported no such section, and
+    /// the only header covering those bytes was `.solder.data`, which calls
+    /// them untyped `SHT_PROGBITS`.
+    #[test]
+    fn the_rebuilt_preinit_array_gets_a_section_header_of_its_own() {
+        use crate::elf_reader::{SH_ENTSIZE, SH_TYPE};
+        use crate::types::InitFiniEntry;
+        use goblin::elf::dynamic::{DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ};
+
+        // The fixture is an ordinary linker output, so the premise holds: no
+        // header to repoint, which is what makes this a header to add.
+        let original = std::fs::read(GREP).expect("read the fixture");
+        assert!(
+            section_table(&original).by_name(".preinit_array").is_none(),
+            "test/grep already has a .preinit_array; the test proves nothing"
+        );
+
+        let out = tempfile::NamedTempFile::new().expect("temp output");
+        std::fs::copy(GREP, out.path()).expect("seed the output with the fixture");
+        let lib = PathBuf::from("/nonexistent/libtest.so.1");
+        let plan = merge_grep_over_with(
+            out.path(),
+            InitFiniArrays {
+                init_entries: vec![InitFiniEntry {
+                    source_lib: lib.clone(),
+                    unit_name: "fn_a".to_owned(),
+                }],
+                fini_entries: Vec::new(),
+            },
+            std::slice::from_ref(&lib),
+        );
+        let bytes = std::fs::read(out.path()).expect("read the merged output back");
+
+        let preinit = &plan
+            .init_fini
+            .as_ref()
+            .expect("a rebuilt preinit array")
+            .preinit;
+        assert_eq!(
+            preinit.entries.len(),
+            1,
+            "the merged constructor, test/grep having none of its own"
+        );
+
+        let dynamic = DynamicTable::parse(&bytes).expect("parse .dynamic of the merged output");
+        let va = dynamic.value_of(DT_PREINIT_ARRAY).expect("DT_PREINIT_ARRAY");
+        let size = dynamic
+            .value_of(DT_PREINIT_ARRAYSZ)
+            .expect("DT_PREINIT_ARRAYSZ");
+        let table = section_table(&bytes);
+        let header = section(&table, ".preinit_array");
+        assert_eq!(
+            header.addr, va,
+            "'.preinit_array' describes {:#x} but the loader reads {va:#x}",
+            header.addr
+        );
+        assert_eq!(header.size, size, "'.preinit_array' is the wrong size");
+
+        // A reader that goes by `sh_type` has to see a list of initializers
+        // rather than bytes, and `sh_entsize` is how it knows how many.
+        let raw = table.offset + header.index * SHDR_SIZE;
+        assert_eq!(
+            u32::from_le_bytes(bytes[raw + SH_TYPE..raw + SH_TYPE + 4].try_into().unwrap()),
+            object::elf::SHT_PREINIT_ARRAY.0,
+            "'.preinit_array' is not typed as a preinit array"
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                bytes[raw + SH_ENTSIZE..raw + SH_ENTSIZE + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            ARRAY_ENTRY_SIZE,
+            "'.preinit_array' entries are 8-byte function pointers"
+        );
+
+        // And the header's file offset has to reach the same words the loader
+        // will call: `readelf -x` and `objcopy` read a section through that.
+        let at = header.offset as usize;
+        let described: Vec<u64> = bytes[at..at + header.size as usize]
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
+            .collect();
+        assert_eq!(
+            described, preinit.entries,
+            "'.preinit_array' at offset {at:#x} names the wrong bytes"
         );
     }
 

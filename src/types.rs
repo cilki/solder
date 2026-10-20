@@ -79,17 +79,33 @@ impl InitFiniKind {
         }
     }
 
-    /// The section that described the executable's own array of this kind.
+    /// The section that describes the executable's array of this kind.
     ///
     /// The merge rebuilds the array in the merged segment and repoints the
     /// `DT_*` pair above at it, so this is the header that has to be repointed
     /// with it: everything that reads section headers rather than `PT_DYNAMIC`
     /// — `readelf`, `objdump`, `gdb` — otherwise goes on describing the
-    /// pre-merge array (see `rewrite_section_headers`).
+    /// pre-merge array (see `rewrite_section_headers`). Where the executable
+    /// had no array of this kind the header does not exist yet and is added
+    /// under this name instead.
     pub fn section(self) -> &'static str {
         match self {
             Self::Preinit => ".preinit_array",
             Self::Fini => ".fini_array",
+        }
+    }
+
+    /// `sh_type` of that section.
+    ///
+    /// Needed because the merge has to *create* the header whenever the
+    /// executable had no array of this kind — overwhelmingly the case for
+    /// `.preinit_array`, which the merge is what introduces. The type is what
+    /// tells a reader those bytes are a list of functions the loader calls
+    /// rather than untyped data.
+    pub fn section_type(self) -> u32 {
+        match self {
+            Self::Preinit => object::elf::SHT_PREINIT_ARRAY.0,
+            Self::Fini => object::elf::SHT_FINI_ARRAY.0,
         }
     }
 
@@ -101,6 +117,11 @@ impl InitFiniKind {
         }
     }
 }
+
+/// One entry of an init/fini array: a function pointer, so a 64-bit address.
+/// It is `sh_entsize` of the section describing the array as well as the
+/// divisor its `DT_*_ARRAYSZ` is counted in.
+pub const ARRAY_ENTRY_SIZE: u64 = 8;
 
 /// A function-pointer array laid out in the merged segment.
 #[derive(Debug, Clone)]
@@ -120,7 +141,7 @@ pub struct MergedArray {
 impl MergedArray {
     /// Size in bytes, for the matching `DT_*_ARRAYSZ`.
     pub fn size(&self) -> u64 {
-        (self.entries.len() * 8) as u64
+        self.entries.len() as u64 * ARRAY_ENTRY_SIZE
     }
 }
 
