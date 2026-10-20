@@ -373,16 +373,6 @@ struct UnitRelocs {
     got_fixups: Vec<(u64, String, bool)>,
 }
 
-impl UnitRelocs {
-    /// Whether a relocation already covers `offset`, so a later pass leaves
-    /// the target an earlier one resolved alone.
-    fn covers(&self, offset: u64) -> bool {
-        self.relocations
-            .iter()
-            .any(|r| r.offset_within_unit == offset)
-    }
-}
-
 /// A synthetic PC-relative relocation over a displacement the instruction
 /// scanner found, at `offset` bytes into the unit being extracted. Every
 /// scanned reference is patched the same way — only the displacement width,
@@ -679,87 +669,25 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
     };
     let alignment = unit_alignment(sym_vaddr, section.align());
 
-    // Collect relocations that fall within this symbol's byte range.
-    for (roff, reloc) in section.relocations() {
-        // Only care about relocations within our symbol's byte range.
-        if roff < sym_vaddr || roff >= sym_vaddr + sym_size as u64 {
-            continue;
-        }
-        let offset_within_unit = roff - sym_vaddr;
-
-        // Validate relocation kind.
-        let kind = reloc.kind();
-        let encoding = reloc.encoding();
-        reject_got_reloc(kind, encoding, &key.sym, &lib_path)?;
-
-        // Resolve the relocation target symbol.
-        let target_sym = match reloc.target() {
-            object::RelocationTarget::Symbol(si) => elf64.symbol_by_index(si).ok(),
-            _ => None,
-        };
-
-        let target = if let Some(ts) = target_sym {
-            let ts_name = ts.name().unwrap_or("").to_owned();
-            let ts_in_section = matches!(ts.section(), object::SymbolSection::Section(_));
-            if ts.is_undefined() || ts_name.is_empty() || !ts_in_section {
-                // Undefined, unnamed, or absolute (e.g. a GNU version-node
-                // pseudo-symbol like NCURSESW6_*, which is SHN_ABS with value 0).
-                // None of these are extractable units, so route them through the
-                // same resolution as externals: (1) executable's exports, then
-                // (2) other merged libraries; anything else is fatal.
-                if state.external_syms.contains(&ts_name) || ts_name.is_empty() {
-                    RelocTarget::External(ts_name)
-                } else if let Some(other_lib) = state.cross_lib_syms.get(&ts_name).cloned() {
-                    state.depend_on(UnitKey {
-                        lib: other_lib,
-                        sym: ts_name,
-                    })
-                } else {
-                    bail!(
-                        "symbol '{}' in {}: references external symbol '{}' which is not \
-                         exported by the executable — cannot merge this library",
-                        key.sym,
-                        lib_path.display(),
-                        ts_name
-                    );
-                }
-            } else {
-                // Internal to the library (or another merged lib). A data
-                // symbol is reached through the blob holding its whole
-                // section, which `ensure_data_blob_extracted` copies on the
-                // first reference into that section and finds again on every
-                // later one.
-                let ts_vaddr = ts.address();
-                match ensure_data_blob_extracted(lib, ts_vaddr, state) {
-                    Ok(Some((blob_id, blob_base))) => {
-                        RelocTarget::DataBlobOffset(blob_id, ts_vaddr - blob_base)
-                    }
-                    // Not in a data section: a code symbol or something
-                    // unrecognized, extracted as a unit of its own.
-                    _ => state.depend_on(UnitKey {
-                        lib: key.lib,
-                        sym: ts_name,
-                    }),
-                }
-            }
-        } else {
-            // Section-relative or absolute with no symbol — treat as fixed.
-            RelocTarget::MergedUnit(UnitId(u32::MAX))
-        };
-
-        relocs.relocations.push(ExtractedReloc {
-            offset_within_unit,
-            kind,
-            encoding,
-            size: reloc.size(),
-            addend: reloc.addend(),
-            target,
-        });
-    }
-
     // Data symbol units: pick up .rela.dyn entries within the symbol's range
     // (e.g. __dso_handle's self-pointing RELATIVE, function pointers in .data).
-    // Section-attached relocation tables don't exist in linked shared objects.
+    //
+    // The dynamic table is the *only* one an extracted unit can draw from. A
+    // linked shared object — all solder merges, since `validate_merge_library`
+    // insists on `ET_DYN` — keeps its relocations in `.rela.dyn`/`.rela.plt`,
+    // whose `sh_link` names `.dynsym`; the section-attached `.rela.<section>`
+    // tables, which name `.symtab`, were consumed by the link. And `object`
+    // maps a section to a relocation table only when that table is linked to
+    // `.symtab` (`RelocationSections::parse`), so `ObjectSection::relocations`
+    // is empty for every section of every library solder reads — see
+    // `a_linked_library_has_no_section_attached_relocations`.
+    //
+    // `process_symbol` used to walk that empty iterator and resolve its
+    // targets through rules of its own: a second copy of the resolution
+    // below, which knew nothing of a copied GOT slot or of a symbol the
+    // executable copy-relocates, and which answered a relocation with no
+    // symbol with a `UnitId(u32::MAX)` that nothing ever extracts — a
+    // `MergedUnit` target the relocator could only fail on.
     if section_kind != SectionKind::Text {
         collect_dynamic_range_relocs(
             lib,
@@ -795,11 +723,6 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
 
             // Skip references within our own function
             if target_addr >= sym_vaddr && target_addr < sym_vaddr + sym_size as u64 {
-                continue;
-            }
-
-            // Check if there's already a relocation at this offset (from .rela.text)
-            if relocs.covers(rip_ref.offset as u64) {
                 continue;
             }
 
@@ -1889,11 +1812,11 @@ fn collect_dynamic_range_relocs(
     let Some(dyn_relocs) = lib.elf.dynamic_relocations() else {
         return Ok(());
     };
-    // Which offsets already carry a relocation, so a dynamic entry does not
-    // overwrite one the caller already resolved. Scanning `relocs` for each
-    // candidate instead made this quadratic in the number of relocations in
-    // range: `libcrypto.so.3`'s `.data.rel.ro` is half a megabyte of pointers
-    // covered by ~25k `R_X86_64_RELATIVE` entries, and the pairwise
+    // Which offsets this pass has already filled, so two entries naming the
+    // same slot leave the first resolution standing. Scanning `relocs` for
+    // each candidate instead made this quadratic in the number of relocations
+    // in range: `libcrypto.so.3`'s `.data.rel.ro` is half a megabyte of
+    // pointers covered by ~25k `R_X86_64_RELATIVE` entries, and the pairwise
     // comparisons alone were most of the extraction.
     let mut occupied: HashSet<u64> = relocs
         .relocations
@@ -2325,6 +2248,43 @@ mod tests {
         UnitKey {
             lib: state.lib_id(lib),
             sym: sym.to_string(),
+        }
+    }
+
+    /// A linked shared object has no section-attached relocation table, so
+    /// `.rela.dyn`/`.rela.plt` — reached through `dynamic_relocations` — is
+    /// the only place an extracted unit's relocations can come from.
+    ///
+    /// This is the premise `collect_dynamic_range_relocs` rests on, and it is
+    /// worth holding to the real libraries rather than to the ELF spec: an
+    /// input that did carry a section-attached table would have the
+    /// relocations in it silently dropped, so every pointer they cover would
+    /// keep the stale library address it was copied with. The fixtures span
+    /// what solder is pointed at — a 6 MB C library, a PCRE build, ncurses'
+    /// terminfo — and none of them has one.
+    #[test]
+    fn a_linked_library_has_no_section_attached_relocations() {
+        for name in ["libcrypto.so.3", "libpcre2-8.so.0", "libtinfo.so.6"] {
+            let bytes = std::fs::read(test_lib(name)).expect("read the fixture");
+            let elf = parse_lib(&bytes);
+
+            // The fixture has to have dynamic relocations at all, or the
+            // assertion below holds for the wrong reason.
+            let dynamic = elf
+                .dynamic_relocations()
+                .expect("a shared library has dynamic relocations")
+                .count();
+            assert!(dynamic > 0, "{name} reports no dynamic relocations");
+
+            for section in elf.sections() {
+                assert_eq!(
+                    section.relocations().count(),
+                    0,
+                    "{name}: section {:?} reports section-attached relocations, which \
+                     `process_symbol` no longer reads",
+                    section.name()
+                );
+            }
         }
     }
 
