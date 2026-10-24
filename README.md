@@ -44,10 +44,12 @@ component, so spelling glibc `/usr/lib64/libc.so.6` does not get it past the
 list.
 
 Only the symbols the executable actually reaches are merged, together with
-their transitive closure inside the library. How much that leaves behind
-depends entirely on how interconnected the library is, and the closure of even
-a handful of entry points tends to reach most of it. The fixtures under `test/`
-are representative:
+their transitive closure inside the library. What the closure costs today is
+bounded less by how interconnected the library is than by how coarsely the
+merge extracts data: an address no symbol covers makes `solder` copy the whole
+section it lands in and extract everything the pointers in that section name,
+so a single reference into a pointer-dense section pulls in most of the
+library. The fixtures under `test/` show both shapes:
 
 | executable | merged library | before | after |
 | ---------- | -------------- | -----: | ----: |
@@ -55,9 +57,16 @@ are representative:
 | `md5sum`   | `libcrypto.so.3` (6.2M)  |   54K |  5.1M |
 | `bash`     | `libtinfo.so.6` (215K)   | 1.2M  |  1.6M |
 
-So `solder` is a way to drop a runtime dependency, not a way to keep the result
-small. Point `--dry-run` at a binary to see how much a merge would pull in
-before committing to it.
+`grep` is close to the genuine closure of the 19 `pcre2_*` entry points it
+calls. `md5sum` is not: `MD5_Init`, `MD5_Update` and `MD5_Final` between them
+reach about 3K of libcrypto's code, and the 5.1M is libcrypto's `.rodata`,
+`.got`, `.data.rel.ro` and `.data` copied in whole with every function pointer
+in them extracted too. That is a limitation of the extractor, not a property of
+the library — it is tracked in issue #66.
+
+So `solder` is a way to drop a runtime dependency; it is not yet a way to keep
+the result small. Point `--dry-run` at a binary to see how much a merge would
+pull in before committing to it.
 
 ### Inherited dependencies
 
