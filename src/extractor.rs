@@ -12,6 +12,30 @@ use crate::types::{
     SectionKind, UnitId,
 };
 
+/// The map the extractor's own caches are kept in.
+///
+/// Those caches are what extraction spends its time in: a merge of
+/// `libcrypto.so.3` into `test/md5sum` asks them about 69k references into
+/// 10k units, and the profile put a sixth of the whole run inside
+/// `std::collections::HashMap` — most of it SipHash, which is built to be
+/// unpredictable rather than quick and processes its key a byte at a time.
+///
+/// What that buys is resistance to an adversary who can choose keys that
+/// collide, and these keys are chosen by the library being merged: symbol
+/// names out of its `.dynsym`, addresses out of its relocations. The attack
+/// it would mount is a merge that takes longer than it should, against an
+/// attacker who, by the time solder reads the file, has already been handed
+/// something strictly better — solder's whole job is to copy that library's
+/// machine code into the executable and run it. Nothing about the merge's
+/// output depends on the hasher, so the trade is a sixth of the runtime
+/// against a slow merge of a file you are about to execute anyway.
+///
+/// Only the extractor's internal tables are built this way; nothing crossing
+/// a module boundary changes type.
+type FastMap<K, V> = rustc_hash::FxHashMap<K, V>;
+/// The set counterpart of [`FastMap`], for the same reasons.
+type FastSet<T> = rustc_hash::FxHashSet<T>;
+
 /// Relocation type names we explicitly reject with a helpful error.
 fn describe_reloc(
     kind: object::RelocationKind,
@@ -67,7 +91,7 @@ struct DataBlobInfo {
 struct ExtractionState {
     /// The id reserved for each unit the closure has reached, whether or not it
     /// has been extracted yet (see [`ExtractionState::reserve`]).
-    reserved: HashMap<UnitKey, UnitId>,
+    reserved: FastMap<UnitKey, UnitId>,
     /// Units whose id has been reserved but which have not been extracted yet,
     /// each with the id reserved for it. Reserving an id and queueing the
     /// extraction that fulfills it are the same step, so nothing can hand out
@@ -82,46 +106,46 @@ struct ExtractionState {
     /// that gets pushed first. Scanning `units` for a matching id instead made
     /// every one of those lookups O(units), which with ~10k units
     /// (md5sum + libcrypto.so.3) was most of a second of pure comparisons.
-    unit_index: HashMap<UnitId, usize>,
+    unit_index: FastMap<UnitId, usize>,
     next_id: u32,
     /// Symbols that stay external (glibc etc.). Maps name → known.
-    external_syms: HashSet<String>,
+    external_syms: FastSet<String>,
     /// Symbols exported by any merged library, mapped to the library that
     /// defines them. Used to redirect cross-library PLT calls (e.g. libssl
     /// calling into libcore) to direct merged-unit references instead of
     /// leaving the original library-relative PLT offset in place.
-    cross_lib_syms: HashMap<String, LibId>,
+    cross_lib_syms: FastMap<String, LibId>,
     /// Symbols the executable actually DEFINES (subset of `external_syms`,
     /// which also contains the executable's undefined imports).
-    exe_defined_syms: HashSet<String>,
+    exe_defined_syms: FastSet<String>,
     /// Symbols the executable copy-relocates, whose storage is therefore the
     /// executable's and not the defining library's (see
     /// `RelaTables::copy_reloc_symbols`).
-    exe_copy_relocated: HashSet<String>,
+    exe_copy_relocated: FastSet<String>,
     /// Libraries we've already extracted init/fini arrays from.
-    processed_libs: HashSet<LibId>,
+    processed_libs: FastSet<LibId>,
     /// Accumulated init/fini entries from all processed libraries.
     init_fini: InitFiniArrays,
     /// Extracted data section blobs: maps (lib, section index) → blob info
-    data_blobs: HashMap<DataBlobKey, DataBlobInfo>,
+    data_blobs: FastMap<DataBlobKey, DataBlobInfo>,
     /// Which offsets of an extracted data blob already carry a relocation, for
     /// the jump-table pass that is the only thing to append one to a unit
     /// already registered (see [`ExtractionState::claim_blob_offset`]).
-    blob_reloc_offsets: HashMap<UnitId, HashSet<u64>>,
+    blob_reloc_offsets: FastMap<UnitId, FastSet<u64>>,
     /// What each address a reference pointed at resolved to, so the resolution
     /// is done once per address rather than once per reference to it (see
     /// [`reserve_unit_at`]).
-    units_at: HashMap<(LibId, u64), Option<UnitRef>>,
+    units_at: FastMap<(LibId, u64), Option<UnitRef>>,
     /// What the PLT stub at each address resolved to, so a stub is resolved
     /// once rather than once per call site (see [`plt_reference`]).
-    plt_refs: HashMap<(LibId, u64), Option<RelocTarget>>,
+    plt_refs: FastMap<(LibId, u64), Option<RelocTarget>>,
     /// Copied GOT slots that need a GLOB_DAT in the output (see GotSlotFixup).
     got_slot_fixups: Vec<GotSlotFixup>,
     /// Every library extraction has touched, in the order it first saw them;
     /// a [`LibId`] is a position in here (see [`ExtractionState::lib_id`]).
     lib_paths: Vec<Rc<Path>>,
     /// The reverse of `lib_paths`, consulted only when a path first turns up.
-    lib_ids: HashMap<Rc<Path>, LibId>,
+    lib_ids: FastMap<Rc<Path>, LibId>,
     /// Cache of raw library bytes, indexed by [`LibId`]. `process_symbol` runs
     /// once per extracted symbol, and a large library (e.g. libcrypto.so.3 at
     /// ~6MB) can yield thousands of symbols; re-reading the whole file from
@@ -322,12 +346,12 @@ pub fn extract_units(
     // Collect symbol names from the executable's .dynsym that merged library code
     // can reference. This includes both defined symbols (callable directly) and
     // undefined/imported symbols (callable through the executable's PLT).
-    let exe_dynsym_names: HashSet<String> = exe_elf
+    let exe_dynsym_names: FastSet<String> = exe_elf
         .dynamic_symbols()
         .filter_map(|s| s.name().ok().map(String::from))
         .filter(|name| !name.is_empty())
         .collect();
-    let exe_defined_syms: HashSet<String> = exe_elf
+    let exe_defined_syms: FastSet<String> = exe_elf
         .dynamic_symbols()
         .filter(|s| !s.is_undefined())
         .filter_map(|s| s.name().ok().map(String::from))
@@ -335,24 +359,24 @@ pub fn extract_units(
         .collect();
 
     let mut state = ExtractionState {
-        reserved: HashMap::new(),
+        reserved: FastMap::default(),
         worklist: VecDeque::new(),
         units: Vec::new(),
-        unit_index: HashMap::new(),
+        unit_index: FastMap::default(),
         next_id: 0,
         external_syms: exe_dynsym_names,
-        cross_lib_syms: HashMap::new(),
+        cross_lib_syms: FastMap::default(),
         exe_defined_syms,
-        exe_copy_relocated: exe_copy_relocated.clone(),
-        processed_libs: HashSet::new(),
+        exe_copy_relocated: exe_copy_relocated.iter().cloned().collect(),
+        processed_libs: FastSet::default(),
         init_fini: InitFiniArrays::default(),
-        data_blobs: HashMap::new(),
-        blob_reloc_offsets: HashMap::new(),
-        units_at: HashMap::new(),
-        plt_refs: HashMap::new(),
+        data_blobs: FastMap::default(),
+        blob_reloc_offsets: FastMap::default(),
+        units_at: FastMap::default(),
+        plt_refs: FastMap::default(),
         got_slot_fixups: Vec::new(),
         lib_paths: Vec::new(),
-        lib_ids: HashMap::new(),
+        lib_ids: FastMap::default(),
         lib_bytes_cache: Vec::new(),
         lib_index_cache: Vec::new(),
     };
@@ -1046,9 +1070,9 @@ struct SymInfo {
 struct LibIndex {
     /// Defined symbols by name, preferring `.symtab` over `.dynsym` (the order
     /// the linear `find_symbol` used). Only symbols in a real section.
-    by_name: HashMap<String, SymInfo>,
+    by_name: FastMap<String, SymInfo>,
     /// First defined symbol name at a given address, `.symtab` before `.dynsym`.
-    addr_to_name: HashMap<u64, String>,
+    addr_to_name: FastMap<u64, String>,
     /// Every defined symbol address paired with its section index (as a plain
     /// `usize`, since `SectionIndex` isn't `Ord`), sorted by address, for
     /// `infer_symbol_size`'s "next symbol boundary" search.
@@ -1059,7 +1083,7 @@ struct LibIndex {
     /// GOT slot address → the external symbol ld.so resolves into it, from the
     /// library's own dynamic relocations. A PLT stub jumps through such a
     /// slot, which is what names the stub (see `plt_target`).
-    got_to_name: HashMap<u64, String>,
+    got_to_name: FastMap<u64, String>,
     /// Exact function bounds from `.eh_frame`, which cover code the symbol
     /// tables say nothing about (see `resolve_owning_unit`).
     fdes: crate::eh_frame::FdeTable,
@@ -1067,8 +1091,8 @@ struct LibIndex {
 
 impl LibIndex {
     fn build(elf: &object::read::elf::ElfFile64<'_>) -> Self {
-        let mut by_name: HashMap<String, SymInfo> = HashMap::new();
-        let mut addr_to_name: HashMap<u64, String> = HashMap::new();
+        let mut by_name: FastMap<String, SymInfo> = FastMap::default();
+        let mut addr_to_name: FastMap<u64, String> = FastMap::default();
         let mut addrs_by_section: Vec<(u64, usize)> = Vec::new();
 
         // Iterate .symtab first, then .dynsym, so first-writer-wins matches the
@@ -1109,7 +1133,7 @@ impl LibIndex {
         // stubs, and `.rela.dyn`, whose GLOB_DATs name the `.plt.got`-style
         // ones. The first entry naming a slot wins; nothing legitimately
         // relocates one slot twice.
-        let mut got_to_name: HashMap<u64, String> = HashMap::new();
+        let mut got_to_name: FastMap<u64, String> = FastMap::default();
         for (got_vaddr, reloc) in elf.dynamic_relocations().into_iter().flatten() {
             let object::RelocationTarget::Symbol(si) = reloc.target() else {
                 continue;
@@ -1861,7 +1885,7 @@ fn collect_dynamic_range_relocs(
     // in range: `libcrypto.so.3`'s `.data.rel.ro` is half a megabyte of
     // pointers covered by ~25k `R_X86_64_RELATIVE` entries, and the pairwise
     // comparisons alone were most of the extraction.
-    let mut occupied: HashSet<u64> = relocs
+    let mut occupied: FastSet<u64> = relocs
         .relocations
         .iter()
         .map(|r| r.offset_within_unit)
@@ -2259,24 +2283,24 @@ mod tests {
 
     fn test_state() -> ExtractionState {
         ExtractionState {
-            reserved: HashMap::new(),
+            reserved: FastMap::default(),
             worklist: VecDeque::new(),
             units: Vec::new(),
-            unit_index: HashMap::new(),
+            unit_index: FastMap::default(),
             next_id: 0,
-            external_syms: HashSet::new(),
-            cross_lib_syms: HashMap::new(),
-            exe_defined_syms: HashSet::new(),
-            exe_copy_relocated: HashSet::new(),
-            processed_libs: HashSet::new(),
+            external_syms: FastSet::default(),
+            cross_lib_syms: FastMap::default(),
+            exe_defined_syms: FastSet::default(),
+            exe_copy_relocated: FastSet::default(),
+            processed_libs: FastSet::default(),
             init_fini: InitFiniArrays::default(),
-            data_blobs: HashMap::new(),
-            blob_reloc_offsets: HashMap::new(),
-            units_at: HashMap::new(),
-            plt_refs: HashMap::new(),
+            data_blobs: FastMap::default(),
+            blob_reloc_offsets: FastMap::default(),
+            units_at: FastMap::default(),
+            plt_refs: FastMap::default(),
             got_slot_fixups: Vec::new(),
             lib_paths: Vec::new(),
-            lib_ids: HashMap::new(),
+            lib_ids: FastMap::default(),
             lib_bytes_cache: Vec::new(),
             lib_index_cache: Vec::new(),
         }
@@ -3279,7 +3303,7 @@ mod tests {
             );
         }
 
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut seen: FastSet<u64> = FastSet::default();
         for reloc in &blob.relocations {
             assert!(
                 seen.insert(reloc.offset_within_unit),
