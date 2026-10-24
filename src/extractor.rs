@@ -69,16 +69,23 @@ struct UnitKey {
     sym: String,
 }
 
-/// Key for data blob deduplication: (library, section index).
+/// Key for data blob deduplication: (library, section index, blob base).
 ///
 /// The section is identified by its index rather than its name for the same
 /// reason the library is: the name has to be read out of `.shstrtab` and
 /// copied before it can be hashed, and this key is built for every address a
 /// scanned reference or a dynamic relocation points at.
+///
+/// `base` is the address the copied range starts at. It is the section's own
+/// address for every section copied whole, and the slot address for a GOT,
+/// which is copied one slot at a time (see [`got_slot_at`]): every address in
+/// a slot maps to the same base, so an exact lookup on this key still finds
+/// the blob a later reference into the same slot wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct DataBlobKey {
     lib: LibId,
     section: object::SectionIndex,
+    base: u64,
 }
 
 /// Info about an extracted data section blob.
@@ -2024,8 +2031,43 @@ fn collect_dynamic_range_relocs(
     Ok(())
 }
 
-/// Extract a data section blob if not already extracted.
-/// Returns the blob's UnitId and base vaddr.
+/// A GOT entry is one pointer wide on every target solder merges.
+const GOT_SLOT_SIZE: u64 = 8;
+
+/// The GOT slot holding `addr`, as `(slot address, slot length)`, if `sec` is a
+/// global offset table at all.
+///
+/// A GOT is the one data section whose objects need no symbol to be bounded:
+/// it is an array of pointer slots, each one written by the loader from its own
+/// dynamic relocation and read by one `mov`/`jmp` naming that slot's address.
+/// Nothing reads a slot as part of a larger object, so copying the eight bytes
+/// a reference lands in is as correct as copying the whole table and much
+/// cheaper — `libcrypto.so.3`'s `.got` is 27,504 bytes holding 3,247 pointers,
+/// and rooting all of them is what turns three MD5 entry points into 91% of
+/// the library (see the `.got` rows of issue #66).
+///
+/// `None` for anything else, including an address past the end of the section
+/// (`find_section_for_address` attributes a gap address to the section before
+/// it, which the caller reaches through an offset past the copied bytes).
+fn got_slot_at(sec: &SectionInfo<'_>, addr: u64) -> Option<(u64, u64)> {
+    if !matches!(sec.name, ".got" | ".got.plt") {
+        return None;
+    }
+    let offset = addr.checked_sub(sec.vaddr)?;
+    if offset >= sec.size {
+        return None;
+    }
+    let slot = sec.vaddr + offset / GOT_SLOT_SIZE * GOT_SLOT_SIZE;
+    // A table whose length is not a whole number of slots would otherwise have
+    // its last slice run past the section.
+    Some((slot, GOT_SLOT_SIZE.min(sec.vaddr + sec.size - slot)))
+}
+
+/// Extract the data holding `target_addr` if it has not been extracted already.
+/// Returns the blob's UnitId and the address its first byte had in the library.
+///
+/// The range copied is the whole containing section, except for a GOT, where it
+/// is the single slot the address falls in ([`got_slot_at`]).
 fn ensure_data_blob_extracted(
     lib: Lib<'_, '_>,
     target_addr: u64,
@@ -2041,9 +2083,17 @@ fn ensure_data_blob_extracted(
         return Ok(None);
     }
 
+    // What to copy: one GOT slot, or the whole section for everything else.
+    let (base_vaddr, blob_len, alignment) = match got_slot_at(&sec, target_addr) {
+        Some((slot, len)) => (slot, len, GOT_SLOT_SIZE),
+        // Conservative alignment for a whole data section.
+        None => (sec.vaddr, sec.size, 32),
+    };
+
     let blob_key = DataBlobKey {
         lib: lib.id,
         section: sec.index,
+        base: base_vaddr,
     };
 
     // Check if already extracted
@@ -2062,6 +2112,14 @@ fn ensure_data_blob_extracted(
         ..
     } = sec;
 
+    // The range to copy, held to the bytes the section actually has:
+    // `describe_section` reports the length of those and not `sh_size`, so a
+    // header claiming more than the file holds cannot make this read past them.
+    let from = (base_vaddr - sec_addr) as usize;
+    let to = (from + blob_len as usize).min(sec_data.len());
+    let mut blob_data = sec_data[from..to].to_vec();
+    let blob_range = base_vaddr..base_vaddr + blob_data.len() as u64;
+
     // Claim the blob's id and register it *before* collecting its relocations.
     // Resolving those relocations can lead back to this same section — directly
     // (a pointer in .data to the start of .data) or through another section
@@ -2070,28 +2128,19 @@ fn ensure_data_blob_extracted(
     // target look unresolvable, and the copied bytes kept the library's own
     // load-time VA, which points into unmapped memory once the library is
     // dropped from DT_NEEDED. It also bounds the mutual recursion with
-    // `collect_dynamic_range_relocs` at one visit per section.
+    // `collect_dynamic_range_relocs` at one visit per range.
     let id = state.alloc_id();
-    state.data_blobs.insert(
-        blob_key,
-        DataBlobInfo {
-            id,
-            base_vaddr: sec_addr,
-        },
-    );
+    state
+        .data_blobs
+        .insert(blob_key, DataBlobInfo { id, base_vaddr });
 
-    // Collect relocations that fall within this data section's byte range.
+    // Collect the relocations that fall inside the copied range — and only
+    // those: a relocation outside it describes bytes this unit does not hold,
+    // and following it would root data nothing here points at.
     let mut relocs = UnitRelocs::default();
-    collect_dynamic_range_relocs(
-        lib,
-        sec_name,
-        sec_addr..sec_addr + sec_data.len() as u64,
-        state,
-        &mut relocs,
-    )?;
+    collect_dynamic_range_relocs(lib, sec_name, blob_range, state, &mut relocs)?;
 
-    let mut sec_data = sec_data;
-    let relocations = state.take_unit_relocs(id, &mut sec_data, relocs);
+    let relocations = state.take_unit_relocs(id, &mut blob_data, relocs);
 
     if !relocations.is_empty() {
         debug!(
@@ -2103,19 +2152,28 @@ fn ensure_data_blob_extracted(
 
     state.push_unit(ExtractedUnit {
         id,
-        name: format!(
-            "{}:{}",
-            lib.path.file_name().unwrap_or_default().to_string_lossy(),
-            sec_name
-        ),
+        name: blob_unit_name(lib.path, sec_name, base_vaddr, sec_addr),
         source_lib: lib.path.to_path_buf(),
-        bytes: sec_data,
+        bytes: blob_data,
         section_kind: sec_kind,
-        alignment: 32, // Conservative alignment for data sections
+        alignment,
         relocations,
     });
 
-    Ok(Some((id, sec_addr)))
+    Ok(Some((id, base_vaddr)))
+}
+
+/// What an extracted blob is called in the merge's own reporting: the library
+/// file and the section it came from, plus the address it starts at when the
+/// blob is only part of that section, so two slots of the same GOT are told
+/// apart in a log line or a dump of the merged units.
+fn blob_unit_name(path: &Path, sec_name: &str, base_vaddr: u64, sec_addr: u64) -> String {
+    let file = path.file_name().unwrap_or_default().to_string_lossy();
+    if base_vaddr == sec_addr {
+        format!("{file}:{sec_name}")
+    } else {
+        format!("{file}:{sec_name}+{:#x}", base_vaddr - sec_addr)
+    }
 }
 
 /// Infer the size of a symbol whose `st_size` is 0, by bounding it with the
@@ -2502,12 +2560,24 @@ mod tests {
     /// to pad its output — so merging `libtinfo.so.6` into it split every one
     /// of them, leaving `tputs` padding from a zeroed copy nothing ever wrote
     /// to.
+    ///
+    /// The two functions extracted here are the ones that read the slots: a GOT
+    /// slot is copied for the code that reads it and not for the rest of the
+    /// table (see [`got_slot_at`]), and `tputs` reaches these two through the
+    /// PLT, which a single-symbol extraction leaves external.
     #[test]
     fn a_variable_the_executable_copy_relocates_is_left_to_ld_so() {
         let mut state = test_state();
-        let key = key_in(&mut state, &test_lib("libtinfo.so.6"), "tputs");
+        let lib = test_lib("libtinfo.so.6");
         state.exe_copy_relocated = ["UP", "PC", "BC"].iter().map(|s| (*s).to_owned()).collect();
-        reserve_and_extract(&key, &mut state).expect("extract tputs");
+        // `tgetent_sp` reads all three of the copy-relocated variables through
+        // the GOT; `set_curterm_sp` reads `ospeed` through it, which is the
+        // control below.
+        for sym in ["tgetent_sp", "set_curterm_sp"] {
+            let key = key_in(&mut state, &lib, sym);
+            reserve_and_extract(&key, &mut state)
+                .unwrap_or_else(|e| panic!("extract {sym}: {e:#}"));
+        }
 
         let fixups: Vec<&str> = state
             .got_slot_fixups
@@ -3115,11 +3185,13 @@ mod tests {
                 process_symbol(&key, id, &mut state).expect("extract the CRT glue");
             }
 
+            let data_section = elf.section_by_name(".data").expect(".data");
             let blob = state
                 .data_blobs
                 .get(&DataBlobKey {
                     lib: lib_id,
-                    section: elf.section_by_name(".data").expect(".data").index(),
+                    section: data_section.index(),
+                    base: data_section.address(),
                 })
                 .expect(".data was not extracted")
                 .id;
@@ -3181,6 +3253,131 @@ mod tests {
                 RelocTarget::DataBlobOffset(id, _) if id == blob_id
             )),
             "no self-referential pointer resolved to the blob itself"
+        );
+    }
+
+    /// Extracting one function copies the GOT slots that function reads and
+    /// leaves the rest of the table in the library.
+    ///
+    /// The whole-table copy this replaces is the first half of the blow-up
+    /// described in issue #66: every pointer in a copied section becomes an
+    /// extraction root, so one function reading one slot used to root all of
+    /// them — in `libcrypto.so.3` that is 3,247 pointers, and they reach 91% of
+    /// the library. `_nc_setupterm` reads seven slots of ncurses' 206-slot
+    /// `.got`, naming each by its own address, and that is all it needs.
+    #[test]
+    fn a_got_reference_copies_the_slot_it_names_and_not_the_table() {
+        let lib = test_lib("libtinfo.so.6");
+        let mut state = test_state();
+        let key = key_in(&mut state, &lib, "_nc_setupterm");
+        reserve_and_extract(&key, &mut state).expect("extract _nc_setupterm");
+
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = parse_lib(&bytes);
+        let got = elf.section_by_name(".got").expect(".got");
+        let (got_addr, got_size) = (got.address(), got.size());
+
+        let slots: Vec<(u64, UnitId)> = state
+            .data_blobs
+            .iter()
+            .filter(|(key, _)| key.section == got.index())
+            .map(|(key, info)| (key.base, info.id))
+            .collect();
+        assert_eq!(
+            slots.len(),
+            7,
+            "expected the seven slots `_nc_setupterm` reads, got {:?}",
+            slots
+                .iter()
+                .map(|(base, _)| base - got_addr)
+                .collect::<Vec<_>>()
+        );
+
+        let mut copied = 0;
+        for (base, id) in &slots {
+            assert_eq!(
+                (base - got_addr) % 8,
+                0,
+                "blob base {base:#x} is not a slot boundary"
+            );
+            let unit = state
+                .units
+                .iter()
+                .find(|u| u.id == *id)
+                .expect("the blob was registered but never pushed");
+            assert_eq!(unit.bytes.len(), 8, "{} is not one slot", unit.name);
+            assert!(
+                unit.relocations.len()
+                    + state
+                        .got_slot_fixups
+                        .iter()
+                        .filter(|f| f.unit == *id)
+                        .count()
+                    <= 1,
+                "{} carries more than the one pointer a slot holds",
+                unit.name
+            );
+            copied += unit.bytes.len() as u64;
+        }
+        assert!(
+            copied * 10 < got_size,
+            "copied {copied} of the {got_size} bytes of .got"
+        );
+    }
+
+    /// Two references into one GOT slot share its blob, and references to
+    /// neighbouring slots get a blob each — the lookup is by slot, not by
+    /// section. A section that is not a GOT is still copied whole, which is
+    /// what an address in it has to resolve against.
+    #[test]
+    fn a_got_is_blobbed_per_slot_and_every_other_section_whole() {
+        let lib = test_lib("libtinfo.so.6");
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = parse_lib(&bytes);
+        let got = elf.section_by_name(".got").expect(".got");
+        let data = elf.section_by_name(".data").expect(".data");
+
+        let mut state = test_state();
+        let lib_id = state.lib_id(&lib);
+        let index = state.lib_index(lib_id, &elf);
+        let handle = Lib {
+            id: lib_id,
+            path: &lib,
+            elf: &elf,
+            index: &index,
+        };
+        let blob_at = |addr: u64, state: &mut ExtractionState| {
+            ensure_data_blob_extracted(handle, addr, state)
+                .expect("extract the blob")
+                .expect("the address is in an extractable section")
+        };
+
+        // A slot in the middle of the table, so neither neighbour is outside it.
+        let slot = got.address() + got.size() / 2 / 8 * 8;
+        let (first, base) = blob_at(slot, &mut state);
+        assert_eq!(base, slot);
+        // The four bytes above the slot's base belong to the same pointer.
+        assert_eq!(blob_at(slot + 4, &mut state), (first, slot));
+        let (next, next_base) = blob_at(slot + 8, &mut state);
+        assert_ne!(next, first, "two slots came out as one blob");
+        assert_eq!(next_base, slot + 8);
+
+        let (data_blob, data_base) = blob_at(data.address() + 8, &mut state);
+        assert_eq!(
+            data_base,
+            data.address(),
+            "a reference into .data resolved against a slice of it"
+        );
+        let unit = state
+            .units
+            .iter()
+            .find(|u| u.id == data_blob)
+            .expect("the .data blob");
+        assert_eq!(
+            unit.bytes.len() as u64,
+            data.size(),
+            "{} is not the whole section",
+            unit.name
         );
     }
 
