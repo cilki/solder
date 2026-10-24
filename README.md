@@ -70,6 +70,28 @@ So `solder` is a way to drop a runtime dependency; it is not yet a way to keep
 the result small. Point `--dry-run` at a binary to see how much a merge would
 pull in before committing to it.
 
+Each section copied whole is reported as it happens — on a real merge as much
+as under `--dry-run` — with what it cost and what reached into it. Two of the
+four lines `md5sum` produces, wrapped here and with their timestamps dropped:
+
+```console
+$ solder md5sum -L ./libs
+WARN solder: ./libs/libcrypto.so.3 .data: merged whole — 10832 bytes and 553
+  pointers that root further extraction — because no symbol and no unwind
+  record bounds the object at 0x633000 that '.solder.anon.0x104020' references
+WARN solder: ./libs/libcrypto.so.3 .data.rel.ro: merged whole — 507008 bytes
+  and 24342 pointers that root further extraction — because no symbol and no
+  unwind record bounds the object at 0x5d9aa0 that '.data' references
+```
+
+What a line attributes the copy to is whatever was being extracted when the
+reference was found: a symbol, a `.solder.anon.<address>` unit standing in for a
+stripped library's local helper, or another section whose own pointers reached
+in. The lines therefore read as a chain, outermost first — above, libcrypto's
+destructor glue has no symbol of its own, touches `.data`, and `.data`'s 553
+pointers are what bring in the half megabyte of `.data.rel.ro` the ASN.1 item
+accessors hang off. `--dry-run` adds the totals to the plan it prints.
+
 ### Inherited dependencies
 
 Merging a library moves its code into the executable but not its own

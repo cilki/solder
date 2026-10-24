@@ -288,6 +288,45 @@ pub struct ExtractedUnit {
     pub relocations: Vec<ExtractedReloc>,
 }
 
+/// A data section the merge copied in full because it could not bound the
+/// object that was referenced inside it.
+///
+/// Extraction reaches a data address through a symbol, through an unwind
+/// record, or — failing both — through a blob of the containing section. A GOT
+/// is sliced per slot, which is exact; every other section is copied whole,
+/// and then *every* pointer in it is followed and whatever it points at is
+/// extracted too. One reference to one unnamed word therefore roots the
+/// section's entire pointer graph: on `test/md5sum` + `libcrypto.so.3`, where
+/// the three MD5 entry points reach about 3K of code between them, a
+/// symbol-less destructor helper's reference into `.data` is what brings in
+/// most of the library.
+///
+/// There is no bound to apply here that does not risk truncating a data object
+/// (see issue #66), so the merge keeps copying whole and reports each copy
+/// instead: the cost is otherwise invisible, since the output is correct and
+/// only its size, its injected imports and its inherited `DT_NEEDED` entries
+/// give the blow-up away.
+#[derive(Debug, Clone)]
+pub struct WholeSectionCopy {
+    /// The library the section was copied out of.
+    pub library: PathBuf,
+    /// The section's name, e.g. `.data.rel.ro`.
+    pub section: String,
+    /// Bytes copied — the whole of the section's contents.
+    pub bytes: usize,
+    /// How many pointers the copied range holds: the dynamic relocations over
+    /// it, each of which the merge has to make valid and so each of which
+    /// roots whatever it points at. This is the number that decides how much
+    /// the copy drags in, and it is zero for a section ld.so never writes to —
+    /// a `.rodata` copied whole is expensive in bytes only.
+    pub pointers: usize,
+    /// The address whose reference caused the copy.
+    pub address: u64,
+    /// The unit being extracted when that reference was found: a symbol name,
+    /// or the name of another section whose own pointers reached in here.
+    pub reached_from: String,
+}
+
 /// An extracted unit with its assigned virtual address in the merged segment.
 #[derive(Debug)]
 pub struct AssignedUnit {
