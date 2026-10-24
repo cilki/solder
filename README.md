@@ -54,15 +54,17 @@ library. The fixtures under `test/` show both shapes:
 | executable | merged library | before | after |
 | ---------- | -------------- | -----: | ----: |
 | `grep`     | `libpcre2-8.so.0` (695K) |  198K |  871K |
-| `md5sum`   | `libcrypto.so.3` (6.2M)  |   54K |  5.1M |
+| `md5sum`   | `libcrypto.so.3` (6.2M)  |   54K |  4.7M |
 | `bash`     | `libtinfo.so.6` (215K)   | 1.2M  |  1.6M |
 
 `grep` is close to the genuine closure of the 19 `pcre2_*` entry points it
 calls. `md5sum` is not: `MD5_Init`, `MD5_Update` and `MD5_Final` between them
-reach about 3K of libcrypto's code, and the 5.1M is libcrypto's `.rodata`,
-`.got`, `.data.rel.ro` and `.data` copied in whole with every function pointer
-in them extracted too. That is a limitation of the extractor, not a property of
-the library — it is tracked in issue #66.
+reach about 3K of libcrypto's code, and the 4.7M is libcrypto's `.rodata`,
+`.data.rel.ro` and `.data` copied in whole with every function pointer in them
+extracted too. A GOT is the one data section extracted at the granularity it is
+read at — one slot per reference — so it no longer contributes; the rest is a
+limitation of the extractor, not a property of the library, and is tracked in
+issue #66.
 
 So `solder` is a way to drop a runtime dependency; it is not yet a way to keep
 the result small. Point `--dry-run` at a binary to see how much a merge would
