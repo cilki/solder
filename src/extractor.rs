@@ -104,6 +104,10 @@ struct ExtractionState {
     init_fini: InitFiniArrays,
     /// Extracted data section blobs: maps (lib, section index) → blob info
     data_blobs: HashMap<DataBlobKey, DataBlobInfo>,
+    /// Which offsets of an extracted data blob already carry a relocation, for
+    /// the jump-table pass that is the only thing to append one to a unit
+    /// already registered (see [`ExtractionState::claim_blob_offset`]).
+    blob_reloc_offsets: HashMap<UnitId, HashSet<u64>>,
     /// What each address a reference pointed at resolved to, so the resolution
     /// is done once per address rather than once per reference to it (see
     /// [`reserve_unit_at`]).
@@ -174,9 +178,51 @@ impl ExtractionState {
     /// publishes a blob's id before collecting its relocations, so that a
     /// pointer leading back into the same section resolves to it instead of
     /// being left stale.
+    fn unit(&self, id: UnitId) -> Option<&ExtractedUnit> {
+        let idx = *self.unit_index.get(&id)?;
+        self.units.get(idx)
+    }
+
+    /// The registered unit with `id`, mutably. See [`ExtractionState::unit`]
+    /// for when there is none.
     fn unit_mut(&mut self, id: UnitId) -> Option<&mut ExtractedUnit> {
         let idx = *self.unit_index.get(&id)?;
         self.units.get_mut(idx)
+    }
+
+    /// Take the offset `offset` within data blob `id` for a relocation, or
+    /// report `false` because one is already there.
+    ///
+    /// The blob holding a jump table is reached again by every function that
+    /// branches through one, and two tables detected from different functions
+    /// can overlap on the same entries, so each entry has to be checked
+    /// against what the blob already holds. Searching the blob's relocation
+    /// list for that made the pass quadratic: `libcrypto.so.3` keeps every
+    /// jump table in one `.rodata`, whose blob ends up with tens of thousands
+    /// of relocations, and each candidate entry walked all of them — a tenth
+    /// of the whole run on `test/md5sum` + `libcrypto.so.3`.
+    ///
+    /// The set is seeded from the blob's own relocations the first time it is
+    /// asked about, which is sound because they are all collected before
+    /// `ensure_data_blob_extracted` registers the unit, and nothing but this
+    /// appends to a registered unit's list afterwards.
+    fn claim_blob_offset(&mut self, id: UnitId, offset: u64) -> bool {
+        if !self.blob_reloc_offsets.contains_key(&id) {
+            let taken = self
+                .unit(id)
+                .map(|unit| {
+                    unit.relocations
+                        .iter()
+                        .map(|r| r.offset_within_unit)
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.blob_reloc_offsets.insert(id, taken);
+        }
+        self.blob_reloc_offsets
+            .get_mut(&id)
+            .expect("the entry was just inserted")
+            .insert(offset)
     }
 
     /// The id `path` is interned under, assigning it one on first sight.
@@ -301,6 +347,7 @@ pub fn extract_units(
         processed_libs: HashSet::new(),
         init_fini: InitFiniArrays::default(),
         data_blobs: HashMap::new(),
+        blob_reloc_offsets: HashMap::new(),
         units_at: HashMap::new(),
         plt_refs: HashMap::new(),
         got_slot_fixups: Vec::new(),
@@ -842,16 +889,9 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
                 for (idx, target_addr) in table.targets.iter().enumerate() {
                     let entry_offset_in_blob = (table.table_vaddr - blob_base) + (idx * 4) as u64;
 
-                    let Some(blob_unit) = state.unit_mut(blob_id) else {
-                        continue;
-                    };
                     // Skip if a relocation already exists at this offset (from another
                     // function detecting an overlapping table at the same .rodata address)
-                    if blob_unit
-                        .relocations
-                        .iter()
-                        .any(|r| r.offset_within_unit == entry_offset_in_blob)
-                    {
+                    if !state.claim_blob_offset(blob_id, entry_offset_in_blob) {
                         continue;
                     }
 
@@ -878,6 +918,9 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
                     // target is this very unit — `detect_jump_tables` keeps no
                     // other — and this unit's id is the one reserved for it at
                     // the top, so the entry needs no placeholder.
+                    let Some(blob_unit) = state.unit_mut(blob_id) else {
+                        continue;
+                    };
                     blob_unit.relocations.push(pcrel_reloc(
                         entry_offset_in_blob,
                         32,
@@ -2228,6 +2271,7 @@ mod tests {
             processed_libs: HashSet::new(),
             init_fini: InitFiniArrays::default(),
             data_blobs: HashMap::new(),
+            blob_reloc_offsets: HashMap::new(),
             units_at: HashMap::new(),
             plt_refs: HashMap::new(),
             got_slot_fixups: Vec::new(),
@@ -3193,6 +3237,57 @@ mod tests {
             .filter(|r| matches!(r.target, RelocTarget::MergedUnit(id) if id == owner))
             .count();
         assert_eq!(entries, 32, "the switch tables lost their entries");
+    }
+
+    /// Two jump tables can overlap in `.rodata`, and each is found again by
+    /// the function that branches through it, so the blob holding both is
+    /// offered the shared entries twice. The second offer has to be refused:
+    /// an entry with two relocations over its four bytes is patched twice, and
+    /// whichever function relocated last takes the branch for both.
+    ///
+    /// `libpcre2-8.so.0` has the case. Two symbol-less helpers at `0x63d0` and
+    /// `0x6070` switch through tables at `0x7e8a4` and `0x7e6c8`, which run
+    /// into each other, and both tables land in the one `.rodata` blob.
+    #[test]
+    fn an_entry_two_overlapping_jump_tables_share_is_relocated_once() {
+        let path = test_lib("libpcre2-8.so.0");
+        let mut state = test_state();
+        let mut owners = Vec::new();
+        for addr in [0x63d0u64, 0x6070] {
+            let key = key_in(&mut state, &path, &anon_unit_name(addr));
+            let id = state.reserve(key.clone());
+            process_symbol(&key, id, &mut state)
+                .unwrap_or_else(|e| panic!("extracting the helper at {addr:#x}: {e:#}"));
+            owners.push(id);
+        }
+
+        let blob = state
+            .units
+            .iter()
+            .find(|u| u.name.ends_with(":.rodata"))
+            .expect("the switch tables pull in a .rodata blob");
+
+        // Both helpers put entries in it, or the overlap under test never
+        // happened and the assertion below would pass on nothing.
+        for (addr, owner) in [0x63d0u64, 0x6070].iter().zip(&owners) {
+            assert!(
+                blob.relocations
+                    .iter()
+                    .any(|r| matches!(r.target, RelocTarget::MergedUnit(id) if id == *owner)),
+                "the table of the helper at {addr:#x} left no entry in {}",
+                blob.name
+            );
+        }
+
+        let mut seen: HashSet<u64> = HashSet::new();
+        for reloc in &blob.relocations {
+            assert!(
+                seen.insert(reloc.offset_within_unit),
+                "{} carries two relocations over offset {}",
+                blob.name,
+                reloc.offset_within_unit
+            );
+        }
     }
 
     /// The extent `decode_to_code_bound` settles on is what keeps the
