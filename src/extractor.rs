@@ -119,6 +119,14 @@ struct DataBlobInfo {
     /// sits in, since a relocation's bytes have to be kept (see
     /// [`grow_data_blob`]).
     rooted_from: u64,
+    /// How far from `base_vaddr` the references that say how much they read
+    /// reach, and how far the ones that say nothing reach through
+    /// [`needed_prefix`]'s fallback — the next object the library names, or the
+    /// section. The copy's extent is the larger of the two; *which* of them it
+    /// is, is what [`DataSectionCopy::end_unbounded`] reports, and a tie goes
+    /// to the reads, since they justify the end on their own.
+    read_to: u64,
+    fallback_to: u64,
     /// Where the blob's entry in [`ExtractionState::data_section_copies`] is,
     /// so growing the copy can keep the reported cost current. `None` for a
     /// GOT slice, which is exactly bounded and is not reported.
@@ -1149,6 +1157,13 @@ struct LibIndex {
     /// `usize`, since `SectionIndex` isn't `Ord`), sorted by address, for
     /// `infer_symbol_size`'s "next symbol boundary" search.
     addrs_by_section: Vec<(u64, usize)>,
+    /// The same for the symbols that have a size, which are the addresses at
+    /// which the library is known to start an object of its own. A zero-size
+    /// symbol is a boundary marker and owns nothing — `resolve_owning_unit`
+    /// declines to let one own an address — so it is no evidence that an
+    /// unnamed object ends there, which is what [`needed_prefix`] needs of a
+    /// bound.
+    object_addrs_by_section: Vec<(u64, usize)>,
     /// `(start address, size, section index)` of each PLT section, so a
     /// scanned code reference can be recognised as a stub (see `plt_target`).
     plt_spans: Vec<(u64, u64, object::SectionIndex)>,
@@ -1166,6 +1181,7 @@ impl LibIndex {
         let mut by_name: FastMap<String, SymInfo> = FastMap::default();
         let mut addr_to_name: FastMap<u64, String> = FastMap::default();
         let mut addrs_by_section: Vec<(u64, usize)> = Vec::new();
+        let mut object_addrs_by_section: Vec<(u64, usize)> = Vec::new();
 
         // Iterate .symtab first, then .dynsym, so first-writer-wins matches the
         // ".symtab preferred" order of the original linear scans.
@@ -1175,6 +1191,9 @@ impl LibIndex {
             };
             let addr = sym.address();
             addrs_by_section.push((addr, si.0));
+            if sym.size() > 0 {
+                object_addrs_by_section.push((addr, si.0));
+            }
 
             let Ok(name) = sym.name() else { continue };
             if name.is_empty() {
@@ -1193,6 +1212,8 @@ impl LibIndex {
 
         addrs_by_section.sort_unstable();
         addrs_by_section.dedup();
+        object_addrs_by_section.sort_unstable();
+        object_addrs_by_section.dedup();
 
         let plt_spans: Vec<(u64, u64, object::SectionIndex)> = elf
             .sections()
@@ -1231,6 +1252,7 @@ impl LibIndex {
             by_name,
             addr_to_name,
             addrs_by_section,
+            object_addrs_by_section,
             plt_spans,
             got_to_name,
             fdes,
@@ -1252,12 +1274,28 @@ impl LibIndex {
 
     /// Smallest defined-symbol address greater than `addr` within `section`.
     fn next_addr_in_section(&self, addr: u64, section: object::SectionIndex) -> Option<u64> {
-        let start = self.addrs_by_section.partition_point(|&(a, _)| a <= addr);
-        self.addrs_by_section[start..]
-            .iter()
-            .find(|&&(_, s)| s == section.0)
-            .map(|&(a, _)| a)
+        next_in_section(&self.addrs_by_section, addr, section)
     }
+
+    /// Smallest address greater than `addr` at which `section` holds an object
+    /// the library both names and gives a size.
+    fn next_object_in_section(&self, addr: u64, section: object::SectionIndex) -> Option<u64> {
+        next_in_section(&self.object_addrs_by_section, addr, section)
+    }
+}
+
+/// Smallest address in `addrs` greater than `addr` that belongs to `section`.
+/// `addrs` is `(address, section index)` sorted by address.
+fn next_in_section(
+    addrs: &[(u64, usize)],
+    addr: u64,
+    section: object::SectionIndex,
+) -> Option<u64> {
+    let start = addrs.partition_point(|&(a, _)| a <= addr);
+    addrs[start..]
+        .iter()
+        .find(|&&(_, s)| s == section.0)
+        .map(|&(a, _)| a)
 }
 
 /// One library as extraction sees it: the file it came from, its parsed ELF,
@@ -2210,8 +2248,24 @@ fn got_slot_at(sec: &SectionInfo<'_>, addr: u64) -> Option<(u64, u64)> {
 /// correct as copying the rest of the section and leaves the rest of the
 /// section's pointers unrooted. `None` is a reference that says nothing about
 /// the size of what it points at — an address taken by `lea`, or a pointer
-/// slot holding one — and the only range that is then certainly big enough is
-/// the section.
+/// slot holding one.
+///
+/// Such a reference is bounded by the next thing the library *does* name: two
+/// distinct objects do not overlap, so the unnamed object at `target_addr`
+/// cannot run into the one the next sized symbol in the section starts, and
+/// that symbol's address is an end for it. It is the same bound
+/// [`infer_symbol_size`] puts on a symbol whose own size the tables leave at
+/// zero, and it is the only one available here. It holds for an address
+/// *inside* a named object too — one `resolve_owning_unit` could not attribute
+/// because no symbol starts there — since the next object after it is past the
+/// end of the one that covers it, so the copy still reaches the whole of it.
+///
+/// A stripped library names nothing in its data sections and falls back to the
+/// section, which is where an extraction far larger than the symbols asked for
+/// comes from (issue #66). One that exports its variables does better:
+/// `libtinfo.so.6` names nine objects in its 12,168-byte `.data.rel.ro`, and
+/// the unnamed 96 bytes `test/bash` reaches between two of them used to copy
+/// the 8,136 bytes from there to the section's end and root 1,003 pointers.
 ///
 /// The copy runs from the section's first byte rather than from `target_addr`
 /// so that one blob serves every reference into the section: anchored at the
@@ -2230,17 +2284,24 @@ fn got_slot_at(sec: &SectionInfo<'_>, addr: u64) -> Option<(u64, u64)> {
 /// compared and subtracted, never read through. `resolve_owning_unit` already
 /// declines to let a zero-size symbol at the same place own anything, for the
 /// same reason; this is the unnamed case of it.
-fn needed_prefix(sec: &SectionInfo<'_>, target_addr: u64, access_len: Option<u64>) -> u64 {
-    if target_addr >= sec.vaddr.saturating_add(sec.size) {
+fn needed_prefix(
+    lib: Lib<'_, '_>,
+    sec: &SectionInfo<'_>,
+    target_addr: u64,
+    access_len: Option<u64>,
+) -> u64 {
+    let sec_end = sec.vaddr.saturating_add(sec.size);
+    if target_addr >= sec_end {
         return 0;
     }
-    match access_len {
-        Some(len) => target_addr
-            .saturating_add(len)
-            .saturating_sub(sec.vaddr)
-            .min(sec.size),
-        None => sec.size,
-    }
+    let end = match access_len {
+        Some(len) => target_addr.saturating_add(len),
+        None => lib
+            .index
+            .next_object_in_section(target_addr, sec.index)
+            .unwrap_or(sec_end),
+    };
+    end.saturating_sub(sec.vaddr).min(sec.size)
 }
 
 /// Extract the data holding `target_addr` if it has not been extracted already.
@@ -2276,7 +2337,7 @@ fn ensure_data_blob_extracted(
         Some((slot, len)) => (slot, len, GOT_SLOT_SIZE, false),
         None => (
             sec.vaddr,
-            needed_prefix(&sec, target_addr, access_len),
+            needed_prefix(lib, &sec, target_addr, access_len),
             DATA_BLOB_ALIGNMENT,
             true,
         ),
@@ -2322,6 +2383,7 @@ fn ensure_data_blob_extracted(
                     start_offset: 0,
                     unreferenced_prefix: sec.size as usize,
                     pointers: 0,
+                    end_unbounded: false,
                     address: target_addr,
                     reached_from: ctx.to_string(),
                 });
@@ -2334,6 +2396,8 @@ fn ensure_data_blob_extracted(
                 copied: 0,
                 first_ref: u64::MAX,
                 rooted_from: u64::MAX,
+                read_to: 0,
+                fallback_to: 0,
                 report,
             };
             state.data_blobs.insert(blob_key, info);
@@ -2357,13 +2421,23 @@ fn ensure_data_blob_extracted(
     // resolve against the blob, and what
     // `DataSectionCopy::unreferenced_prefix` reports of whatever it could not.
     let offset = target_addr - base_vaddr;
-    let first_ref = {
+    let (first_ref, end_unbounded) = {
         let info = state
             .data_blobs
             .get_mut(&blob_key)
             .expect("the blob is registered above");
         info.first_ref = info.first_ref.min(offset);
-        info.first_ref
+        // Whichever kind of reference reaches furthest is the one that decides
+        // where the copy ends, and so the one the report is about: a read
+        // reaching past an unbounded reference's fallback end bounds the copy
+        // after all, and an unbounded one reaching past every read takes the
+        // report back.
+        if access_len.is_some() {
+            info.read_to = info.read_to.max(needed);
+        } else {
+            info.fallback_to = info.fallback_to.max(needed);
+        }
+        (info.first_ref, info.fallback_to > info.read_to)
     };
 
     grow_data_blob(lib, &sec, blob_key, needed, state)?;
@@ -2374,6 +2448,7 @@ fn ensure_data_blob_extracted(
         // the section's last byte and asks for nothing copied — and what
         // precedes the first reference is then no part of the copy.
         copy.unreferenced_prefix = first_ref.min(copy.bytes as u64) as usize;
+        copy.end_unbounded = end_unbounded;
     }
 
     Ok(Some((info.id, info.base_vaddr)))
@@ -3813,7 +3888,8 @@ mod tests {
     /// Two references into one GOT slot share its blob, and references to
     /// neighbouring slots get a blob each — the lookup is by slot, not by
     /// section. A section that is not a GOT is copied from its first byte, and
-    /// an unbounded reference into it takes the whole of it.
+    /// an unbounded reference into it takes everything up to the next object
+    /// the library names.
     #[test]
     fn a_got_is_blobbed_per_slot_and_every_other_section_from_its_start() {
         let lib = test_lib("libtinfo.so.6");
@@ -3858,11 +3934,18 @@ mod tests {
             .iter()
             .find(|u| u.id == data_blob)
             .expect("the .data blob");
+        let next = index
+            .next_object_in_section(data.address() + 8, data.index())
+            .expect("libtinfo names its variables, so .data has an object in it");
         assert_eq!(
             unit.bytes.len() as u64,
-            data.size(),
-            "{} is not the whole section",
+            next - data.address(),
+            "{} does not stop at the next symbol in the section",
             unit.name
+        );
+        assert!(
+            next < data.address() + data.size(),
+            "the bound is the section's end, so nothing was proved"
         );
     }
 
@@ -3938,8 +4021,8 @@ mod tests {
             .find(|c| c.section == ".data.rel.ro")
             .expect("the .data.rel.ro copy is recorded");
         assert!(
-            !copy.runs_to_section_end(),
-            "{copy:?} is not a whole section"
+            !copy.is_whole_section() && !copy.end_unbounded,
+            "{copy:?} is bounded by the bytes the reads touch"
         );
         assert_eq!(copy.bytes, 0x408);
         assert_eq!(copy.section_bytes as u64, sec_size);
@@ -4055,10 +4138,7 @@ mod tests {
             (referenced - moved, unit.bytes.len() as u64)
         );
         assert_eq!(copy.unreferenced_prefix as u64, moved);
-        assert!(
-            !copy.runs_to_section_end() && !copy.is_oversized(),
-            "{copy:?}"
-        );
+        assert!(!copy.is_whole_section() && !copy.is_oversized(), "{copy:?}");
     }
 
     /// Where a data copy's pointers are, as offsets from its base: its own
@@ -4301,6 +4381,177 @@ mod tests {
         assert_no_stale_pointers(&state, &elf, blob, sec_addr);
     }
 
+    /// An unnamed object between two the library *does* name is bounded above
+    /// by the one over it: two distinct objects do not overlap, so an object
+    /// with no symbol of its own cannot run into the address a symbol gives.
+    /// That is the only end bound available for a reference that says nothing
+    /// about the size of what it points at, and it is the one
+    /// [`infer_symbol_size`] already puts on a symbol whose size the tables
+    /// leave at zero.
+    ///
+    /// It is what `test/bash` costs: `libtinfo.so.6` pads between the nine
+    /// tables it exports from `.data.rel.ro`, a pointer slot reaches into one
+    /// of those gaps, and the copy used to run from there to the end of the
+    /// section — 8,136 bytes rooting 1,003 pointers for a few unnamed words
+    /// (issue #66).
+    #[test]
+    fn an_unnamed_object_is_bounded_by_the_next_symbol_in_its_section() {
+        let lib = test_lib("libtinfo.so.6");
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = parse_lib(&bytes);
+        let sec = elf.section_by_name(".data.rel.ro").expect(".data.rel.ro");
+        let (sec_addr, sec_size, sec_index) = (sec.address(), sec.size(), sec.index());
+
+        // The first byte of padding between two of the library's exported
+        // tables: no symbol covers it, so a reference to it has to fall back on
+        // the section's symbols for an end.
+        let mut named: Vec<(u64, u64)> = elf
+            .dynamic_symbols()
+            .filter(|s| s.section_index() == Some(sec_index) && s.size() > 0)
+            .map(|s| (s.address(), s.size()))
+            .collect();
+        named.sort_unstable();
+        let gap = named
+            .windows(2)
+            .find_map(|w| (w[0].0 + w[0].1 < w[1].0).then_some(w[0].0 + w[0].1))
+            .expect("fixture moved: libtinfo pads between its exported tables");
+
+        let mut state = test_state();
+        let lib_id = state.lib_id(&lib);
+        let index = state.lib_index(lib_id, &elf);
+        let handle = Lib {
+            id: lib_id,
+            path: &lib,
+            elf: &elf,
+            index: &index,
+        };
+        let (blob, base) = ensure_data_blob_extracted(handle, "the test", gap, None, &mut state)
+            .expect("copy .data.rel.ro")
+            .expect(".data.rel.ro is extractable");
+        assert_eq!(base, sec_addr, "the copy is still anchored at the section");
+
+        // The copy reaches the next symbol and stops there, rather than at the
+        // section's end.
+        let next = index
+            .next_object_in_section(gap, sec_index)
+            .expect("an object above the gap");
+        assert!(
+            gap < next && next < sec_addr + sec_size,
+            "the gap at {gap:#x} is not between two symbols of a {sec_size}-byte section"
+        );
+        let blob_len = |state: &ExtractionState| {
+            state
+                .units
+                .iter()
+                .find(|u| u.id == blob)
+                .expect("the .data.rel.ro copy")
+                .bytes
+                .len() as u64
+        };
+        assert_eq!(blob_len(&state), next - sec_addr);
+
+        // And the run below the reference goes back as it does for a bounded
+        // one, leaving the unnamed object itself plus its alignment padding.
+        trim_unreferenced_prefixes(&mut state);
+        assert!(
+            blob_len(&state) <= next - gap + DATA_BLOB_ALIGNMENT,
+            "the copy kept {} bytes for the {} unnamed ones at {gap:#x}",
+            blob_len(&state),
+            next - gap
+        );
+
+        // The pointers that buys: the section holds over a thousand, and what
+        // the merge now has to make valid is the handful inside the copy.
+        let in_section = elf
+            .dynamic_relocations()
+            .expect("dynamic relocations")
+            .filter(|(roff, _)| (sec_addr..sec_addr + sec_size).contains(roff))
+            .count();
+        let rooted = blob_pointers(&state, blob).len();
+        assert!(
+            in_section > 1_000 && rooted * 100 < in_section,
+            "{rooted} of the section's {in_section} pointers are still rooted"
+        );
+
+        let copy = state
+            .data_section_copies
+            .iter()
+            .find(|c| c.section == ".data.rel.ro")
+            .expect("the .data.rel.ro copy is recorded");
+        assert!(
+            copy.end_unbounded && !copy.is_whole_section(),
+            "a copy bounded by the next symbol is still a copy no reference \
+             bounded: {copy:?}"
+        );
+        assert_no_stale_pointers(&state, &elf, blob, sec_addr + copy.start_offset as u64);
+    }
+
+    /// A zero-size symbol is a boundary marker rather than the start of an
+    /// object, so it is no evidence that an unnamed object below it ends there
+    /// and the copy has to reach the next object the library gives a size.
+    /// Cutting at a marker is the one way bounding by the symbol table could
+    /// truncate a live object; `resolve_owning_unit` declines to let such a
+    /// symbol own an address for the same reason.
+    #[test]
+    fn a_zero_size_symbol_does_not_bound_a_copy() {
+        const MARKER: &str = "numcodes";
+
+        /// The object the copy stopped at, and how long it came out, for the
+        /// unnamed padding immediately below `MARKER` in `.data.rel.ro`.
+        fn bound_below_the_marker(path: &std::path::Path) -> (u64, u64) {
+            let bytes = std::fs::read(path).expect("read the library");
+            let elf = parse_lib(&bytes);
+            let sec = elf.section_by_name(".data.rel.ro").expect(".data.rel.ro");
+            let marker = elf
+                .dynamic_symbols()
+                .find(|s| s.name() == Ok(MARKER))
+                .unwrap_or_else(|| panic!("libtinfo.so.6 has no {MARKER}"))
+                .address();
+
+            let mut state = test_state();
+            let lib_id = state.lib_id(path);
+            let index = state.lib_index(lib_id, &elf);
+            let handle = Lib {
+                id: lib_id,
+                path,
+                elf: &elf,
+                index: &index,
+            };
+            let gap = marker - POINTER_SIZE;
+            let (blob, base) =
+                ensure_data_blob_extracted(handle, "the test", gap, None, &mut state)
+                    .expect("copy .data.rel.ro")
+                    .expect(".data.rel.ro is extractable");
+            assert_eq!(base, sec.address());
+            let len = state
+                .units
+                .iter()
+                .find(|u| u.id == blob)
+                .expect("the .data.rel.ro copy")
+                .bytes
+                .len() as u64;
+            let next = index
+                .next_object_in_section(gap, sec.index())
+                .expect("an object above the gap");
+            assert_eq!(len, next - sec.address(), "the copy overran its bound");
+            (next, len)
+        }
+
+        let (next, len) = bound_below_the_marker(&test_lib("libtinfo.so.6"));
+        let marker = next;
+
+        // The same library with that object's size zeroed: the marker no longer
+        // says anything ends there, so the bound is whatever the library sizes
+        // above it.
+        let doctored = lib_with_symbol_size(MARKER, 0);
+        let (past, longer) = bound_below_the_marker(doctored.path());
+        assert!(
+            past > marker && longer > len,
+            "a zero-size symbol at {marker:#x} bounded the copy at {longer} bytes \
+             as if it owned something"
+        );
+    }
+
     /// The whole of issue #66, held to the closure it is about: the three MD5
     /// entry points `test/md5sum` imports, plus the constructors and
     /// destructors every merged library brings with it, against a stripped
@@ -4470,13 +4721,14 @@ mod tests {
                 state.data_section_copies
             );
         };
-        assert!(!copy.runs_to_section_end());
+        assert!(!copy.is_whole_section());
         assert_eq!((copy.bytes, copy.section_bytes as u64), (8, data_size));
     }
 
     /// `lea` is the reference that cannot be bounded: it hands out an address
-    /// and says nothing about what lives there, so the copy has to run to the
-    /// end of the section. A load of the same address through the same
+    /// and says nothing about what lives there, so the copy has to run to
+    /// whatever the library itself names above it. A load of the same address
+    /// through the same
     /// displacement does say, and iced is where both answers come from — so
     /// hold it to them rather than to the documentation.
     #[test]
@@ -4509,13 +4761,14 @@ mod tests {
         assert_eq!(bounds, lens, "the scan dropped or reordered a bound");
     }
 
-    /// Copying a whole section is the only step of the merge with no bound on
-    /// it, and the pointers it roots are what turn a handful of imported
-    /// symbols into most of a library (issue #66). Each such copy is recorded
-    /// with the section, what it cost and what reached into it; a GOT slice is
-    /// exactly bounded and is not one of them.
+    /// A copy whose end comes from [`needed_prefix`]'s fallback rather than
+    /// from what the merged code reads is the only step of the merge with no
+    /// bound of its own, and the pointers it roots are what turn a handful of
+    /// imported symbols into most of a library (issue #66). Each such copy is
+    /// recorded with the section, what it cost and what reached into it; a GOT
+    /// slice is exactly bounded and is not one of them.
     #[test]
-    fn a_section_merged_whole_is_recorded_and_a_got_slot_is_not() {
+    fn a_section_copied_for_want_of_a_bound_is_recorded_and_a_got_slot_is_not() {
         let lib = test_lib("libtinfo.so.6");
         let bytes = std::fs::read(&lib).expect("read library");
         let elf = parse_lib(&bytes);
@@ -4567,7 +4820,11 @@ mod tests {
             .find(|u| u.id == blob)
             .expect("the .data blob");
         assert_eq!(copy.bytes, unit.bytes.len());
-        assert_eq!(copy.bytes as u64, data.size(), "not the whole section");
+        assert!(
+            copy.end_unbounded && copy.is_oversized(),
+            "a reference that says nothing about what it points at is the case \
+             this report exists for: {copy:?}"
+        );
         let fixups = state
             .got_slot_fixups
             .iter()
@@ -4575,6 +4832,26 @@ mod tests {
             .count();
         assert_eq!(copy.pointers, unit.relocations.len() + fixups);
         assert!(copy.pointers > 0, "libtinfo's .data holds pointers");
+        let bytes_copied = copy.bytes;
+
+        // A read that reaches exactly as far as the copy already does bounds
+        // its end after all, and the line goes away: the bytes it holds are
+        // bytes the merged code reads, whatever first asked for them.
+        let last = data.address() + bytes_copied as u64 - 8;
+        ensure_data_blob_extracted(handle, "a caller", last, Some(8), &mut state)
+            .expect("read the last word of the copy")
+            .expect(".data is extractable");
+        let [copy] = &state.data_section_copies[..] else {
+            panic!(
+                "a second copy was reported: {:?}",
+                state.data_section_copies
+            );
+        };
+        assert_eq!(copy.bytes, bytes_copied, "the read extended the copy");
+        assert!(
+            !copy.end_unbounded && !copy.is_oversized(),
+            "the copy is the bytes the merged code reads: {copy:?}"
+        );
     }
 
     /// A section reached through another copied section's pointers is recorded

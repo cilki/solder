@@ -309,9 +309,11 @@ pub const DATA_BLOB_ALIGNMENT: u64 = 32;
 /// with a memory operand says how many bytes it touches, so the copy stops
 /// where the furthest of them does; an address taken by `lea`, or stored in a
 /// pointer slot, says nothing about the size of what lives there, and the copy
-/// has to run to the end of the section. One such reference therefore roots
-/// the section's whole pointer graph, which is where an extraction far larger
-/// than the symbols asked for comes from (see issue #66).
+/// has to run to the next object the library names — or, in a library that
+/// names nothing in its data sections, to the end of the section. One such
+/// reference therefore roots every pointer up to there, which is where an
+/// extraction far larger than the symbols asked for comes from (see issue
+/// #66).
 ///
 /// Either way the cost is otherwise invisible — the output is correct, and
 /// only its size, its injected imports and its inherited `DT_NEEDED` entries
@@ -344,6 +346,13 @@ pub struct DataSectionCopy {
     /// the copy drags in, and it is zero for a section ld.so never writes to —
     /// a `.rodata` copied whole is expensive in bytes only.
     pub pointers: usize,
+    /// Whether the reference that reaches furthest into the section is one
+    /// that says nothing about the size of what it points at, so the copy ends
+    /// where the next symbol or the section does rather than where the merged
+    /// code stops reading. That is the one step of the merge with no bound of
+    /// its own, and the bytes and pointers between the last read and that end
+    /// are what it costs.
+    pub end_unbounded: bool,
     /// The address whose reference caused the copy.
     pub address: u64,
     /// The unit being extracted when that reference was found: a symbol name,
@@ -352,11 +361,11 @@ pub struct DataSectionCopy {
 }
 
 impl DataSectionCopy {
-    /// Whether the copy runs to the end of the section because nothing bounded
-    /// what the reference reads — the one step of the merge with no bound on
-    /// it.
-    pub fn runs_to_section_end(&self) -> bool {
-        self.start_offset + self.bytes >= self.section_bytes
+    /// Whether the copy takes the whole of the section's contents. A copy
+    /// never holds more than `section_bytes - start_offset`, so this also says
+    /// it starts at the section's first byte.
+    pub fn is_whole_section(&self) -> bool {
+        self.bytes >= self.section_bytes
     }
 
     /// Whether the copy holds bytes nothing asked for. A bounded copy that
@@ -365,7 +374,7 @@ impl DataSectionCopy {
     /// one carrying no more than the alignment padding under its first
     /// reference.
     pub fn is_oversized(&self) -> bool {
-        self.runs_to_section_end() || self.unreferenced_prefix as u64 >= DATA_BLOB_ALIGNMENT
+        self.end_unbounded || self.unreferenced_prefix as u64 >= DATA_BLOB_ALIGNMENT
     }
 }
 

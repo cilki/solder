@@ -167,21 +167,22 @@ fn run() -> Result<()> {
     // symbols asked for. A copy that is exactly the bytes referenced is not
     // worth a line; the two that are each explain themselves differently.
     for copy in data_section_copies.iter().filter(|c| c.is_oversized()) {
-        if copy.runs_to_section_end() {
-            // The copy's end is where the section's is, so what it took is
-            // either all of the section or everything from its first reference
-            // on.
-            let extent = if copy.start_offset == 0 {
+        if copy.end_unbounded {
+            // Nothing says where the referenced object ends, so the copy runs
+            // to the next thing the library does name — and in a library that
+            // names nothing in its data sections, that is the section's end.
+            let extent = if copy.is_whole_section() {
                 format!("merged whole — {} bytes", copy.bytes)
             } else {
                 format!(
-                    "merged {} of {} bytes, everything from offset {} on",
+                    "merged {} of {} bytes from offset {}, up to the next symbol \
+                     the library defines in it,",
                     copy.bytes, copy.section_bytes, copy.start_offset
                 )
             };
             warn!(
-                "{} {}: {extent} and {} pointers that root further extraction — \
-                 because no symbol and no unwind record bounds the object at \
+                "{} {}: {extent} and {} pointers that root further extraction \
+                 — because no symbol and no unwind record bounds the object at \
                  {:#x} that '{}' references, and the reference says nothing \
                  about its size either",
                 copy.library.display(),
@@ -578,16 +579,16 @@ fn render_merge_plan(
     if !data_section_copies.is_empty() {
         let bytes: usize = data_section_copies.iter().map(|c| c.bytes).sum();
         let pointers: usize = data_section_copies.iter().map(|c| c.pointers).sum();
-        let whole = data_section_copies
+        let unbounded = data_section_copies
             .iter()
-            .filter(|c| c.runs_to_section_end())
+            .filter(|c| c.end_unbounded)
             .count();
         say!(
-            "  data sections copied for want of a symbol: {} ({} of them whole \
-             for want of a bound, {} bytes, {} pointers rooting further \
-             extraction)",
+            "  data sections copied for want of a symbol: {} ({} of them with no \
+             bound but the next symbol or the section's end, {} bytes, {} \
+             pointers rooting further extraction)",
             data_section_copies.len(),
-            whole,
+            unbounded,
             bytes,
             pointers
         );
@@ -725,13 +726,16 @@ mod dry_run_report_tests {
     }
 
     /// A copy of `bytes` bytes out of a `section_bytes`-byte section, starting
-    /// at `start_offset` — so it runs to the section's end, and counts as one
-    /// of the "whole for want of a bound" copies, only when it reaches it.
+    /// at `start_offset`. `end_unbounded` is what the totals line counts
+    /// apart: the furthest reference into the section said nothing about the
+    /// size of what it points at, so the copy ends where the next symbol or
+    /// the section does rather than where the merged code stops reading.
     fn copy(
         bytes: usize,
         section_bytes: usize,
         start_offset: usize,
         pointers: usize,
+        end_unbounded: bool,
     ) -> DataSectionCopy {
         DataSectionCopy {
             library: PathBuf::from("/opt/lib/libfoo.so.1"),
@@ -741,6 +745,7 @@ mod dry_run_report_tests {
             start_offset,
             unreferenced_prefix: 0,
             pointers,
+            end_unbounded,
             address: 0x1000,
             reached_from: "foo".to_owned(),
         }
@@ -841,19 +846,25 @@ mod dry_run_report_tests {
     }
 
     /// The data-copy totals sum the bytes and pointers of every copy, and
-    /// count separately the ones that ran to their section's end — the copies
-    /// nothing bounded, which are the ones worth acting on.
+    /// count separately the ones whose end nothing bounded — the copies worth
+    /// acting on. A copy cut at the next symbol the library names is one of
+    /// them while taking a sliver of its section, so counting the copies that
+    /// run to their section's end instead would miss it.
     #[test]
     fn data_copy_totals_count_the_unbounded_copies_apart() {
-        let copies = [copy(400, 400, 0, 9), copy(64, 4096, 128, 2)];
+        let copies = [
+            copy(96, 12168, 4032, 9, true),
+            copy(64, 4096, 128, 2, false),
+        ];
         let needed = ["libfoo.so.1".to_owned()];
 
         let report = render_merge_plan(Path::new("/tmp/app"), &plan(), &[], &needed, &copies);
 
         assert!(
             report.contains(
-                "data sections copied for want of a symbol: 2 (1 of them whole for want \
-                 of a bound, 464 bytes, 11 pointers rooting further extraction)"
+                "data sections copied for want of a symbol: 2 (1 of them with no bound \
+                 but the next symbol or the section's end, 160 bytes, 11 pointers \
+                 rooting further extraction)"
             ),
             "{report}"
         );
