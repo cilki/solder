@@ -108,6 +108,17 @@ struct DataBlobInfo {
     /// where the copy can start once nothing more will be resolved against it
     /// (see [`trim_unreferenced_prefixes`]).
     first_ref: u64,
+    /// The lowest offset from `base_vaddr` whose dynamic relocations have been
+    /// resolved, and so the low end of the one contiguous range
+    /// `[rooted_from, copied)` they have been collected over. `u64::MAX` until
+    /// the first collection.
+    ///
+    /// Only the bytes that can still reach the output are worth resolving: a
+    /// pointer below the first reference is in a run the copy gives back, and
+    /// rooting it would extract what it names for nothing — and pin the run it
+    /// sits in, since a relocation's bytes have to be kept (see
+    /// [`grow_data_blob`]).
+    rooted_from: u64,
     /// Where the blob's entry in [`ExtractionState::data_section_copies`] is,
     /// so growing the copy can keep the reported cost current. `None` for a
     /// GOT slice, which is exactly bounded and is not reported.
@@ -2322,6 +2333,7 @@ fn ensure_data_blob_extracted(
                 base_vaddr,
                 copied: 0,
                 first_ref: u64::MAX,
+                rooted_from: u64::MAX,
                 report,
             };
             state.data_blobs.insert(blob_key, info);
@@ -2368,11 +2380,27 @@ fn ensure_data_blob_extracted(
 }
 
 /// Copy enough of `sec` into the blob `key` names that it holds `needed` bytes
-/// from its base, collecting the dynamic relocations over every byte added.
+/// from its base, collecting the dynamic relocations over the bytes that can
+/// still reach the output.
 ///
 /// Nothing is removed and nothing moves: the blob only ever gains bytes at its
 /// end, so the offsets of the references already resolved against it — and of
 /// the relocations already collected for it — stay what they were.
+///
+/// The relocations are collected over the bytes from the copy's eventual start
+/// up, not over every byte copied. The run below the first reference is carried
+/// only so that the copy can be anchored at the section while the closure is
+/// being built, and [`trim_unreferenced_prefixes`] gives it back at the end —
+/// so resolving a pointer down there would extract what it names for nothing,
+/// and worse, pin the run it sits in: a relocation describes bytes the copy has
+/// to keep, which is what stopped the trim short of exactly the pointer-dense
+/// sections it would help most. `test/bash` + `libtinfo.so.6` rooted all 1,500
+/// pointers of a `.data.rel.ro` first referenced 4,032 bytes in, and then had
+/// to keep every byte below that reference because of them (issue #66).
+///
+/// That start only ever moves down, and whenever it does the run it exposes is
+/// collected then: a later, lower reference is the one thing that can turn a
+/// pointer the copy was going to give back into one it has to keep.
 fn grow_data_blob(
     lib: Lib<'_, '_>,
     sec: &SectionInfo<'_>,
@@ -2384,17 +2412,33 @@ fn grow_data_blob(
         .data_blobs
         .get(&key)
         .expect("the blob is registered before it is grown");
-    if info.copied >= needed {
+    let id = info.id;
+    let want = info.copied.max(needed);
+    let align = state
+        .unit(id)
+        .expect("the blob unit was pushed with the blob")
+        .alignment;
+    // Where the copy will start once the run below its first reference is
+    // given back, which is the lowest byte of it that can reach the output.
+    // The trim moves in multiples of the blob's alignment, so this does too.
+    let kept_from = (info.first_ref / align * align).min(want);
+    // A relocation is passed over only when every byte it describes is below
+    // that: one straddling the cut still writes bytes the copy keeps, so it
+    // has to be resolved — and the bytes it needs held — like any other.
+    let root_from = kept_from.saturating_sub(POINTER_SIZE - 1);
+    // A reference at or past the section's last byte asks for nothing copied,
+    // and a blob with no bytes has neither bytes to resolve nor a run to give
+    // back (see [`needed_prefix`]).
+    if want == 0 || (info.copied >= needed && info.rooted_from <= root_from) {
         return Ok(());
     }
-    let id = info.id;
 
     // Publish the longer extent before reading the bytes, for the same reason
     // the id is published before the relocations are collected: resolving them
     // can lead back into this very range, and the lookup has to find it rather
     // than start a second copy of the same bytes. It also bounds the mutual
     // recursion with `collect_dynamic_range_relocs` at one visit per range.
-    state.data_blobs.get_mut(&key).expect("just read").copied = needed;
+    state.data_blobs.get_mut(&key).expect("just read").copied = want;
 
     // Only now that the section is known to need copying are its bytes worth
     // materializing: most of the addresses `ensure_data_blob_extracted` is
@@ -2406,32 +2450,46 @@ fn grow_data_blob(
     let sec_data = section_contents(lib.elf, sec)?;
     let from = (info.base_vaddr - sec.vaddr) as usize;
     let start = (from + info.copied as usize).min(sec_data.len());
-    let end = (from + needed as usize).min(sec_data.len());
+    let end = (from + want as usize).min(sec_data.len());
     let added = &sec_data[start..end];
-    let added_range =
-        info.base_vaddr + info.copied..info.base_vaddr + info.copied + added.len() as u64;
+    let held = info.copied + added.len() as u64;
     state
         .unit_mut(id)
         .expect("the blob unit was pushed with the blob")
         .bytes
         .extend_from_slice(added);
 
-    // Collect the relocations that fall inside the bytes just added — and only
-    // those: a relocation outside the copied range describes bytes this unit
-    // does not hold, and following it would root data nothing here points at.
-    // The ones over the bytes copied earlier were collected then.
+    // The two runs of kept bytes whose relocations nothing has resolved yet:
+    // the one just copied onto the end, and — when this call is what lowered
+    // the start — the one that reference exposed underneath. Everything outside
+    // them is resolved already, or describes bytes this unit does not hold, or
+    // describes bytes it does not keep.
+    //
+    // They meet the range already resolved from either side and overlap neither
+    // it nor each other: a relocation collected twice would be deduplicated as
+    // a relocation but counted twice as a GOT slot the loader has to write.
+    //
     // The section's own name is the context for what its pointers reach, not
     // the caller's: a copy pulled in through this one is reported as having
     // been reached from here, which is what makes the records read as a chain.
+    let base = info.base_vaddr;
+    let resolved_from = info.rooted_from.min(info.copied).min(held);
+    let exposed = base + root_from.min(resolved_from)..base + resolved_from;
+    let appended = base + info.copied.max(root_from)..base + held;
+    // Published before either range is collected, because collecting can lead
+    // back here — and only once there are bytes, so that a blob still waiting
+    // for its first byte does not read as having had them resolved.
+    if held > 0 {
+        let info = state.data_blobs.get_mut(&key).expect("just read");
+        info.rooted_from = info.rooted_from.min(root_from);
+    }
     let mut relocs = UnitRelocs::default();
-    collect_dynamic_range_relocs(
-        lib,
-        sec.name,
-        added_range,
-        info.base_vaddr,
-        state,
-        &mut relocs,
-    )?;
+    for range in [exposed, appended] {
+        if range.is_empty() {
+            continue;
+        }
+        collect_dynamic_range_relocs(lib, sec.name, range, base, state, &mut relocs)?;
+    }
     let got_fixups = relocs.got_fixups.len();
 
     // `register_got_slot_fixups` zeroes the slots it records, so the bytes have
@@ -2503,9 +2561,10 @@ fn grow_data_blob(
 /// * the lowest pointer the copy carries. A relocation describes bytes the
 ///   copy holds, and whatever it names is in the merge *because* of it, so
 ///   dropping those bytes would leave that extraction reachable from nothing
-///   rather than remove it. The pointer-dense sections a reference cannot
-///   bound are exactly the ones this stops short in, and what to do about them
-///   is the part of issue #66 still waiting on a decision.
+///   rather than remove it. [`grow_data_blob`] is what keeps that from
+///   stopping the trim at a pointer nothing reaches: a pointer below the first
+///   reference is never resolved in the first place, so the only relocation
+///   this bound can still find is one straddling the cut.
 fn trim_unreferenced_prefixes(state: &mut ExtractionState) {
     let mut lowest_fixup: FastMap<UnitId, u64> = FastMap::default();
     for fixup in &state.got_slot_fixups {
@@ -4002,18 +4061,83 @@ mod tests {
         );
     }
 
-    /// How far up a copy can start is bounded by the lowest pointer it carries:
-    /// that pointer is why whatever it names is in the merge at all, so
-    /// dropping the bytes holding it would leave that extraction reachable from
-    /// nothing rather than remove it. A GOT slice is already exactly the slot
-    /// it was asked for and must not move at all.
+    /// Where a data copy's pointers are, as offsets from its base: its own
+    /// relocations and the GOT slots the loader has to write into it.
+    fn blob_pointers(state: &ExtractionState, id: UnitId) -> Vec<u64> {
+        let unit = state.units.iter().find(|u| u.id == id).expect("the blob");
+        let mut offsets: Vec<u64> = unit
+            .relocations
+            .iter()
+            .map(|r| r.offset_within_unit)
+            .chain(
+                state
+                    .got_slot_fixups
+                    .iter()
+                    .filter(|f| f.unit == id)
+                    .map(|f| f.offset),
+            )
+            .collect();
+        offsets.sort_unstable();
+        offsets
+    }
+
+    /// Check that every byte the copy keeps whose value the loader wrote is
+    /// written by the merged binary too: for each dynamic relocation of the
+    /// library inside the copy's extent there is a relocation or a GOT fixup at
+    /// the matching offset. A pointer a copy keeps but does not resolve holds
+    /// the library's own load-time VA, which addresses unmapped memory once the
+    /// library is dropped from `DT_NEEDED` — and that is the one way skipping a
+    /// pointer below a reference could go wrong.
+    fn assert_no_stale_pointers(
+        state: &ExtractionState,
+        elf: &object::read::elf::ElfFile64<'_>,
+        id: UnitId,
+        start_vaddr: u64,
+    ) {
+        let unit = state.units.iter().find(|u| u.id == id).expect("the blob");
+        let held = start_vaddr..start_vaddr + unit.bytes.len() as u64;
+        let resolved: FastSet<u64> = blob_pointers(state, id).into_iter().collect();
+        for (roff, _) in elf.dynamic_relocations().expect("dynamic relocations") {
+            assert!(
+                !held.contains(&roff) || resolved.contains(&(roff - start_vaddr)),
+                "{}: the pointer at {roff:#x} is kept but left at its library VA",
+                unit.name
+            );
+        }
+    }
+
+    /// A copy roots no pointer below the reference that reached into it. The
+    /// run underneath is one [`trim_unreferenced_prefixes`] gives back, so a
+    /// pointer down there names an extraction nothing in the merged binary can
+    /// reach — and resolving it would pin the run it sits in, since a
+    /// relocation describes bytes the copy has to keep.
+    ///
+    /// That is what used to stop the trim at exactly the sections it would help
+    /// most: `libtinfo.so.6`'s `.data.rel.ro` is 12,168 bytes of pointers, and
+    /// a reference 0x800 bytes in rooted every one of them and then had to keep
+    /// every byte below itself for them (issue #66). A GOT slice is already
+    /// exactly the slot it was asked for and must not move at all.
     #[test]
-    fn a_copy_keeps_the_prefix_holding_the_pointers_the_merge_rests_on() {
+    fn a_copy_roots_no_pointer_below_the_reference_that_reached_into_it() {
+        const REFERENCE: u64 = 0x800;
+
         let lib = test_lib("libtinfo.so.6");
         let bytes = std::fs::read(&lib).expect("read library");
         let elf = parse_lib(&bytes);
         let sec = elf.section_by_name(".data.rel.ro").expect(".data.rel.ro");
         let sec_addr = sec.address();
+
+        // What the copy is being let off: the pointers the section holds below
+        // the reference, every one of them a root into the rest of the library.
+        let below = elf
+            .dynamic_relocations()
+            .expect("dynamic relocations")
+            .filter(|(roff, _)| (sec_addr..sec_addr + REFERENCE).contains(roff))
+            .count();
+        assert!(
+            below > 100,
+            "fixture moved: only {below} pointers below {REFERENCE:#x} of .data.rel.ro"
+        );
 
         let mut state = test_state();
         let key = key_in(&mut state, &lib, "_nc_setupterm");
@@ -4028,36 +4152,23 @@ mod tests {
         };
 
         // A bounded reference a long way into the section, which is what makes
-        // the prefix below it unreferenced.
-        let (blob, base) =
-            ensure_data_blob_extracted(handle, "the test", sec_addr + 0x800, Some(8), &mut state)
-                .expect("copy .data.rel.ro")
-                .expect(".data.rel.ro is extractable");
+        // the run below it unreferenced.
+        let (blob, base) = ensure_data_blob_extracted(
+            handle,
+            "the test",
+            sec_addr + REFERENCE,
+            Some(8),
+            &mut state,
+        )
+        .expect("copy .data.rel.ro")
+        .expect(".data.rel.ro is extractable");
         assert_eq!(base, sec_addr);
 
-        let pointers = |state: &ExtractionState, id: UnitId| {
-            let unit = state.units.iter().find(|u| u.id == id).expect("the blob");
-            let mut offsets: Vec<u64> = unit
-                .relocations
-                .iter()
-                .map(|r| r.offset_within_unit)
-                .chain(
-                    state
-                        .got_slot_fixups
-                        .iter()
-                        .filter(|f| f.unit == id)
-                        .map(|f| f.offset),
-                )
-                .collect();
-            offsets.sort_unstable();
-            offsets
-        };
-        let before = pointers(&state, blob);
-        let lowest = *before.first().expect(".data.rel.ro holds pointers");
-        assert!(
-            lowest < 0x800,
-            "fixture moved: the copy's first pointer is at {lowest:#x}, above the \
-             reference under test"
+        let before = blob_pointers(&state, blob);
+        assert_eq!(
+            before.first().copied(),
+            Some(REFERENCE),
+            "the copy rooted a pointer below the reference that reached into it"
         );
 
         // Every GOT slice `_nc_setupterm` made, which the trim has no business
@@ -4068,35 +4179,51 @@ mod tests {
             .filter(|info| info.report.is_none())
             .map(|info| {
                 let unit = state.units.iter().find(|u| u.id == info.id).expect("slot");
-                (info.id, pointers(&state, info.id), unit.bytes.len())
+                (info.id, blob_pointers(&state, info.id), unit.bytes.len())
             })
             .collect();
         assert!(!slots.is_empty(), "the symbol reads no GOT slot");
 
         trim_unreferenced_prefixes(&mut state);
 
+        // Nothing is left below the reference to keep, so the copy is the eight
+        // bytes the reference reads and the pointer in them moves with it.
+        let unit = state
+            .units
+            .iter()
+            .find(|u| u.id == blob)
+            .expect("the .data.rel.ro copy");
+        assert_eq!(unit.bytes.len(), 8);
+        assert_eq!(blob_pointers(&state, blob), vec![0]);
+        let section = find_section_for_address(&elf, sec_addr).expect("the section");
+        let contents = section_contents(&elf, &section).expect("contents");
         assert_eq!(
-            pointers(&state, blob),
-            before,
-            "the copy dropped a pointer the merge already rests on"
+            unit.bytes[..],
+            contents[REFERENCE as usize..REFERENCE as usize + 8],
+            "the copy does not hold the bytes the reference reads"
         );
+        assert_no_stale_pointers(&state, &elf, blob, sec_addr + REFERENCE);
+
         let copy = state
             .data_section_copies
             .iter()
             .find(|c| c.section == ".data.rel.ro")
             .expect("the .data.rel.ro copy is recorded");
-        assert!(
-            copy.start_offset as u64 <= lowest / DATA_BLOB_ALIGNMENT * DATA_BLOB_ALIGNMENT,
-            "{copy:?} starts above its first pointer at {lowest:#x}"
+        assert_eq!(
+            (copy.start_offset as u64, copy.bytes, copy.pointers),
+            (REFERENCE, 8, 1)
         );
         assert!(
-            copy.is_oversized(),
-            "a copy carrying {} unreferenced bytes is not reported: {copy:?}",
-            copy.unreferenced_prefix
+            !copy.is_oversized(),
+            "a copy that is the bytes the reference reads is not worth a line: {copy:?}"
         );
 
         for (id, offsets, len) in slots {
-            assert_eq!(pointers(&state, id), offsets, "a GOT slot's pointer moved");
+            assert_eq!(
+                blob_pointers(&state, id),
+                offsets,
+                "a GOT slot's pointer moved"
+            );
             assert_eq!(
                 state
                     .units
@@ -4109,6 +4236,69 @@ mod tests {
                 "a GOT slot was trimmed"
             );
         }
+    }
+
+    /// A reference lower than every reference before it turns the pointers in
+    /// the run it exposes from pointers the copy was going to give back into
+    /// pointers it has to keep — so that run's relocations are collected when
+    /// it is exposed, not left behind because the copy already reached over
+    /// them.
+    ///
+    /// Missing them is the one way skipping the run below a reference could
+    /// corrupt a merge: the bytes stay, and every pointer in them keeps the
+    /// library's own load-time VA. The order is not hypothetical — `test/grep`
+    /// reaches `libpcre2-8.so.0`'s `.data` 0x40 bytes in before it reaches its
+    /// first byte, with three of the section's nine pointers in between.
+    #[test]
+    fn a_lower_reference_roots_the_pointers_in_the_run_it_exposes() {
+        const FIRST: u64 = 0x800;
+
+        let lib = test_lib("libtinfo.so.6");
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = parse_lib(&bytes);
+        let sec_addr = elf
+            .section_by_name(".data.rel.ro")
+            .expect(".data.rel.ro")
+            .address();
+
+        let mut state = test_state();
+        let lib_id = state.lib_id(&lib);
+        let index = state.lib_index(lib_id, &elf);
+        let handle = Lib {
+            id: lib_id,
+            path: &lib,
+            elf: &elf,
+            index: &index,
+        };
+        let blob_at = |addr: u64, state: &mut ExtractionState| {
+            ensure_data_blob_extracted(handle, "the test", addr, Some(8), state)
+                .expect("copy .data.rel.ro")
+                .expect(".data.rel.ro is extractable")
+                .0
+        };
+
+        let blob = blob_at(sec_addr + FIRST, &mut state);
+        let reached_over = blob_pointers(&state, blob);
+        assert_eq!(reached_over, vec![FIRST], "the run was not skipped");
+
+        // The lower reference: everything from here up is kept now, pointers
+        // included.
+        assert_eq!(blob_at(sec_addr, &mut state), blob);
+        let exposed = blob_pointers(&state, blob);
+        assert!(
+            exposed.len() > 100 && exposed.contains(&0) && exposed.ends_with(&reached_over),
+            "the exposed run's pointers were not rooted: {} pointers up to {:?}",
+            exposed.len(),
+            exposed.last()
+        );
+
+        trim_unreferenced_prefixes(&mut state);
+        assert_eq!(
+            blob_pointers(&state, blob),
+            exposed,
+            "a copy referenced at its first byte has nothing to give back"
+        );
+        assert_no_stale_pointers(&state, &elf, blob, sec_addr);
     }
 
     /// The whole of issue #66, held to the closure it is about: the three MD5
