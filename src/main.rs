@@ -19,8 +19,8 @@ use clap::Parser;
 use tracing::{info, warn};
 
 use elf_reader::MappedElf;
-use lib_discovery::{LdsoCache, resolve_library};
-use symbol_analysis::{RelaTables, collect_imports, parse_dynamic};
+use lib_discovery::LdsoCache;
+use symbol_analysis::{LibrarySearch, RelaTables, collect_imports, parse_dynamic};
 
 #[derive(Parser)]
 #[command(
@@ -100,20 +100,18 @@ fn run() -> Result<()> {
 
     let ldso_cache = LdsoCache::load();
 
+    // Every `DT_NEEDED` lookup the merge makes goes through this: the search
+    // path ld.so uses for the executable, with solder's own `-L` and
+    // `$SYSROOT/lib` directories folded in.
+    let search = LibrarySearch::new(&dyn_info, &library_path, &ldso_cache);
+
     // The executable's `.rela.plt` and `.rela.dyn`, decoded once: which symbols
     // it imports and through which GOT slot, which JUMP_SLOT and COPY entries
     // the patcher has to neutralize, and which slots a trampoline can reuse all
     // come out of these two tables.
     let rela = RelaTables::read(&exe_elf).context("reading the executable's .rela tables")?;
 
-    let import_info = collect_imports(
-        &exe_elf,
-        &rela,
-        &dyn_info,
-        &ldso_cache,
-        &library_path,
-        merge_filter,
-    )?;
+    let import_info = collect_imports(&exe_elf, &rela, &search, merge_filter)?;
     let imports = &import_info.imports;
     let merged_lib_syms = &import_info.merged_lib_syms;
 
@@ -292,30 +290,10 @@ fn run() -> Result<()> {
             }
         }
 
-        let mut exe_rpath = dyn_info.search_rpath().to_vec();
-        exe_rpath.extend_from_slice(&library_path);
         let mut resolve_exports = |soname: &str| {
-            let (rpath, runpath, origin) = match declarer.get(soname) {
-                Some(lib) => {
-                    let (rpath, runpath) = symbol_analysis::dependency_search_path(lib, &exe_rpath);
-                    (
-                        rpath,
-                        runpath,
-                        lib.path.parent().unwrap_or(dyn_info.origin.as_path()),
-                    )
-                }
-                // Nothing being merged away declares this entry, so there is no
-                // other object whose search path could apply to it.
-                None => (
-                    exe_rpath.clone(),
-                    dyn_info.runpath.as_slice(),
-                    dyn_info.origin.as_path(),
-                ),
-            };
-            resolve_library(soname, &rpath, runpath, &ldso_cache, origin)
-                .and_then(|path| {
-                    symbol_analysis::read_library_dynamic(&path).map(|lib| (path, lib.defined))
-                })
+            search
+                .read_declared_by(declarer.get(soname).copied(), soname)
+                .map(|(path, lib)| (path, lib.defined))
                 .ok()
         };
 
@@ -338,15 +316,7 @@ fn run() -> Result<()> {
     // linked against, that pairing leaves a live relocation against a symbol
     // nothing in the link defines any more.
     let merged_names: HashSet<String> = imports.iter().map(|i| i.name.clone()).collect();
-    refuse_unresolvable_imports(
-        &exe_elf,
-        &rela,
-        &dyn_info,
-        &plan,
-        &merged_names,
-        &ldso_cache,
-        &library_path,
-    )?;
+    refuse_unresolvable_imports(&exe_elf, &rela, &search, &plan, &merged_names)?;
 
     // The loader protects the range `PT_GNU_RELRO` names and nothing else, and
     // the merged region is necessarily outside it. Say so before writing
@@ -441,11 +411,9 @@ fn run() -> Result<()> {
 fn refuse_unresolvable_imports(
     exe_elf: &object::read::elf::ElfFile64<'_>,
     rela: &RelaTables,
-    dyn_info: &symbol_analysis::DynamicInfo,
+    search: &LibrarySearch<'_>,
     plan: &types::MergePlan,
     merged: &HashSet<String>,
-    ldso_cache: &LdsoCache,
-    library_path: &[PathBuf],
 ) -> Result<()> {
     let loader_resolved = rela.loader_resolved_imports(merged);
     if loader_resolved.is_empty() {
@@ -456,8 +424,8 @@ fn refuse_unresolvable_imports(
     // merged library took with it, plus the ones inherited from the libraries
     // that did go. The interpreter rides along, defining symbols of its own
     // without ever being listed.
-    let remaining: Vec<&str> = dyn_info
-        .needed
+    let remaining: Vec<&str> = search
+        .exe_needed()
         .iter()
         .map(String::as_str)
         .filter(|needed| !plan.remove_needed.iter().any(|gone| gone == needed))
@@ -465,28 +433,16 @@ fn refuse_unresolvable_imports(
         .chain(elf_reader::interpreter(exe_elf))
         .collect();
 
-    let mut exe_rpath = dyn_info.search_rpath().to_vec();
-    exe_rpath.extend_from_slice(library_path);
     let mut unreadable = None;
     let mut consulted: Vec<String> = Vec::new();
+    // Every one of these is looked up the way the loader looks it up for the
+    // *executable*, which is what each one of them is a dependency of once the
+    // merge is done.
     let mut resolve = |entry: &str| -> Option<HashSet<String>> {
-        // Every one of these is looked up the way the loader looks it up for
-        // the *executable*, which is what each one of them is a dependency of
-        // once the merge is done.
-        let found = resolve_library(
-            entry,
-            &exe_rpath,
-            &dyn_info.runpath,
-            ldso_cache,
-            &dyn_info.origin,
-        )
-        .and_then(|path| {
-            symbol_analysis::read_library_dynamic(&path).map(|lib| (path, lib.defined))
-        });
-        match found {
-            Ok((path, defined)) => {
+        match search.read(entry) {
+            Ok((path, lib)) => {
                 consulted.push(format!("{} ({entry})", path.display()));
-                Some(defined)
+                Some(lib.defined)
             }
             Err(e) => {
                 unreadable = Some(format!("{entry}: {e:#}"));
