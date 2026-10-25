@@ -164,6 +164,86 @@ pub fn dependency_search_path<'a>(
     (rpath, &lib.runpath)
 }
 
+/// Every `DT_NEEDED` lookup the merge makes, through the one search path the
+/// loader would use for it.
+///
+/// Three stages resolve an entry and read the file it names: `collect_imports`
+/// to decide what can be merged, [`inherited_needed`] to decide which of the
+/// merged libraries' own dependencies the executable has to take over, and
+/// [`unprovided_imports`] to check that the symbols left dynamic still have a
+/// provider. Each had its own copy of the rule — the executable's effective
+/// `DT_RPATH`, then solder's `$SYSROOT/lib` and `-L` directories, then
+/// `LD_LIBRARY_PATH`, then the executable's `DT_RUNPATH`, with `$ORIGIN`
+/// meaning the executable's own directory — assembled from `DynamicInfo` and a
+/// path list at each call site. Three copies of one search path are three
+/// chances to look a soname up somewhere ld.so does not, and a lookup that
+/// finds a different file from the one the executable will load merges code the
+/// executable never runs.
+pub struct LibrarySearch<'a> {
+    exe: &'a DynamicInfo,
+    cache: &'a LdsoCache,
+    /// The executable's effective `DT_RPATH` followed by solder's own search
+    /// directories: the group [`resolve_library`] searches ahead of
+    /// `LD_LIBRARY_PATH`.
+    rpath: Vec<PathBuf>,
+}
+
+impl<'a> LibrarySearch<'a> {
+    /// `extra` is where solder's own `$SYSROOT/lib` and `-L` directories go —
+    /// behind the executable's `DT_RPATH`, ahead of `LD_LIBRARY_PATH`.
+    pub fn new(exe: &'a DynamicInfo, extra: &[PathBuf], cache: &'a LdsoCache) -> Self {
+        let mut rpath = exe.search_rpath().to_vec();
+        rpath.extend_from_slice(extra);
+        Self { exe, cache, rpath }
+    }
+
+    /// The executable's `DT_NEEDED` entries, in the order it lists them.
+    pub fn exe_needed(&self) -> &'a [String] {
+        &self.exe.needed
+    }
+
+    /// The file an entry the *executable* declares names — which is what every
+    /// `DT_NEEDED` entry of the merged binary is, the inherited ones included.
+    fn find(&self, entry: &str) -> Result<PathBuf> {
+        resolve_library(
+            entry,
+            &self.rpath,
+            &self.exe.runpath,
+            self.cache,
+            &self.exe.origin,
+        )
+    }
+
+    /// Resolve an entry the executable declares and read the exports and
+    /// dependencies of the file it names.
+    pub fn read(&self, entry: &str) -> Result<(PathBuf, LibraryDynamic)> {
+        self.read_declared_by(None, entry)
+    }
+
+    /// The same for an entry `declarer` — a library being merged away — is the
+    /// one that declares: ld.so resolves it through that library's own search
+    /// path ahead of the executable's, and `$ORIGIN` in it means that library's
+    /// directory (see [`dependency_search_path`]). `None` for an entry no
+    /// merged library declares, which leaves nothing but the executable's own
+    /// search path to apply to it.
+    pub fn read_declared_by(
+        &self,
+        declarer: Option<&MergedLibrary>,
+        entry: &str,
+    ) -> Result<(PathBuf, LibraryDynamic)> {
+        let path = match declarer {
+            Some(lib) => {
+                let (rpath, runpath) = dependency_search_path(lib, &self.rpath);
+                let origin = lib.path.parent().unwrap_or(&self.exe.origin);
+                resolve_library(entry, &rpath, runpath, self.cache, origin)
+            }
+            None => self.find(entry),
+        }?;
+        let lib = read_library_dynamic(&path)?;
+        Ok((path, lib))
+    }
+}
+
 /// Collect all symbols the executable imports from shared libraries, resolving
 /// each to an absolute library path and a GOT file offset.
 /// Result of `collect_imports`: the symbols the executable imports, plus a
@@ -247,13 +327,12 @@ fn validate_merge_filter(needed: &[String], filter: &[String]) -> Result<()> {
 pub fn collect_imports(
     elf: &ElfFile64<'_>,
     rela: &RelaTables,
-    dyn_info: &DynamicInfo,
-    ldso_cache: &LdsoCache,
-    extra_lib_paths: &[PathBuf],
+    search: &LibrarySearch<'_>,
     merge_filter: Option<&[String]>,
 ) -> Result<ImportInfo> {
+    let exe_needed = search.exe_needed();
     if let Some(filter) = merge_filter {
-        validate_merge_filter(&dyn_info.needed, filter)?;
+        validate_merge_filter(exe_needed, filter)?;
     }
 
     // Build a map from symbol name → source library path.
@@ -263,11 +342,7 @@ pub fn collect_imports(
         std::collections::HashMap::new();
     let mut merged_libs: Vec<MergedLibrary> = Vec::new();
 
-    let mut search_rpath = dyn_info.search_rpath().to_vec();
-    search_rpath.extend_from_slice(extra_lib_paths);
-    let search_runpath = dyn_info.runpath.as_slice();
-
-    for needed in &dyn_info.needed {
+    for needed in exe_needed {
         if is_excluded(needed) {
             continue;
         }
@@ -277,15 +352,7 @@ pub fn collect_imports(
             continue;
         }
 
-        let resolved = resolve_library(
-            needed,
-            &search_rpath,
-            search_runpath,
-            ldso_cache,
-            &dyn_info.origin,
-        );
-
-        let lib_path = match resolved {
+        let lib_path = match search.find(needed) {
             Ok(path) => path,
             // Nothing here provides the entry, and the user did not ask for
             // this library by name: leave it dynamic and merge the rest.
@@ -959,7 +1026,8 @@ mod unresolvable_dependency_tests {
         let libs = [PathBuf::from(LIBS)];
         let cache = LdsoCache::load();
 
-        let info = collect_imports(&exe, &rela, &dyn_info, &cache, &libs, None)
+        let search = LibrarySearch::new(&dyn_info, &libs, &cache);
+        let info = collect_imports(&exe, &rela, &search, None)
             .expect("an unresolvable dependency must not fail a merge nobody asked for");
         assert_eq!(
             info.merged_libs
@@ -990,7 +1058,8 @@ mod unresolvable_dependency_tests {
         let cache = LdsoCache::load();
 
         let filter = [ABSENT.to_string()];
-        let Err(err) = collect_imports(&exe, &rela, &dyn_info, &cache, &libs, Some(&filter)) else {
+        let search = LibrarySearch::new(&dyn_info, &libs, &cache);
+        let Err(err) = collect_imports(&exe, &rela, &search, Some(&filter)) else {
             panic!("a library named with -m has to be merged or refused");
         };
         let msg = format!("{err:#}");
@@ -1296,6 +1365,87 @@ mod dependency_search_tests {
     }
 }
 
+/// The lookups [`super::LibrarySearch`] performs, end to end against the
+/// fixtures: the rules above decide which directories apply, and these pin
+/// that an entry is actually resolved and read through them.
+#[cfg(test)]
+mod library_search_tests {
+    use super::{DynamicInfo, LibrarySearch, MergedLibrary};
+    use crate::lib_discovery::LdsoCache;
+    use std::path::{Path, PathBuf};
+
+    const LIBS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs");
+    const TINFO: &str = "libtinfo.so.6";
+
+    /// An executable with no search path of its own, so only the directories
+    /// solder was given can resolve anything.
+    fn exe_without_a_search_path() -> DynamicInfo {
+        DynamicInfo {
+            needed: vec![TINFO.to_owned()],
+            rpath: Vec::new(),
+            runpath: Vec::new(),
+            origin: PathBuf::from("/nonexistent"),
+        }
+    }
+
+    /// A merged library whose own `DT_RPATH` is `dir`.
+    fn lib_with_rpath(dir: &Path) -> MergedLibrary {
+        MergedLibrary {
+            soname: "libfoo.so.1".to_owned(),
+            path: PathBuf::from(LIBS).join("libfoo.so.1"),
+            needed: vec![TINFO.to_owned()],
+            rpath: vec![dir.to_path_buf()],
+            runpath: Vec::new(),
+        }
+    }
+
+    /// The directories `-L` and `$SYSROOT/lib` contribute are searched for an
+    /// entry the executable declares, and the file found there is the one whose
+    /// exports the merge reads. This is how every fixture merge resolves its
+    /// libraries: `test/libs` holds sonames that are not the host's.
+    #[test]
+    fn an_executables_entry_resolves_through_solders_own_directories() {
+        let exe = exe_without_a_search_path();
+        let cache = LdsoCache::load();
+        let search = LibrarySearch::new(&exe, &[PathBuf::from(LIBS)], &cache);
+
+        assert_eq!(search.exe_needed(), [TINFO.to_owned()]);
+        let (path, lib) = search.read(TINFO).expect("-L should resolve the fixture");
+        assert_eq!(path, Path::new(LIBS).join(TINFO));
+        assert!(lib.defined.contains("baudrate"), "no exports were read");
+        assert_eq!(lib.needed, ["libc.so.6"]);
+    }
+
+    /// A dependency of a library being merged away is looked up through *that*
+    /// library's `DT_RPATH` first, so a copy sitting there wins over the one
+    /// solder's own directories hold. Getting this wrong reads the exports of a
+    /// file the merged library never loaded, and those exports are what decide
+    /// whether its `DT_NEEDED` entry is inherited at all.
+    #[test]
+    fn a_declarers_own_rpath_wins_over_solders_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundled = dir.path().join(TINFO);
+        std::fs::copy(Path::new(LIBS).join(TINFO), &bundled).expect("bundle a copy");
+
+        let exe = exe_without_a_search_path();
+        let cache = LdsoCache::load();
+        let search = LibrarySearch::new(&exe, &[PathBuf::from(LIBS)], &cache);
+        let declarer = lib_with_rpath(dir.path());
+
+        let (path, _) = search
+            .read_declared_by(Some(&declarer), TINFO)
+            .expect("the declarer's own DT_RPATH holds a copy");
+        assert_eq!(path, bundled);
+
+        // With no declarer there is no other object's search path to apply, so
+        // the same entry falls back to the executable's.
+        let (path, _) = search
+            .read_declared_by(None, TINFO)
+            .expect("the executable's search path holds a copy too");
+        assert_eq!(path, Path::new(LIBS).join(TINFO));
+    }
+}
+
 #[cfg(test)]
 mod absorbed_library_tests {
     use super::{ImportInfo, MergedLibrary};
@@ -1489,15 +1639,9 @@ mod unprovided_import_tests {
         let dyn_info = parse_dynamic(&exe, Path::new(GREP)).expect("parse .dynamic");
         let rela = RelaTables::read(&exe).expect("read .rela tables");
 
-        let info = collect_imports(
-            &exe,
-            &rela,
-            &dyn_info,
-            &LdsoCache::load(),
-            &[lib_dir.to_path_buf()],
-            None,
-        )
-        .expect("collect imports");
+        let cache = LdsoCache::load();
+        let search = LibrarySearch::new(&dyn_info, &[lib_dir.to_path_buf()], &cache);
+        let info = collect_imports(&exe, &rela, &search, None).expect("collect imports");
 
         let merged: HashSet<String> = info.imports.iter().map(|i| i.name.clone()).collect();
         rela.loader_resolved_imports(&merged)
