@@ -6,6 +6,17 @@ use object::read::elf::ElfFile64;
 
 /// A memory-mapped ELF file. Everything that reads it borrows from `&self`,
 /// so the mapping outlives every view handed out of it.
+///
+/// This is how solder reads every input it does not have to modify — the
+/// executable and each library the merge reads — because none of the passes
+/// over a library wants all of it. Collecting its exports reads `.dynsym` and
+/// `.dynstr`, extraction reads the sections its units come out of, the GNU
+/// property pass reads one note; and a library is read by several of those
+/// passes in turn, each a separate open. Pulling the whole file into a `Vec`
+/// per pass copied megabytes nobody looked at: `test/md5sum` against the
+/// 6.2 MB `libcrypto.so.3` spent a quarter of the merge in four such copies,
+/// where a mapping faults in only the pages a pass actually touches and the
+/// second pass over the file finds them already resident.
 pub struct MappedElf {
     mmap: Mmap,
     path: PathBuf,

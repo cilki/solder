@@ -7,6 +7,7 @@ use iced_x86::Instruction;
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
+use crate::elf_reader::MappedElf;
 use crate::types::{
     DATA_BLOB_ALIGNMENT, DataSectionCopy, ExtractedReloc, ExtractedUnit, GotSlotFixup,
     InitFiniArrays, InitFiniEntry, RelocTarget, SectionKind, UnitId,
@@ -188,12 +189,12 @@ struct ExtractionState {
     lib_paths: Vec<Rc<Path>>,
     /// The reverse of `lib_paths`, consulted only when a path first turns up.
     lib_ids: FastMap<Rc<Path>, LibId>,
-    /// Cache of raw library bytes, indexed by [`LibId`]. `process_symbol` runs
+    /// Cache of library images, indexed by [`LibId`]. `process_symbol` runs
     /// once per extracted symbol, and a large library (e.g. libcrypto.so.3 at
-    /// ~6MB) can yield thousands of symbols; re-reading the whole file from
-    /// disk each time dominated the runtime. The parse itself is lazy and
-    /// cheap, so only the bytes need caching.
-    lib_bytes_cache: Vec<Option<Rc<Vec<u8>>>>,
+    /// ~6MB) can yield thousands of symbols; re-opening the whole file each
+    /// time dominated the runtime. The parse itself is lazy and cheap, so only
+    /// the image needs caching.
+    lib_bytes_cache: Vec<Option<Rc<MappedElf>>>,
     /// Precomputed symbol lookups per library (see `LibIndex`).
     lib_index_cache: Vec<Option<Rc<LibIndex>>>,
 }
@@ -308,14 +309,14 @@ impl ExtractionState {
         Rc::clone(&self.lib_paths[lib.0 as usize])
     }
 
-    /// Return the raw bytes of `lib`, reading and caching them on first use.
-    fn lib_bytes(&mut self, lib: LibId) -> Result<Rc<Vec<u8>>> {
+    /// Return the image of `lib`, mapping and caching it on first use.
+    fn lib_bytes(&mut self, lib: LibId) -> Result<Rc<MappedElf>> {
         if let Some(bytes) = &self.lib_bytes_cache[lib.0 as usize] {
             return Ok(Rc::clone(bytes));
         }
         let path = self.lib_path(lib);
         let bytes =
-            Rc::new(std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?);
+            Rc::new(MappedElf::open(&path).with_context(|| format!("reading {}", path.display()))?);
         self.lib_bytes_cache[lib.0 as usize] = Some(Rc::clone(&bytes));
         Ok(bytes)
     }
@@ -685,7 +686,7 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
     let lib_path = state.lib_path(key.lib);
     let lib_bytes = state.lib_bytes(key.lib)?;
 
-    let object_file = object::File::parse(lib_bytes.as_slice())
+    let object_file = object::File::parse(lib_bytes.bytes())
         .with_context(|| format!("object parse {}", lib_path.display()))?;
 
     let object::File::Elf64(elf64) = &object_file else {

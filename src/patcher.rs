@@ -4,8 +4,8 @@ use anyhow::{Context, Result, bail};
 use tracing::warn;
 
 use crate::elf_reader::{
-    DYN_ENTRY_SIZE, DynamicTable, SH_ADDR, SH_INFO, SH_OFFSET, SH_SIZE, SHDR_SIZE, SectionTable,
-    VER_NDX_GLOBAL,
+    DYN_ENTRY_SIZE, DynamicTable, MappedElf, SH_ADDR, SH_INFO, SH_OFFSET, SH_SIZE, SHDR_SIZE,
+    SectionTable, VER_NDX_GLOBAL,
 };
 use crate::types::{MergePlan, RelativeReloc};
 
@@ -250,12 +250,13 @@ fn update_gnu_properties(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     let mut features = exe_features.map_or(0, |(_, mask)| mask);
     let mut isa = exe_isa.map_or(0, |(_, mask)| mask);
     for lib in libs {
-        let data = std::fs::read(lib)
+        let mapped = MappedElf::open(lib)
             .with_context(|| format!("reading {} for its GNU property note", lib.display()))?;
-        let lib_features = find_property(&data, GNU_PROPERTY_X86_FEATURE_1_AND)
+        let data = mapped.bytes();
+        let lib_features = find_property(data, GNU_PROPERTY_X86_FEATURE_1_AND)
             .with_context(|| format!("reading .note.gnu.property of {}", lib.display()))?
             .map_or(0, |(_, mask)| mask);
-        let lib_isa = find_property(&data, GNU_PROPERTY_X86_ISA_1_NEEDED)
+        let lib_isa = find_property(data, GNU_PROPERTY_X86_ISA_1_NEEDED)
             .with_context(|| format!("reading .note.gnu.property of {}", lib.display()))?
             .map_or(0, |(_, mask)| mask);
 
