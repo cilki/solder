@@ -327,14 +327,14 @@ fn run() -> Result<()> {
     }
 
     if cli.dry_run {
-        print_merge_plan(
+        let report = render_merge_plan(
             &cli.input,
             &plan,
             imports,
             &dyn_info.needed,
             &data_section_copies,
         );
-        return Ok(());
+        return write_report(std::io::stdout().lock(), &report);
     }
 
     // ── Step 4: apply relocations ─────────────────────────────────────────────
@@ -498,26 +498,53 @@ fn refuse_unresolvable_imports(
     )
 }
 
-/// Print the merge plan for `--dry-run`.
+/// Hand the rendered `--dry-run` report to stdout.
+///
+/// `println!` panics when stdout will not take the write, so printing the plan
+/// a line at a time turned `solder --dry-run | head` — or `| grep -q`, or
+/// quitting `less` — into `failed printing to stdout: Broken pipe` and exit
+/// 101. A reader that stopped reading is not a failure of the run: the report
+/// is rendered whole and written once, and an `EPIPE` ends the run quietly and
+/// successfully, which is what clap already does for `--help` into a closed
+/// pipe. Any other write error (a full disk under `> file`) is still reported
+/// like every other error, rather than as a panic.
+fn write_report<W: std::io::Write>(mut out: W, report: &str) -> Result<()> {
+    match out.write_all(report.as_bytes()).and_then(|()| out.flush()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other.context("writing the merge plan to stdout"),
+    }
+}
+
+/// Render the merge plan for `--dry-run`.
 ///
 /// This goes to stdout directly rather than through `tracing`: previewing the
 /// plan is the whole point of the flag, and the default log filter is `warn`,
 /// so routing it through `info!` meant `solder --dry-run` printed nothing at
 /// all unless the user happened to set `RUST_LOG`.
-fn print_merge_plan(
+fn render_merge_plan(
     input: &std::path::Path,
     plan: &types::MergePlan,
     imports: &[types::ImportedSymbol],
     needed: &[String],
     data_section_copies: &[types::DataSectionCopy],
-) {
+) -> String {
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
 
     #[derive(Default)]
     struct LibStats {
         symbols: usize,
         units: usize,
         bytes: usize,
+    }
+
+    let mut report = String::new();
+    // One report line. Formatting into a `String` cannot fail, so the
+    // `fmt::Result` each `writeln!` hands back carries no information.
+    macro_rules! say {
+        ($($arg:tt)*) => {
+            writeln!(report, $($arg)*).expect("formatting into a String cannot fail")
+        };
     }
 
     let mut per_lib: BTreeMap<&std::path::Path, LibStats> = BTreeMap::new();
@@ -533,10 +560,10 @@ fn print_merge_plan(
         stats.bytes += au.unit.bytes.len();
     }
 
-    println!("Merge plan for {}", input.display());
-    println!("  libraries to merge:");
+    say!("Merge plan for {}", input.display());
+    say!("  libraries to merge:");
     for (lib, stats) in &per_lib {
-        println!(
+        say!(
             "    {} ({} imported symbols, {} units, {} bytes)",
             lib.display(),
             stats.symbols,
@@ -555,7 +582,7 @@ fn print_merge_plan(
             .iter()
             .filter(|c| c.runs_to_section_end())
             .count();
-        println!(
+        say!(
             "  data sections copied for want of a symbol: {} ({} of them whole \
              for want of a bound, {} bytes, {} pointers rooting further \
              extraction)",
@@ -567,9 +594,9 @@ fn print_merge_plan(
     }
 
     if plan.remove_needed.is_empty() {
-        println!("  no DT_NEEDED entries become removable");
+        say!("  no DT_NEEDED entries become removable");
     } else {
-        println!(
+        say!(
             "  DT_NEEDED entries removed: {}",
             plan.remove_needed.join(", ")
         );
@@ -580,16 +607,16 @@ fn print_merge_plan(
         .filter(|s| !plan.remove_needed.iter().any(|r| r == s))
         .collect();
     if !kept.is_empty() {
-        println!("  DT_NEEDED entries kept: {}", kept.join(", "));
+        say!("  DT_NEEDED entries kept: {}", kept.join(", "));
     }
     if !plan.add_needed.is_empty() {
-        println!(
+        say!(
             "  DT_NEEDED entries inherited from the merged libraries: {}",
             plan.add_needed.join(", ")
         );
     }
 
-    println!(
+    say!(
         "  new mapping at 0x{:016x}, {} bytes: {} read-execute (code, trampolines), \
          {} read-only (constants), {} read-write (data, loader-written slots)",
         plan.load_address,
@@ -598,12 +625,12 @@ fn print_merge_plan(
         plan.rodata_end - plan.exec_size,
         plan.writable_end - plan.rodata_end
     );
-    println!("  GOT entries patched: {}", plan.got_patches.len());
-    println!(
+    say!("  GOT entries patched: {}", plan.got_patches.len());
+    say!(
         "  trampolines for symbols still resolved at runtime: {}",
         plan.trampoline_stubs.len()
     );
-    println!(
+    say!(
         "  symbols injected into .dynsym: {}",
         plan.new_externals.len()
     );
@@ -612,12 +639,294 @@ fn print_merge_plan(
         // whatever the executable already had in the corresponding array, which
         // has to keep running. Calling the totals "merged" overstated how many
         // constructors the merge is adding.
-        println!(
+        say!(
             "  rebuilt preinit array entries: {}, fini array entries: {} \
              (merged constructors and destructors, plus the executable's own)",
             init_fini.preinit.entries.len(),
             init_fini.fini.entries.len()
         );
     }
-    println!("Dry run: {} left unchanged", input.display());
+    say!("Dry run: {} left unchanged", input.display());
+
+    report
+}
+
+/// What `solder --dry-run` prints, and what happens to it when stdout will not
+/// take it.
+#[cfg(test)]
+mod dry_run_report_tests {
+    use super::{render_merge_plan, write_report};
+    use crate::types::{
+        AssignedUnit, DataSectionCopy, ExtractedUnit, ImportKind, ImportedSymbol, InitFiniPlan,
+        MergePlan, MergedArray, SectionKind, UnitId,
+    };
+    use std::io::{self, ErrorKind, Write};
+    use std::path::{Path, PathBuf};
+
+    /// A writer whose every write fails with `kind`, standing in for the stdout
+    /// of a `solder --dry-run | head` whose `head` has already exited.
+    struct FailingWriter(ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "writer under test"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(self.0, "writer under test"))
+        }
+    }
+
+    /// An empty plan with a merged region laid out as one page of each run, so
+    /// the three sizes the report derives from it are all distinguishable.
+    fn plan() -> MergePlan {
+        MergePlan {
+            is_pie: true,
+            load_address: 0x4_3000,
+            exec_size: 0x1000,
+            rodata_end: 0x3000,
+            writable_end: 0x4000,
+            units: Vec::new(),
+            trampoline_stubs: Vec::new(),
+            got_patches: Vec::new(),
+            jump_slot_reloc_offsets: Vec::new(),
+            copy_reloc_offsets: Vec::new(),
+            remove_needed: Vec::new(),
+            add_needed: Vec::new(),
+            relative_relocs: Vec::new(),
+            new_externals: Vec::new(),
+            got_imports: Vec::new(),
+            init_fini: None,
+        }
+    }
+
+    fn import(name: &str, lib: &str) -> ImportedSymbol {
+        ImportedSymbol {
+            name: name.to_owned(),
+            source_library: PathBuf::from(lib),
+            got_file_offset: 0,
+            kind: ImportKind::JumpSlot,
+        }
+    }
+
+    /// A unit of `bytes` bytes extracted from `lib`.
+    fn unit(lib: &str, bytes: usize) -> AssignedUnit {
+        AssignedUnit {
+            unit: ExtractedUnit {
+                id: UnitId(0),
+                name: "unit".to_owned(),
+                source_lib: PathBuf::from(lib),
+                bytes: vec![0x90; bytes],
+                section_kind: SectionKind::Text,
+                alignment: 16,
+                relocations: Vec::new(),
+            },
+            assigned_vaddr: 0x4_3000,
+        }
+    }
+
+    /// A copy of `bytes` bytes out of a `section_bytes`-byte section, starting
+    /// at `start_offset` — so it runs to the section's end, and counts as one
+    /// of the "whole for want of a bound" copies, only when it reaches it.
+    fn copy(
+        bytes: usize,
+        section_bytes: usize,
+        start_offset: usize,
+        pointers: usize,
+    ) -> DataSectionCopy {
+        DataSectionCopy {
+            library: PathBuf::from("/opt/lib/libfoo.so.1"),
+            section: ".data.rel.ro".to_owned(),
+            bytes,
+            section_bytes,
+            start_offset,
+            unreferenced_prefix: 0,
+            pointers,
+            address: 0x1000,
+            reached_from: "foo".to_owned(),
+        }
+    }
+
+    fn render(plan: &MergePlan, imports: &[ImportedSymbol], needed: &[&str]) -> String {
+        let needed: Vec<String> = needed.iter().map(|s| (*s).to_owned()).collect();
+        render_merge_plan(Path::new("/tmp/app"), plan, imports, &needed, &[])
+    }
+
+    /// The line for one library pairs the symbols the *executable* imports out
+    /// of it with the units and bytes the *extraction* pulled from it — two
+    /// different inputs, grouped by the library's path.
+    #[test]
+    fn each_library_is_reported_with_its_own_symbols_units_and_bytes() {
+        let mut plan = plan();
+        plan.units = vec![
+            unit("/opt/lib/libfoo.so.1", 100),
+            unit("/opt/lib/libfoo.so.1", 20),
+            unit("/opt/lib/libbar.so.2", 7),
+        ];
+        let imports = [
+            import("foo_one", "/opt/lib/libfoo.so.1"),
+            import("foo_two", "/opt/lib/libfoo.so.1"),
+            import("bar_one", "/opt/lib/libbar.so.2"),
+        ];
+
+        let report = render(&plan, &imports, &["libfoo.so.1", "libbar.so.2"]);
+
+        assert!(
+            report.contains("/opt/lib/libfoo.so.1 (2 imported symbols, 2 units, 120 bytes)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("/opt/lib/libbar.so.2 (1 imported symbols, 1 units, 7 bytes)"),
+            "{report}"
+        );
+    }
+
+    /// The three runs of the merged region are reported as sizes, which the
+    /// plan holds as offsets of each run's end: getting the subtraction wrong
+    /// would misreport how much of the region is executable.
+    #[test]
+    fn the_merged_regions_runs_are_reported_as_sizes() {
+        let report = render(&plan(), &[], &[]);
+        assert!(
+            report.contains(
+                "new mapping at 0x0000000000043000, 16384 bytes: 4096 read-execute \
+                 (code, trampolines), 8192 read-only (constants), 4096 read-write \
+                 (data, loader-written slots)"
+            ),
+            "{report}"
+        );
+    }
+
+    /// Only the entries that survive the merge are "kept": a soname the plan
+    /// removes has to come off the list the executable declared, and an
+    /// inherited one is neither removed nor kept but reported on its own.
+    #[test]
+    fn removed_kept_and_inherited_sonames_are_reported_separately() {
+        let mut plan = plan();
+        plan.remove_needed = vec!["libfoo.so.1".to_owned()];
+        plan.add_needed = vec!["libz.so.1".to_owned()];
+
+        let report = render(&plan, &[], &["libfoo.so.1", "libc.so.6"]);
+
+        assert!(
+            report.contains("DT_NEEDED entries removed: libfoo.so.1"),
+            "{report}"
+        );
+        assert!(
+            report.contains("DT_NEEDED entries kept: libc.so.6"),
+            "{report}"
+        );
+        assert!(
+            report.contains("DT_NEEDED entries inherited from the merged libraries: libz.so.1"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("no DT_NEEDED entries become removable"),
+            "{report}"
+        );
+    }
+
+    /// A merge that removes nothing says so, rather than leaving the reader to
+    /// notice the line is missing.
+    #[test]
+    fn a_merge_that_removes_no_soname_says_so() {
+        let report = render(&plan(), &[], &["libfoo.so.1"]);
+        assert!(
+            report.contains("no DT_NEEDED entries become removable"),
+            "{report}"
+        );
+        assert!(
+            report.contains("DT_NEEDED entries kept: libfoo.so.1"),
+            "{report}"
+        );
+    }
+
+    /// The data-copy totals sum the bytes and pointers of every copy, and
+    /// count separately the ones that ran to their section's end — the copies
+    /// nothing bounded, which are the ones worth acting on.
+    #[test]
+    fn data_copy_totals_count_the_unbounded_copies_apart() {
+        let copies = [copy(400, 400, 0, 9), copy(64, 4096, 128, 2)];
+        let needed = ["libfoo.so.1".to_owned()];
+
+        let report = render_merge_plan(Path::new("/tmp/app"), &plan(), &[], &needed, &copies);
+
+        assert!(
+            report.contains(
+                "data sections copied for want of a symbol: 2 (1 of them whole for want \
+                 of a bound, 464 bytes, 11 pointers rooting further extraction)"
+            ),
+            "{report}"
+        );
+    }
+
+    /// A merge with nothing to copy for want of a symbol — every fixture merge
+    /// of `test/md5sum` — leaves the totals line out altogether.
+    #[test]
+    fn a_merge_with_no_unbounded_copy_omits_the_totals() {
+        let report = render(&plan(), &[], &["libfoo.so.1"]);
+        assert!(
+            !report.contains("data sections copied"),
+            "nothing was copied for want of a symbol: {report}"
+        );
+    }
+
+    /// Both arrays are rebuilt whole, so the counts include the executable's
+    /// own entries and not just the merged libraries'.
+    #[test]
+    fn the_rebuilt_arrays_are_reported_when_the_merge_rebuilds_them() {
+        let mut plan = plan();
+        plan.init_fini = Some(InitFiniPlan {
+            preinit: MergedArray {
+                vaddr: 0x4_3000,
+                exe_vaddr: None,
+                entries: vec![0x1000],
+            },
+            fini: MergedArray {
+                vaddr: 0x4_3008,
+                exe_vaddr: Some(0x2000),
+                entries: vec![0x2000, 0x3000],
+            },
+        });
+
+        let report = render(&plan, &[], &[]);
+        assert!(
+            report.contains("rebuilt preinit array entries: 1, fini array entries: 2"),
+            "{report}"
+        );
+    }
+
+    /// The report is one write, and it is the whole report.
+    #[test]
+    fn the_whole_report_reaches_the_writer() {
+        let report = render(&plan(), &[], &["libfoo.so.1"]);
+        let mut sink = Vec::new();
+        write_report(&mut sink, &report).expect("a Vec takes every write");
+        assert_eq!(String::from_utf8(sink).expect("utf-8"), report);
+        assert!(
+            report.ends_with("Dry run: /tmp/app left unchanged\n"),
+            "{report}"
+        );
+    }
+
+    /// `solder --dry-run | head` is an ordinary thing to type, and `head`
+    /// closing the pipe is not a failure of the merge analysis: the run ends
+    /// successfully and silently instead of panicking out of `println!`.
+    #[test]
+    fn a_reader_that_hung_up_ends_the_run_successfully() {
+        write_report(
+            FailingWriter(ErrorKind::BrokenPipe),
+            "Merge plan for /tmp/app\n",
+        )
+        .expect("a closed pipe is not an error");
+    }
+
+    /// Every other write failure — `> file` on a full disk — is still an
+    /// error, and still reported rather than panicked out of.
+    #[test]
+    fn any_other_write_failure_is_reported() {
+        let err = write_report(FailingWriter(ErrorKind::StorageFull), "Merge plan\n")
+            .expect_err("a report that could not be written is a failed run");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("writing the merge plan to stdout"), "{msg}");
+    }
 }
