@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use object::read::elf::ElfFile64;
 use tracing::{debug, warn};
 
-use crate::elf_reader::{DynamicTable, va_to_file_offset};
+use crate::elf_reader::{DynamicTable, MappedElf, va_to_file_offset};
 use crate::lib_discovery::{
     LdsoCache, NotFound, expand_dynamic_tokens, is_excluded, resolve_library, soname_base,
 };
@@ -687,10 +687,11 @@ pub struct LibraryDynamic {
 /// assumes the file's code can run in the executable. See
 /// [`validate_merge_library`](crate::elf_reader::validate_merge_library).
 pub fn read_library_dynamic(lib_path: &Path) -> Result<LibraryDynamic> {
-    let bytes =
-        std::fs::read(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
-    crate::elf_reader::validate_merge_library(&bytes, lib_path)?;
-    let elf = goblin::elf::Elf::parse(&bytes)
+    let mapped =
+        MappedElf::open(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
+    let bytes = mapped.bytes();
+    crate::elf_reader::validate_merge_library(bytes, lib_path)?;
+    let elf = goblin::elf::Elf::parse(bytes)
         .with_context(|| format!("parsing {}", lib_path.display()))?;
 
     // `$ORIGIN` in this library's search path is this library's own directory,
@@ -939,9 +940,9 @@ pub fn find_copy_reloc_offsets(
 pub fn symbol_is_zero_initialized(lib_path: &std::path::Path, name: &str) -> Result<bool> {
     use object::{Object, ObjectSection, ObjectSymbol};
 
-    let bytes =
-        std::fs::read(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
-    let file = object::File::parse(bytes.as_slice())
+    let mapped =
+        MappedElf::open(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
+    let file = object::File::parse(mapped.bytes())
         .with_context(|| format!("parsing {}", lib_path.display()))?;
 
     for sym in file.dynamic_symbols() {
