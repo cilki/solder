@@ -8,8 +8,8 @@ use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind}
 use tracing::{debug, warn};
 
 use crate::types::{
-    ExtractedReloc, ExtractedUnit, GotSlotFixup, InitFiniArrays, InitFiniEntry, RelocTarget,
-    SectionKind, UnitId, WholeSectionCopy,
+    DataSectionCopy, ExtractedReloc, ExtractedUnit, GotSlotFixup, InitFiniArrays, InitFiniEntry,
+    RelocTarget, SectionKind, UnitId,
 };
 
 /// The map the extractor's own caches are kept in.
@@ -77,10 +77,17 @@ struct UnitKey {
 /// scanned reference or a dynamic relocation points at.
 ///
 /// `base` is the address the copied range starts at. It is the section's own
-/// address for every section copied whole, and the slot address for a GOT,
-/// which is copied one slot at a time (see [`got_slot_at`]): every address in
-/// a slot maps to the same base, so an exact lookup on this key still finds
-/// the blob a later reference into the same slot wants.
+/// address for every section the merge copies a prefix of, and the slot
+/// address for a GOT, which is copied one slot at a time (see
+/// [`got_slot_at`]): every address in a slot maps to the same base, so an
+/// exact lookup on this key still finds the blob a later reference into the
+/// same slot wants.
+///
+/// A section's copy is always anchored at the section's own first byte and
+/// only ever grows forward (see [`grow_data_blob`]), which is what keeps the
+/// base out of the lookup: however much of the section ends up copied, there
+/// is one copy of it and every reference into it resolves to the same blob at
+/// the same offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct DataBlobKey {
     lib: LibId,
@@ -89,9 +96,16 @@ struct DataBlobKey {
 }
 
 /// Info about an extracted data section blob.
+#[derive(Clone, Copy)]
 struct DataBlobInfo {
     id: UnitId,
     base_vaddr: u64,
+    /// How many bytes from `base_vaddr` have been copied into the blob so far.
+    copied: u64,
+    /// Where the blob's entry in [`ExtractionState::data_section_copies`] is,
+    /// so growing the copy can keep the reported cost current. `None` for a
+    /// GOT slice, which is exactly bounded and is not reported.
+    report: Option<usize>,
 }
 
 /// State threaded through the BFS.
@@ -135,12 +149,13 @@ struct ExtractionState {
     init_fini: InitFiniArrays,
     /// Extracted data section blobs: maps (lib, section index) → blob info
     data_blobs: FastMap<DataBlobKey, DataBlobInfo>,
-    /// Every data section copied whole rather than sliced, in the order the
-    /// copies happened (see [`WholeSectionCopy`]).
-    whole_section_copies: Vec<WholeSectionCopy>,
+    /// Every data section copied for want of a symbol naming the object a
+    /// reference landed in, in the order the copies happened (see
+    /// [`DataSectionCopy`]).
+    data_section_copies: Vec<DataSectionCopy>,
     /// Which offsets of an extracted data blob already carry a relocation, for
-    /// the jump-table pass that is the only thing to append one to a unit
-    /// already registered (see [`ExtractionState::claim_blob_offset`]).
+    /// the jump-table pass and for a copy that grew after it was registered
+    /// (see [`ExtractionState::claim_blob_offset`]).
     blob_reloc_offsets: FastMap<UnitId, FastSet<u64>>,
     /// What each address a reference pointed at resolved to, so the resolution
     /// is done once per address rather than once per reference to it (see
@@ -208,10 +223,7 @@ impl ExtractionState {
 
     /// The registered unit with `id`.
     ///
-    /// `None` while a unit is still being built: `ensure_data_blob_extracted`
-    /// publishes a blob's id before collecting its relocations, so that a
-    /// pointer leading back into the same section resolves to it instead of
-    /// being left stale.
+    /// `None` for an id that has been reserved but not yet extracted.
     fn unit(&self, id: UnitId) -> Option<&ExtractedUnit> {
         let idx = *self.unit_index.get(&id)?;
         self.units.get(idx)
@@ -237,9 +249,10 @@ impl ExtractionState {
     /// of the whole run on `test/md5sum` + `libcrypto.so.3`.
     ///
     /// The set is seeded from the blob's own relocations the first time it is
-    /// asked about, which is sound because they are all collected before
-    /// `ensure_data_blob_extracted` registers the unit, and nothing but this
-    /// appends to a registered unit's list afterwards.
+    /// asked about, and both things that append to a registered blob's list go
+    /// through it: the jump-table pass, and `grow_data_blob` when a later
+    /// reference extends the copy. Either order is therefore safe — whichever
+    /// reaches a given offset first keeps it.
     fn claim_blob_offset(&mut self, id: UnitId, offset: u64) -> bool {
         if !self.blob_reloc_offsets.contains_key(&id) {
             let taken = self
@@ -354,8 +367,8 @@ pub struct Extraction {
     pub got_slot_fixups: Vec<GotSlotFixup>,
     /// The data sections that had to be copied whole, which is where an
     /// extraction far larger than the symbols asked for comes from (see
-    /// [`WholeSectionCopy`]).
-    pub whole_section_copies: Vec<WholeSectionCopy>,
+    /// [`DataSectionCopy`]).
+    pub data_section_copies: Vec<DataSectionCopy>,
 }
 
 /// Extract all symbols transitively reachable from `seeds` (direct imports).
@@ -393,7 +406,7 @@ pub fn extract_units(
         processed_libs: FastSet::default(),
         init_fini: InitFiniArrays::default(),
         data_blobs: FastMap::default(),
-        whole_section_copies: Vec::new(),
+        data_section_copies: Vec::new(),
         blob_reloc_offsets: FastMap::default(),
         units_at: FastMap::default(),
         plt_refs: FastMap::default(),
@@ -452,7 +465,7 @@ pub fn extract_units(
         units: state.units,
         init_fini: state.init_fini,
         got_slot_fixups: state.got_slot_fixups,
-        whole_section_copies: state.whole_section_copies,
+        data_section_copies: state.data_section_copies,
     })
 }
 
@@ -792,6 +805,7 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
             lib,
             &key.sym,
             sym_vaddr..sym_vaddr + sym_size as u64,
+            sym_vaddr,
             state,
             &mut relocs,
         )?;
@@ -892,9 +906,13 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
                     continue;
                 }
                 // Otherwise try to extract the data section
-                if let Some((blob_id, blob_base)) =
-                    ensure_data_blob_extracted(lib, &key.sym, target_addr, state)?
-                {
+                if let Some((blob_id, blob_base)) = ensure_data_blob_extracted(
+                    lib,
+                    &key.sym,
+                    target_addr,
+                    rip_ref.access_len,
+                    state,
+                )? {
                     let offset_in_blob = target_addr - blob_base;
                     relocs.relocations.push(pcrel_reloc(
                         rip_ref.offset as u64,
@@ -933,13 +951,18 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
         }
 
         for table in jump_tables {
-            // 1. Ensure .rodata blob containing table is extracted
+            // 1. Ensure .rodata blob containing table is extracted. The table
+            // is as long as the entries detected in it, four bytes apiece, and
+            // the relocations written below cover all of them — so that, and
+            // not one entry, is what the copy has to reach.
+            let table_len = Some(JUMP_TABLE_ENTRY_SIZE * table.targets.len() as u64);
             if let Some((blob_id, blob_base)) =
-                ensure_data_blob_extracted(lib, &key.sym, table.table_vaddr, state)?
+                ensure_data_blob_extracted(lib, &key.sym, table.table_vaddr, table_len, state)?
             {
                 // 2. Create relocations for each table entry
                 for (idx, target_addr) in table.targets.iter().enumerate() {
-                    let entry_offset_in_blob = (table.table_vaddr - blob_base) + (idx * 4) as u64;
+                    let entry_offset_in_blob =
+                        (table.table_vaddr - blob_base) + idx as u64 * JUMP_TABLE_ENTRY_SIZE;
 
                     // Skip if a relocation already exists at this offset (from another
                     // function detecting an overlapping table at the same .rodata address)
@@ -1535,6 +1558,41 @@ struct RipRelativeRef {
     /// like `cmpb $imm, [rip+d]` carry an immediate after the displacement,
     /// which shifts next_ip further and makes the addend more negative.
     addend: i64,
+    /// How many bytes at `target_vaddr` the instruction reads or writes, where
+    /// the instruction says: that bounds the object the reference reaches, and
+    /// so bounds how much of a data section has to be copied for it (see
+    /// [`needed_prefix`]). `None` for a code reference, and for the
+    /// instructions that take an address without saying what is at it.
+    access_len: Option<u64>,
+}
+
+/// How many bytes `instr` touches at its RIP-relative memory operand, or
+/// `None` where the instruction does not say.
+///
+/// A memory operand's width is the whole of what the instruction reads or
+/// writes, which is what makes it a bound on the object: `movdqa [rip+d],
+/// %xmm0` reads sixteen bytes and cannot reach the seventeenth. Two kinds of
+/// instruction do not bound anything:
+///
+///   * `lea`, which computes the address and leaves what lives there to
+///     whatever uses it — the base of a string, of a table indexed by a
+///     register, of a struct read field by field. iced reports its memory size
+///     as unknown, which is exactly right.
+///   * the bit-test family with a register bit offset (`bt %rax, [rip+d]`),
+///     where the operand width is the unit the offset counts in and not the
+///     extent touched: the accessed word is `offset / width` of them along.
+fn rip_access_len(instr: &Instruction) -> Option<u64> {
+    use iced_x86::{Mnemonic, OpKind};
+
+    if matches!(
+        instr.mnemonic(),
+        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc
+    ) && instr.op_count() > 1
+        && instr.op_kind(1) != OpKind::Immediate8
+    {
+        return None;
+    }
+    Some(instr.memory_size().size() as u64).filter(|&len| len > 0)
 }
 
 /// Decode `bytes`, loaded at `vaddr`, into an instruction stream.
@@ -1603,6 +1661,7 @@ fn scan_rip_relative_refs(
                             is_code_ref: true,
                             disp_size,
                             addend: -(disp_size as i64),
+                            access_len: None,
                         });
                     }
                 }
@@ -1634,6 +1693,7 @@ fn scan_rip_relative_refs(
                                 is_code_ref: false,
                                 disp_size: 4,
                                 addend: -((instr.len() - pos) as i64),
+                                access_len: rip_access_len(instr),
                             });
                         }
                         break; // Only one memory operand per instruction
@@ -1896,11 +1956,14 @@ fn zero_fill(len: u64) -> Result<Vec<u8>> {
 /// unit) must consult this table or its copied bytes hold stale library VAs.
 ///
 /// `ctx` names the symbol or section being extracted. Offsets pushed into
-/// `relocs` are relative to `range.start`.
+/// `relocs` are relative to `unit_base`, which is `range.start` for a unit
+/// collected in one go and the base of the whole blob when a data section copy
+/// is being extended and `range` covers only the bytes just added.
 fn collect_dynamic_range_relocs(
     lib: Lib<'_, '_>,
     ctx: &str,
     range: std::ops::Range<u64>,
+    unit_base: u64,
     state: &mut ExtractionState,
     relocs: &mut UnitRelocs,
 ) -> Result<()> {
@@ -1922,7 +1985,7 @@ fn collect_dynamic_range_relocs(
         if !range.contains(&roff) {
             continue;
         }
-        let offset_within_unit = roff - range.start;
+        let offset_within_unit = roff - unit_base;
         if occupied.contains(&offset_within_unit) {
             continue;
         }
@@ -2010,9 +2073,13 @@ fn collect_dynamic_range_relocs(
             if let Some(dep) = reserve_unit_at(lib, addend_va, state) {
                 resolved_addend = Some(dep.offset as i64);
                 RelocTarget::MergedUnit(dep.id)
-            } else if let Some((blob_id, blob_base)) =
-                ensure_data_blob_extracted(lib, ctx, addend_va, state)?
-            {
+            } else if let Some((blob_id, blob_base)) = ensure_data_blob_extracted(
+                lib,
+                ctx,
+                addend_va,
+                pointee_len(roff, addend_va),
+                state,
+            )? {
                 // No symbol and no unwind info describe the target, but it does
                 // live in a data section we can copy wholesale — most often a
                 // string or a struct in .rodata that a pointer table in
@@ -2052,8 +2119,37 @@ fn collect_dynamic_range_relocs(
     Ok(())
 }
 
-/// A GOT entry is one pointer wide on every target solder merges.
-const GOT_SLOT_SIZE: u64 = 8;
+/// An address is eight bytes wide on every target solder merges.
+const POINTER_SIZE: u64 = 8;
+
+/// A GOT entry is one pointer wide.
+const GOT_SLOT_SIZE: u64 = POINTER_SIZE;
+
+/// How many bytes of a data section a pointer slot at `slot` needs copied at
+/// the `target` it points to, or `None` — the usual answer — where it says
+/// nothing about the size of what is there.
+///
+/// A slot holding its own address is the exception, and the whole of it: the
+/// object it points at *is* the slot, which is in the copy already by virtue
+/// of being the slot being resolved, so the pointer is made correct by
+/// retargeting it and not by copying anything further.
+///
+/// The slot in question is `__dso_handle`. Every shared library linked by GCC
+/// has one at the start of its `.data`, holding its own address because that
+/// is all it is: the token `__cxa_atexit` files a destructor under and
+/// `__cxa_finalize` matches it against, compared and never dereferenced.
+/// Taking the whole section for it is what used to make the destructor glue of
+/// a stripped `libcrypto.so.3` — which loads `__dso_handle` to pass it to
+/// `__cxa_finalize`, and has no symbol of its own to be bounded by — root all
+/// 553 pointers of `.data`, and through them `.data.rel.ro` and most of the
+/// library (issue #66).
+fn pointee_len(slot: u64, target: u64) -> Option<u64> {
+    (slot == target).then_some(POINTER_SIZE)
+}
+
+/// A jump table entry is a 32-bit offset from the table's own base (see the
+/// relocation the jump-table pass writes for one).
+const JUMP_TABLE_ENTRY_SIZE: u64 = 4;
 
 /// The GOT slot holding `addr`, as `(slot address, slot length)`, if `sec` is a
 /// global offset table at all.
@@ -2084,19 +2180,61 @@ fn got_slot_at(sec: &SectionInfo<'_>, addr: u64) -> Option<(u64, u64)> {
     Some((slot, GOT_SLOT_SIZE.min(sec.vaddr + sec.size - slot)))
 }
 
+/// How much of `sec`, counted from its first byte, a reference to
+/// `target_addr` needs copied.
+///
+/// `access_len` is how many bytes the reference reads, where that is known:
+/// an instruction with a memory operand touches exactly the operand's width
+/// and nothing beyond it, so copying up to the end of that operand is as
+/// correct as copying the rest of the section and leaves the rest of the
+/// section's pointers unrooted. `None` is a reference that says nothing about
+/// the size of what it points at — an address taken by `lea`, or a pointer
+/// slot holding one — and the only range that is then certainly big enough is
+/// the section.
+///
+/// The copy runs from the section's first byte rather than from `target_addr`
+/// so that one blob serves every reference into the section: anchored at the
+/// section and growing forward, it can be extended for a later reference
+/// without moving, which would invalidate the offsets of every reference
+/// already resolved against it. The bytes between the objects that were
+/// referenced are the price of that, and they root nothing — only the
+/// relocations over the copied range do.
+///
+/// An address at or past the section's last byte needs nothing copied however
+/// unbounded the reference is: there is nothing there to copy. Such an address
+/// is an end marker — `__TMC_END__` at the end of `.data`, which the CRT's
+/// clone-table glue subtracts from `__TMC_LIST__` — and an end marker is
+/// compared and subtracted, never read through. `resolve_owning_unit` already
+/// declines to let a zero-size symbol at the same place own anything, for the
+/// same reason; this is the unnamed case of it.
+fn needed_prefix(sec: &SectionInfo<'_>, target_addr: u64, access_len: Option<u64>) -> u64 {
+    if target_addr >= sec.vaddr.saturating_add(sec.size) {
+        return 0;
+    }
+    match access_len {
+        Some(len) => target_addr
+            .saturating_add(len)
+            .saturating_sub(sec.vaddr)
+            .min(sec.size),
+        None => sec.size,
+    }
+}
+
 /// Extract the data holding `target_addr` if it has not been extracted already.
 /// Returns the blob's UnitId and the address its first byte had in the library.
 ///
-/// The range copied is the whole containing section, except for a GOT, where it
-/// is the single slot the address falls in ([`got_slot_at`]).
+/// The range copied is a prefix of the containing section long enough to hold
+/// what the reference reads ([`needed_prefix`]), except for a GOT, where it is
+/// the single slot the address falls in ([`got_slot_at`]).
 ///
 /// `ctx` names what was being extracted when the reference was found. It is
-/// only used to report the whole-section copies ([`WholeSectionCopy`]), which
-/// are the expensive case and the one worth being able to attribute.
+/// only used to report the section copies ([`DataSectionCopy`]), which are the
+/// expensive case and the one worth being able to attribute.
 fn ensure_data_blob_extracted(
     lib: Lib<'_, '_>,
     ctx: &str,
     target_addr: u64,
+    access_len: Option<u64>,
     state: &mut ExtractionState,
 ) -> Result<Option<(UnitId, u64)>> {
     // Find the section containing this address
@@ -2109,11 +2247,17 @@ fn ensure_data_blob_extracted(
         return Ok(None);
     }
 
-    // What to copy: one GOT slot, or the whole section for everything else.
-    let (base_vaddr, blob_len, alignment, whole_section) = match got_slot_at(&sec, target_addr) {
+    // What to copy: one GOT slot, or a long enough prefix of the section for
+    // everything else.
+    let (base_vaddr, needed, alignment, report_copy) = match got_slot_at(&sec, target_addr) {
         Some((slot, len)) => (slot, len, GOT_SLOT_SIZE, false),
-        // Conservative alignment for a whole data section.
-        None => (sec.vaddr, sec.size, 32, true),
+        // Conservative alignment for a data section copy.
+        None => (
+            sec.vaddr,
+            needed_prefix(&sec, target_addr, access_len),
+            32,
+            true,
+        ),
     };
 
     let blob_key = DataBlobKey {
@@ -2122,98 +2266,186 @@ fn ensure_data_blob_extracted(
         base: base_vaddr,
     };
 
-    // Check if already extracted
-    if let Some(info) = state.data_blobs.get(&blob_key) {
-        return Ok(Some((info.id, info.base_vaddr)));
+    let info = match state.data_blobs.get(&blob_key) {
+        Some(&info) => info,
+        // Claim the blob's id and register it *before* any of its bytes are
+        // copied. Resolving the relocations over those bytes can lead back to
+        // this same section — directly (a pointer in .data to the start of
+        // .data) or through another section whose own pointers come back here —
+        // and the lookup above has to be able to see the blob while that
+        // happens. Registering afterwards made such a target look unresolvable,
+        // and the copied bytes kept the library's own load-time VA, which
+        // points into unmapped memory once the library is dropped from
+        // DT_NEEDED.
+        None => {
+            let id = state.alloc_id();
+
+            // A section copy is where an output a hundred times the size of
+            // its input comes from: each pointer in the copied range is an
+            // extraction root one reference brought in. Record it so the cost
+            // can be reported and attributed instead of only showing up in the
+            // output's size (see `DataSectionCopy`).
+            //
+            // Recorded before the bytes are copied, because collecting their
+            // relocations copies further sections — reached through this one —
+            // and those have to be reported after it, not before: the records
+            // then read as the chain they are, each naming the section or
+            // symbol above it.
+            let report = report_copy.then(|| {
+                state.data_section_copies.push(DataSectionCopy {
+                    library: lib.path.to_path_buf(),
+                    section: sec.name.to_string(),
+                    bytes: 0,
+                    section_bytes: sec.size as usize,
+                    unreferenced_prefix: sec.size as usize,
+                    pointers: 0,
+                    address: target_addr,
+                    reached_from: ctx.to_string(),
+                });
+                state.data_section_copies.len() - 1
+            });
+
+            let info = DataBlobInfo {
+                id,
+                base_vaddr,
+                copied: 0,
+                report,
+            };
+            state.data_blobs.insert(blob_key, info);
+            state.push_unit(ExtractedUnit {
+                id,
+                name: blob_unit_name(lib.path, sec.name, base_vaddr, sec.vaddr),
+                source_lib: lib.path.to_path_buf(),
+                bytes: Vec::new(),
+                section_kind: sec.kind,
+                alignment,
+                relocations: Vec::new(),
+            });
+            info
+        }
+    };
+
+    // How far into the section the earliest reference landed: with the copy
+    // anchored at the section, everything before that is carried for nothing,
+    // and it is the only part of a bounded copy that is (see
+    // `DataSectionCopy::unreferenced_prefix`).
+    if let Some(at) = info.report {
+        let offset = (target_addr - sec.vaddr) as usize;
+        let copy = &mut state.data_section_copies[at];
+        copy.unreferenced_prefix = copy.unreferenced_prefix.min(offset);
     }
+
+    grow_data_blob(lib, &sec, blob_key, needed, state)?;
+    Ok(Some((info.id, info.base_vaddr)))
+}
+
+/// Copy enough of `sec` into the blob `key` names that it holds `needed` bytes
+/// from its base, collecting the dynamic relocations over every byte added.
+///
+/// Nothing is removed and nothing moves: the blob only ever gains bytes at its
+/// end, so the offsets of the references already resolved against it — and of
+/// the relocations already collected for it — stay what they were.
+fn grow_data_blob(
+    lib: Lib<'_, '_>,
+    sec: &SectionInfo<'_>,
+    key: DataBlobKey,
+    needed: u64,
+    state: &mut ExtractionState,
+) -> Result<()> {
+    let info = *state
+        .data_blobs
+        .get(&key)
+        .expect("the blob is registered before it is grown");
+    if info.copied >= needed {
+        return Ok(());
+    }
+    let id = info.id;
+
+    // Publish the longer extent before reading the bytes, for the same reason
+    // the id is published before the relocations are collected: resolving them
+    // can lead back into this very range, and the lookup has to find it rather
+    // than start a second copy of the same bytes. It also bounds the mutual
+    // recursion with `collect_dynamic_range_relocs` at one visit per range.
+    state.data_blobs.get_mut(&key).expect("just read").copied = needed;
 
     // Only now that the section is known to need copying are its bytes worth
-    // materializing: every return above happens for the great majority of the
-    // addresses this is asked about.
-    let sec_data = section_contents(lib.elf, &sec)?;
-    let SectionInfo {
-        name: sec_name,
-        vaddr: sec_addr,
-        kind: sec_kind,
-        ..
-    } = sec;
-
-    // The range to copy, held to the bytes the section actually has:
+    // materializing: most of the addresses `ensure_data_blob_extracted` is
+    // asked about never reach here.
+    //
+    // The range copied is held to the bytes the section actually has:
     // `describe_section` reports the length of those and not `sh_size`, so a
     // header claiming more than the file holds cannot make this read past them.
-    let from = (base_vaddr - sec_addr) as usize;
-    let to = (from + blob_len as usize).min(sec_data.len());
-    let mut blob_data = sec_data[from..to].to_vec();
-    let blob_range = base_vaddr..base_vaddr + blob_data.len() as u64;
-
-    // Claim the blob's id and register it *before* collecting its relocations.
-    // Resolving those relocations can lead back to this same section — directly
-    // (a pointer in .data to the start of .data) or through another section
-    // whose own pointers come back here — and the lookup above has to be able
-    // to see the blob while that happens. Registering afterwards made such a
-    // target look unresolvable, and the copied bytes kept the library's own
-    // load-time VA, which points into unmapped memory once the library is
-    // dropped from DT_NEEDED. It also bounds the mutual recursion with
-    // `collect_dynamic_range_relocs` at one visit per range.
-    let id = state.alloc_id();
+    let sec_data = section_contents(lib.elf, sec)?;
+    let from = (info.base_vaddr - sec.vaddr) as usize;
+    let start = (from + info.copied as usize).min(sec_data.len());
+    let end = (from + needed as usize).min(sec_data.len());
+    let added = &sec_data[start..end];
+    let added_range =
+        info.base_vaddr + info.copied..info.base_vaddr + info.copied + added.len() as u64;
     state
-        .data_blobs
-        .insert(blob_key, DataBlobInfo { id, base_vaddr });
+        .unit_mut(id)
+        .expect("the blob unit was pushed with the blob")
+        .bytes
+        .extend_from_slice(added);
 
-    // A whole-section copy is the merge's one unbounded step, and it is the
-    // step that decides how big the output gets: each pointer in the copy is an
-    // extraction root this one reference brought in. Record it so the cost can
-    // be reported and attributed instead of only showing up as an output a
-    // hundred times the size of its input (see `WholeSectionCopy`).
-    //
-    // Recorded before the pointers are counted, because collecting them copies
-    // further sections — reached through this one — and those have to be
-    // reported after it, not before: the records then read as the chain they
-    // are, each naming the section or symbol above it.
-    let report = whole_section.then(|| {
-        state.whole_section_copies.push(WholeSectionCopy {
-            library: lib.path.to_path_buf(),
-            section: sec_name.to_string(),
-            bytes: blob_data.len(),
-            pointers: 0,
-            address: target_addr,
-            reached_from: ctx.to_string(),
-        });
-        state.whole_section_copies.len() - 1
-    });
-
-    // Collect the relocations that fall inside the copied range — and only
-    // those: a relocation outside it describes bytes this unit does not hold,
-    // and following it would root data nothing here points at.
+    // Collect the relocations that fall inside the bytes just added — and only
+    // those: a relocation outside the copied range describes bytes this unit
+    // does not hold, and following it would root data nothing here points at.
+    // The ones over the bytes copied earlier were collected then.
+    // The section's own name is the context for what its pointers reach, not
+    // the caller's: a copy pulled in through this one is reported as having
+    // been reached from here, which is what makes the records read as a chain.
     let mut relocs = UnitRelocs::default();
-    collect_dynamic_range_relocs(lib, sec_name, blob_range, state, &mut relocs)?;
+    collect_dynamic_range_relocs(
+        lib,
+        sec.name,
+        added_range,
+        info.base_vaddr,
+        state,
+        &mut relocs,
+    )?;
+    let got_fixups = relocs.got_fixups.len();
 
-    if let Some(at) = report {
-        state.whole_section_copies[at].pointers =
-            relocs.relocations.len() + relocs.got_fixups.len();
+    // `register_got_slot_fixups` zeroes the slots it records, so the bytes have
+    // to be handed over mutably. They are taken out of the unit and put back
+    // rather than written before the append, because the collection above can
+    // have grown this same blob further and those bytes belong after these.
+    let mut bytes = std::mem::take(
+        &mut state
+            .unit_mut(id)
+            .expect("the blob unit is still registered")
+            .bytes,
+    );
+    let new_relocs = state.take_unit_relocs(id, &mut bytes, relocs);
+
+    // Claiming each offset is what keeps the jump-table pass and a copy that
+    // grew after it from writing two relocations into the same slot — in
+    // either order, since the claim both consults what the unit already holds
+    // and records what is being added to it.
+    let new_relocs: Vec<ExtractedReloc> = new_relocs
+        .into_iter()
+        .filter(|r| state.claim_blob_offset(id, r.offset_within_unit))
+        .collect();
+    let pointers = new_relocs.len() + got_fixups;
+
+    let unit = state
+        .unit_mut(id)
+        .expect("the blob unit is still registered");
+    unit.bytes = bytes;
+    unit.relocations.extend(new_relocs);
+    let (copied, relocations) = (unit.bytes.len(), unit.relocations.len());
+
+    if relocations > 0 {
+        debug!(section = sec.name, relocations, "Extracted data blob");
     }
 
-    let relocations = state.take_unit_relocs(id, &mut blob_data, relocs);
-
-    if !relocations.is_empty() {
-        debug!(
-            section = sec_name,
-            relocations = relocations.len(),
-            "Extracted data blob"
-        );
+    if let Some(at) = info.report {
+        let copy = &mut state.data_section_copies[at];
+        copy.bytes = copied;
+        copy.pointers += pointers;
     }
 
-    state.push_unit(ExtractedUnit {
-        id,
-        name: blob_unit_name(lib.path, sec_name, base_vaddr, sec_addr),
-        source_lib: lib.path.to_path_buf(),
-        bytes: blob_data,
-        section_kind: sec_kind,
-        alignment,
-        relocations,
-    });
-
-    Ok(Some((id, base_vaddr)))
+    Ok(())
 }
 
 /// What an extracted blob is called in the merge's own reporting: the library
@@ -2406,7 +2638,7 @@ mod tests {
             processed_libs: FastSet::default(),
             init_fini: InitFiniArrays::default(),
             data_blobs: FastMap::default(),
-            whole_section_copies: Vec::new(),
+            data_section_copies: Vec::new(),
             blob_reloc_offsets: FastMap::default(),
             units_at: FastMap::default(),
             plt_refs: FastMap::default(),
@@ -3291,7 +3523,7 @@ mod tests {
             elf: elf64,
             index: &index,
         };
-        let (blob_id, base) = ensure_data_blob_extracted(handle, ".data", data, &mut state)
+        let (blob_id, base) = ensure_data_blob_extracted(handle, ".data", data, None, &mut state)
             .expect("extract .data")
             .expect(".data is extractable");
         assert_eq!(base, data);
@@ -3381,10 +3613,10 @@ mod tests {
 
     /// Two references into one GOT slot share its blob, and references to
     /// neighbouring slots get a blob each — the lookup is by slot, not by
-    /// section. A section that is not a GOT is still copied whole, which is
-    /// what an address in it has to resolve against.
+    /// section. A section that is not a GOT is copied from its first byte, and
+    /// an unbounded reference into it takes the whole of it.
     #[test]
-    fn a_got_is_blobbed_per_slot_and_every_other_section_whole() {
+    fn a_got_is_blobbed_per_slot_and_every_other_section_from_its_start() {
         let lib = test_lib("libtinfo.so.6");
         let bytes = std::fs::read(&lib).expect("read library");
         let elf = parse_lib(&bytes);
@@ -3400,23 +3632,23 @@ mod tests {
             elf: &elf,
             index: &index,
         };
-        let blob_at = |addr: u64, state: &mut ExtractionState| {
-            ensure_data_blob_extracted(handle, "the test", addr, state)
+        let blob_at = |addr: u64, access_len: Option<u64>, state: &mut ExtractionState| {
+            ensure_data_blob_extracted(handle, "the test", addr, access_len, state)
                 .expect("extract the blob")
                 .expect("the address is in an extractable section")
         };
 
         // A slot in the middle of the table, so neither neighbour is outside it.
         let slot = got.address() + got.size() / 2 / 8 * 8;
-        let (first, base) = blob_at(slot, &mut state);
+        let (first, base) = blob_at(slot, Some(8), &mut state);
         assert_eq!(base, slot);
         // The four bytes above the slot's base belong to the same pointer.
-        assert_eq!(blob_at(slot + 4, &mut state), (first, slot));
-        let (next, next_base) = blob_at(slot + 8, &mut state);
+        assert_eq!(blob_at(slot + 4, Some(4), &mut state), (first, slot));
+        let (next, next_base) = blob_at(slot + 8, Some(8), &mut state);
         assert_ne!(next, first, "two slots came out as one blob");
         assert_eq!(next_base, slot + 8);
 
-        let (data_blob, data_base) = blob_at(data.address() + 8, &mut state);
+        let (data_blob, data_base) = blob_at(data.address() + 8, None, &mut state);
         assert_eq!(
             data_base,
             data.address(),
@@ -3433,6 +3665,311 @@ mod tests {
             "{} is not the whole section",
             unit.name
         );
+    }
+
+    /// A reference that says how many bytes it reads takes only the bytes up
+    /// to the end of what it read, and a later reference further into the same
+    /// section extends that one copy rather than starting a second: the blob is
+    /// anchored at the section and grows forward, so every offset already
+    /// resolved against it still means the same byte.
+    ///
+    /// This is what keeps the pointers past the copy out of the closure, which
+    /// is the whole of issue #66: on `libtinfo.so.6`'s `.data.rel.ro` the
+    /// section holds 1,500 of them and the first eight bytes hold one.
+    #[test]
+    fn a_bounded_reference_copies_only_as_far_as_it_reads_and_a_later_one_extends_it() {
+        let lib = test_lib("libtinfo.so.6");
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = parse_lib(&bytes);
+        let sec = elf.section_by_name(".data.rel.ro").expect(".data.rel.ro");
+        let (sec_addr, sec_size) = (sec.address(), sec.size());
+
+        let mut state = test_state();
+        let lib_id = state.lib_id(&lib);
+        let index = state.lib_index(lib_id, &elf);
+        let handle = Lib {
+            id: lib_id,
+            path: &lib,
+            elf: &elf,
+            index: &index,
+        };
+        let blob_at = |addr: u64, access_len: Option<u64>, state: &mut ExtractionState| {
+            ensure_data_blob_extracted(handle, "a caller", addr, access_len, state)
+                .expect("extract the blob")
+                .expect("the address is in an extractable section")
+        };
+        let blob_len = |id: UnitId, state: &ExtractionState| {
+            state
+                .units
+                .iter()
+                .find(|u| u.id == id)
+                .expect("the blob unit")
+                .bytes
+                .len() as u64
+        };
+
+        let (blob, base) = blob_at(sec_addr, Some(8), &mut state);
+        assert_eq!(base, sec_addr);
+        assert_eq!(
+            blob_len(blob, &state),
+            8,
+            "an eight-byte read copied more than the eight bytes it reads"
+        );
+        let first_pointers = state.data_section_copies[0].pointers;
+
+        // A reference the copy already covers neither grows it nor reports a
+        // second copy.
+        assert_eq!(blob_at(sec_addr + 4, Some(4), &mut state), (blob, base));
+        assert_eq!(blob_len(blob, &state), 8);
+
+        // One further in extends the same blob to reach it, and the relocations
+        // over the bytes added come with it.
+        let (again, base_again) = blob_at(sec_addr + 0x400, Some(8), &mut state);
+        assert_eq!(
+            (again, base_again),
+            (blob, base),
+            "extending the copy started a second blob"
+        );
+        assert_eq!(blob_len(blob, &state), 0x408);
+        assert!(sec_size > 0x408, "the fixture's section is too short");
+
+        let copy = state
+            .data_section_copies
+            .iter()
+            .find(|c| c.section == ".data.rel.ro")
+            .expect("the .data.rel.ro copy is recorded");
+        assert!(!copy.is_whole_section(), "{copy:?} is not a whole section");
+        assert_eq!(copy.bytes, 0x408);
+        assert_eq!(copy.section_bytes as u64, sec_size);
+        assert_eq!(
+            copy.address, sec_addr,
+            "the first reference is the one named"
+        );
+        assert!(
+            copy.pointers > first_pointers,
+            "the pointers over the bytes added were not counted: {copy:?}"
+        );
+
+        // The pointers reported are the pointers the blob holds, and the rest
+        // of the section's 1,500 are not in the closure at all.
+        let unit = state
+            .units
+            .iter()
+            .find(|u| u.id == blob)
+            .expect("the blob unit");
+        let fixups = state
+            .got_slot_fixups
+            .iter()
+            .filter(|f| f.unit == blob)
+            .count();
+        assert_eq!(copy.pointers, unit.relocations.len() + fixups);
+    }
+
+    /// The whole of issue #66, held to the closure it is about: the three MD5
+    /// entry points `test/md5sum` imports, plus the constructors and
+    /// destructors every merged library brings with it, against a stripped
+    /// 6.5 MB `libcrypto.so.3`.
+    ///
+    /// What those three functions actually reach is about 3K of code. What used
+    /// to come out was 10,218 units and 4.5 MB — 91% of the library's `.text`,
+    /// the ASN.1 item accessors included — because the destructor glue's
+    /// unnamed references into `.data` and `.bss` copied both sections whole,
+    /// and `.data`'s 553 pointers then copied `.data.rel.ro`, whose 24,342
+    /// reached the rest of the library.
+    #[test]
+    fn the_md5_entry_points_do_not_reach_the_rest_of_libcrypto() {
+        let lib = test_lib("libcrypto.so.3");
+        let mut state = test_state();
+        let lib_id = state.lib_id(&lib);
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = parse_lib(&bytes);
+        let index = state.lib_index(lib_id, &elf);
+
+        for sym in ["MD5_Init", "MD5_Update", "MD5_Final"] {
+            let key = key_in(&mut state, &lib, sym);
+            state.reserve(key);
+        }
+        let arrays = extract_init_fini_arrays(Lib {
+            id: lib_id,
+            path: &lib,
+            elf: &elf,
+            index: &index,
+        })
+        .expect("the library's init/fini arrays");
+        let roots: Vec<String> = arrays
+            .init_entries
+            .iter()
+            .chain(&arrays.fini_entries)
+            .map(|e| e.unit_name.clone())
+            .collect();
+        assert!(
+            !roots.is_empty(),
+            "the fixture has no constructors or destructors to root the closure"
+        );
+        for name in roots {
+            let key = key_in(&mut state, &lib, &name);
+            state.reserve(key);
+        }
+        while let Some((key, id)) = state.worklist.pop_front() {
+            process_symbol(&key, id, &mut state).expect("extract the closure");
+        }
+
+        let extracted: usize = state.units.iter().map(|u| u.bytes.len()).sum();
+        assert!(
+            state.units.len() < 50 && extracted < 300_000,
+            "the closure is {} units and {extracted} bytes; the sections copied \
+             were {:?}",
+            state.units.len(),
+            state
+                .data_section_copies
+                .iter()
+                .map(|c| (
+                    c.section.as_str(),
+                    c.bytes,
+                    c.pointers,
+                    c.reached_from.as_str()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !state
+                .data_section_copies
+                .iter()
+                .any(|c| c.section == ".data.rel.ro"),
+            "`.data.rel.ro` is still being copied: {:?}",
+            state.data_section_copies
+        );
+    }
+
+    /// A pointer slot holding its own address needs nothing of its section
+    /// beyond the slot, and an address at or past the end of a section's
+    /// contents needs nothing at all — the two unnamed objects the CRT leaves
+    /// in every shared library's `.data`, and between them the reason three MD5
+    /// entry points used to merge to most of `libcrypto.so.3`.
+    #[test]
+    fn a_self_referential_slot_and_a_section_end_marker_bound_themselves() {
+        let lib = test_lib("libcrypto.so.3");
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = parse_lib(&bytes);
+        let data = elf.section_by_name(".data").expect(".data");
+        let (data_addr, data_size) = (data.address(), data.size());
+
+        // `__dso_handle` is the first word of `.data` and holds its own
+        // address, which is the whole of what the fixture has to show for this
+        // to be the rule being tested and not a coincidence.
+        let self_pointer = elf
+            .dynamic_relocations()
+            .expect("dynamic relocations")
+            .any(|(roff, reloc)| roff == data_addr && reloc.addend() as u64 == data_addr);
+        assert!(
+            self_pointer,
+            "the fixture's .data does not start with a self-referential pointer"
+        );
+        assert_eq!(pointee_len(data_addr, data_addr), Some(8));
+        assert_eq!(pointee_len(data_addr, data_addr + 8), None);
+
+        let mut state = test_state();
+        let lib_id = state.lib_id(&lib);
+        let index = state.lib_index(lib_id, &elf);
+        let handle = Lib {
+            id: lib_id,
+            path: &lib,
+            elf: &elf,
+            index: &index,
+        };
+
+        // An eight-byte load of `__dso_handle` — what the destructor glue does
+        // with it — copies the eight bytes, and resolving the self-reference
+        // inside them does not take the rest of the section with it.
+        let (blob, base) =
+            ensure_data_blob_extracted(handle, "the glue", data_addr, Some(8), &mut state)
+                .expect("copy .data")
+                .expect(".data is extractable");
+        assert_eq!(base, data_addr);
+        let unit = state
+            .units
+            .iter()
+            .find(|u| u.id == blob)
+            .expect("the .data blob");
+        assert_eq!(
+            unit.bytes.len(),
+            8,
+            "the self-referential first word took {} bytes of .data with it",
+            unit.bytes.len()
+        );
+        assert!(
+            unit.relocations.iter().any(|r| matches!(
+                r.target,
+                RelocTarget::DataBlobOffset(id, 0) if id == blob
+            )),
+            "the self-reference was not retargeted at the blob: {:?}",
+            unit.relocations
+        );
+
+        // The end marker sits one past the last byte of `.data`, resolves to
+        // this same blob, and asks for nothing: there is nothing there.
+        let marker = data_addr + data_size;
+        assert_eq!(
+            ensure_data_blob_extracted(handle, "the glue", marker, None, &mut state)
+                .expect("resolve the marker")
+                .expect("the marker is attributed to .data"),
+            (blob, base)
+        );
+        assert_eq!(
+            state
+                .units
+                .iter()
+                .find(|u| u.id == blob)
+                .expect("the .data blob")
+                .bytes
+                .len(),
+            8,
+            "an end marker copied the section it marks the end of"
+        );
+
+        let [copy] = &state.data_section_copies[..] else {
+            panic!(
+                "expected the one .data copy: {:?}",
+                state.data_section_copies
+            );
+        };
+        assert!(!copy.is_whole_section());
+        assert_eq!((copy.bytes, copy.section_bytes as u64), (8, data_size));
+    }
+
+    /// `lea` is the reference that cannot be bounded: it hands out an address
+    /// and says nothing about what lives there, so the copy has to run to the
+    /// end of the section. A load of the same address through the same
+    /// displacement does say, and iced is where both answers come from — so
+    /// hold it to them rather than to the documentation.
+    #[test]
+    fn an_address_taken_by_lea_is_unbounded_and_a_load_of_it_is_not() {
+        // 48 8d 05 10 00 00 00   lea  rax, [rip+0x10]
+        // 48 8b 05 10 00 00 00   mov  rax, [rip+0x10]
+        // 0f 10 05 10 00 00 00   movups xmm0, [rip+0x10]
+        // 80 3d 10 00 00 00 00   cmp  byte [rip+0x10], 0
+        // 48 0f a3 05 10 00 00 00  bt   [rip+0x10], rax
+        let code: &[u8] = &[
+            0x48, 0x8d, 0x05, 0x10, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00,
+            0x0f, 0x10, 0x05, 0x10, 0x00, 0x00, 0x00, 0x80, 0x3d, 0x10, 0x00, 0x00, 0x00, 0x00,
+            0x48, 0x0f, 0xa3, 0x05, 0x10, 0x00, 0x00, 0x00,
+        ];
+        let instrs = decode_instructions(code, 0x1000);
+        let lens: Vec<Option<u64>> = instrs.iter().map(rip_access_len).collect();
+        assert_eq!(
+            lens,
+            vec![None, Some(8), Some(16), Some(1), None],
+            "decoded as {:?}",
+            instrs
+                .iter()
+                .map(|i| (i.mnemonic(), i.memory_size()))
+                .collect::<Vec<_>>()
+        );
+
+        // And the scan passes that on: same displacement, different bound.
+        let refs = scan_rip_relative_refs(&instrs, code, 0x1000);
+        let bounds: Vec<Option<u64>> = refs.iter().map(|r| r.access_len).collect();
+        assert_eq!(bounds, lens, "the scan dropped or reordered a bound");
     }
 
     /// Copying a whole section is the only step of the merge with no bound on
@@ -3459,24 +3996,24 @@ mod tests {
         };
 
         // A GOT slot is sliced, so nothing is reported for it.
-        ensure_data_blob_extracted(handle, "a caller", got.address(), &mut state)
+        ensure_data_blob_extracted(handle, "a caller", got.address(), None, &mut state)
             .expect("slice the GOT")
             .expect("the slot is extractable");
         assert!(
-            state.whole_section_copies.is_empty(),
+            state.data_section_copies.is_empty(),
             "a sliced GOT slot was reported as a whole-section copy: {:?}",
-            state.whole_section_copies
+            state.data_section_copies
         );
 
         let addr = data.address() + 8;
-        let (blob, _) = ensure_data_blob_extracted(handle, "a caller", addr, &mut state)
+        let (blob, _) = ensure_data_blob_extracted(handle, "a caller", addr, None, &mut state)
             .expect("copy .data")
             .expect(".data is extractable");
 
-        let [copy] = &state.whole_section_copies[..] else {
+        let [copy] = &state.data_section_copies[..] else {
             panic!(
                 "expected the one .data copy, got {:?}",
-                state.whole_section_copies
+                state.data_section_copies
             );
         };
         assert_eq!(copy.library, lib);
@@ -3528,11 +4065,11 @@ mod tests {
             elf: &elf,
             index: &index,
         };
-        ensure_data_blob_extracted(handle, "a caller", rel_ro, &mut state)
+        ensure_data_blob_extracted(handle, "a caller", rel_ro, None, &mut state)
             .expect("copy .data.rel.ro")
             .expect(".data.rel.ro is extractable");
 
-        let copies = &state.whole_section_copies;
+        let copies = &state.data_section_copies;
         assert_eq!(
             copies
                 .first()
@@ -3570,7 +4107,7 @@ mod tests {
         reserve_and_extract(&key, &mut state).expect("extract _nc_setupterm");
 
         let direct: Vec<&str> = state
-            .whole_section_copies
+            .data_section_copies
             .iter()
             .filter(|c| c.reached_from == "_nc_setupterm")
             .map(|c| c.section.as_str())
@@ -3578,13 +4115,13 @@ mod tests {
         assert!(
             !direct.is_empty(),
             "no copy was attributed to the symbol that caused it: {:?}",
-            state.whole_section_copies
+            state.data_section_copies
         );
 
         // Nothing else was extracted, so every copy is either one this symbol
         // asked for or one reached through another copied section's pointers —
         // never unattributed, and never a GOT, which is sliced.
-        for copy in &state.whole_section_copies {
+        for copy in &state.data_section_copies {
             assert!(!copy.reached_from.is_empty(), "{copy:?} has no context");
             assert!(
                 !matches!(copy.section.as_str(), ".got" | ".got.plt"),

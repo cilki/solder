@@ -288,32 +288,43 @@ pub struct ExtractedUnit {
     pub relocations: Vec<ExtractedReloc>,
 }
 
-/// A data section the merge copied in full because it could not bound the
-/// object that was referenced inside it.
+/// A data section the merge copied because it could not name the object that
+/// was referenced inside it.
 ///
 /// Extraction reaches a data address through a symbol, through an unwind
 /// record, or — failing both — through a blob of the containing section. A GOT
-/// is sliced per slot, which is exact; every other section is copied whole,
-/// and then *every* pointer in it is followed and whatever it points at is
-/// extracted too. One reference to one unnamed word therefore roots the
-/// section's entire pointer graph: on `test/md5sum` + `libcrypto.so.3`, where
-/// the three MD5 entry points reach about 3K of code between them, a
-/// symbol-less destructor helper's reference into `.data` is what brings in
-/// most of the library.
+/// is sliced per slot, which is exact and is not recorded here. Every other
+/// section is copied from its first byte up to the last byte any reference
+/// into it reads, and then *every* pointer in that range is followed and
+/// whatever it points at is extracted too.
 ///
-/// There is no bound to apply here that does not risk truncating a data object
-/// (see issue #66), so the merge keeps copying whole and reports each copy
-/// instead: the cost is otherwise invisible, since the output is correct and
+/// How long that range is depends on what the references are. An instruction
+/// with a memory operand says how many bytes it touches, so the copy stops
+/// where the furthest of them does; an address taken by `lea`, or stored in a
+/// pointer slot, says nothing about the size of what lives there, and the copy
+/// has to run to the end of the section. One such reference therefore roots
+/// the section's whole pointer graph, which is where an extraction far larger
+/// than the symbols asked for comes from (see issue #66).
+///
+/// Either way the cost is otherwise invisible — the output is correct, and
 /// only its size, its injected imports and its inherited `DT_NEEDED` entries
-/// give the blow-up away.
+/// give the blow-up away — so each copy is reported with what it cost and what
+/// reached into it.
 #[derive(Debug, Clone)]
-pub struct WholeSectionCopy {
+pub struct DataSectionCopy {
     /// The library the section was copied out of.
     pub library: PathBuf,
     /// The section's name, e.g. `.data.rel.ro`.
     pub section: String,
-    /// Bytes copied — the whole of the section's contents.
+    /// Bytes copied, counted from the section's first byte.
     pub bytes: usize,
+    /// The whole of the section's contents, which `bytes` equals when nothing
+    /// bounded the copy.
+    pub section_bytes: usize,
+    /// How many of the copied bytes lie before the first byte anything
+    /// references — the price of anchoring the copy at the section rather than
+    /// at the object, and the one part of a bounded copy that is pure waste.
+    pub unreferenced_prefix: usize,
     /// How many pointers the copied range holds: the dynamic relocations over
     /// it, each of which the merge has to make valid and so each of which
     /// roots whatever it points at. This is the number that decides how much
@@ -325,6 +336,21 @@ pub struct WholeSectionCopy {
     /// The unit being extracted when that reference was found: a symbol name,
     /// or the name of another section whose own pointers reached in here.
     pub reached_from: String,
+}
+
+impl DataSectionCopy {
+    /// Whether the copy ran to the end of the section because nothing bounded
+    /// it — the one step of the merge with no bound on it.
+    pub fn is_whole_section(&self) -> bool {
+        self.bytes >= self.section_bytes
+    }
+
+    /// Whether the copy holds bytes nothing asked for. A bounded copy that
+    /// begins where the first reference does and ends where the last one does
+    /// is exactly the merged code's own reads and is not worth a word.
+    pub fn is_oversized(&self) -> bool {
+        self.is_whole_section() || self.unreferenced_prefix > 0
+    }
 }
 
 /// An extracted unit with its assigned virtual address in the merged segment.

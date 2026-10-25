@@ -44,53 +44,60 @@ component, so spelling glibc `/usr/lib64/libc.so.6` does not get it past the
 list.
 
 Only the symbols the executable actually reaches are merged, together with
-their transitive closure inside the library. What the closure costs today is
-bounded less by how interconnected the library is than by how coarsely the
-merge extracts data: an address no symbol covers makes `solder` copy the whole
-section it lands in and extract everything the pointers in that section name,
-so a single reference into a pointer-dense section pulls in most of the
-library. The fixtures under `test/` show both shapes:
+their transitive closure inside the library. What the closure costs is bounded
+less by how interconnected the library is than by how precisely the merge can
+bound a data object: an address no symbol covers is bounded by the reference
+that reached it, and where the reference says nothing — `lea` hands out an
+address without saying what is at it — `solder` falls back to copying the whole
+containing section and extracting everything the pointers in it name. One such
+reference into a pointer-dense section pulls in most of the library. The
+fixtures under `test/` show both shapes:
 
 | executable | merged library | before | after |
 | ---------- | -------------- | -----: | ----: |
 | `grep`     | `libpcre2-8.so.0` (695K) |  198K |  871K |
-| `md5sum`   | `libcrypto.so.3` (6.2M)  |   54K |  4.7M |
+| `md5sum`   | `libcrypto.so.3` (6.2M)  |   54K |  268K |
 | `bash`     | `libtinfo.so.6` (215K)   | 1.2M  |  1.6M |
 
-`grep` is close to the genuine closure of the 19 `pcre2_*` entry points it
-calls. `md5sum` is not: `MD5_Init`, `MD5_Update` and `MD5_Final` between them
-reach about 3K of libcrypto's code, and the 4.7M is libcrypto's `.rodata`,
-`.data.rel.ro` and `.data` copied in whole with every function pointer in them
-extracted too. A GOT is the one data section extracted at the granularity it is
-read at — one slot per reference — so it no longer contributes; the rest is a
-limitation of the extractor, not a property of the library, and is tracked in
-issue #66.
+`grep` is the genuine closure of the 19 `pcre2_*` entry points it calls, plus
+libpcre2's `.rodata` copied whole for one `lea` into it. `md5sum`'s three MD5
+entry points reach about 3K of libcrypto's code; almost all of its 268K is
+libcrypto's `.rodata`, which is copied from its first byte up to the 16-byte
+constant `MD5_Init` loads 198K in. A data copy is anchored at the section so
+that a later reference can extend it without moving, and the bytes before the
+first thing referenced are what that costs — tracked, with the rest of the
+data-granularity problem, in issue #66.
 
-So `solder` is a way to drop a runtime dependency; it is not yet a way to keep
-the result small. Point `--dry-run` at a binary to see how much a merge would
-pull in before committing to it.
+Point `--dry-run` at a binary to see how much a merge would pull in before
+committing to it.
 
-Each section copied whole is reported as it happens — on a real merge as much
-as under `--dry-run` — with what it cost and what reached into it. Two of the
-four lines `md5sum` produces, wrapped here and with their timestamps dropped:
+Each data section copied past what the merged code reads is reported as it
+happens — on a real merge as much as under `--dry-run` — with what it cost and
+what reached into it. `md5sum` produces one such line and `bash` three, wrapped
+here and with their timestamps dropped:
 
 ```console
 $ solder md5sum -L ./libs
-WARN solder: ./libs/libcrypto.so.3 .data: merged whole — 10832 bytes and 553
-  pointers that root further extraction — because no symbol and no unwind
-  record bounds the object at 0x633000 that '.solder.anon.0x104020' references
-WARN solder: ./libs/libcrypto.so.3 .data.rel.ro: merged whole — 507008 bytes
-  and 24342 pointers that root further extraction — because no symbol and no
-  unwind record bounds the object at 0x5d9aa0 that '.data' references
+WARN solder: ./libs/libcrypto.so.3 .rodata: merged 198560 of 625947 bytes — of
+  which the first 198544 precede everything the merge references — and 0
+  pointers that root further extraction, because no symbol and no unwind record
+  bounds the object at 0x4a9790 that 'MD5_Init' references, so the copy is
+  anchored at the section's first byte
+
+$ solder bash -L ./libs
+WARN solder: ./libs/libtinfo.so.6 .data.rel.ro: merged whole — 12168 bytes and
+  1500 pointers that root further extraction — because no symbol and no unwind
+  record bounds the object at 0x327a0 that '.solder.anon.0x11cc0' references,
+  and the reference says nothing about its size either
 ```
 
 What a line attributes the copy to is whatever was being extracted when the
 reference was found: a symbol, a `.solder.anon.<address>` unit standing in for a
 stripped library's local helper, or another section whose own pointers reached
-in. The lines therefore read as a chain, outermost first — above, libcrypto's
-destructor glue has no symbol of its own, touches `.data`, and `.data`'s 553
-pointers are what bring in the half megabyte of `.data.rel.ro` the ASN.1 item
-accessors hang off. `--dry-run` adds the totals to the plan it prints.
+in. The lines therefore read as a chain, outermost first — above, a symbol-less
+local helper in libtinfo touches `.data.rel.ro`, and its 1,500 pointers are what
+root everything they name. A copy that is exactly the bytes the merged code
+reads gets no line; `--dry-run` adds the totals to the plan it prints.
 
 ### Inherited dependencies
 

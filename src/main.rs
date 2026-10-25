@@ -141,7 +141,7 @@ fn run() -> Result<()> {
         units,
         init_fini,
         got_slot_fixups,
-        whole_section_copies,
+        data_section_copies,
     } = extractor::extract_units(imports, &exe_elf, merged_lib_syms, &copy_relocated)?;
 
     for u in &units {
@@ -162,22 +162,43 @@ fn run() -> Result<()> {
     );
 
     // Warned rather than logged at `info!`, which the default filter drops:
-    // a whole-section copy is the one step of the merge with no bound on it,
-    // and the pointers it roots are what turn a handful of imported symbols
-    // into most of a library. Nothing else in a successful run says so — the
-    // output is correct, just vastly larger than the symbols asked for.
-    for copy in &whole_section_copies {
-        warn!(
-            "{} {}: merged whole — {} bytes and {} pointers that root further \
-             extraction — because no symbol and no unwind record bounds the \
-             object at {:#x} that '{}' references",
-            copy.library.display(),
-            copy.section,
-            copy.bytes,
-            copy.pointers,
-            copy.address,
-            copy.reached_from
-        );
+    // a data section copied past what the merged code reads is the step of the
+    // merge with the least bound on it, and the pointers it roots are what turn
+    // a handful of imported symbols into most of a library. Nothing else in a
+    // successful run says so — the output is correct, just larger than the
+    // symbols asked for. A copy that is exactly the bytes referenced is not
+    // worth a line; the two that are each explain themselves differently.
+    for copy in data_section_copies.iter().filter(|c| c.is_oversized()) {
+        if copy.is_whole_section() {
+            warn!(
+                "{} {}: merged whole — {} bytes and {} pointers that root further \
+                 extraction — because no symbol and no unwind record bounds the \
+                 object at {:#x} that '{}' references, and the reference says \
+                 nothing about its size either",
+                copy.library.display(),
+                copy.section,
+                copy.bytes,
+                copy.pointers,
+                copy.address,
+                copy.reached_from
+            );
+        } else {
+            warn!(
+                "{} {}: merged {} of {} bytes — of which the first {} precede \
+                 everything the merge references — and {} pointers that root \
+                 further extraction, because no symbol and no unwind record \
+                 bounds the object at {:#x} that '{}' references, so the copy is \
+                 anchored at the section's first byte",
+                copy.library.display(),
+                copy.section,
+                copy.bytes,
+                copy.section_bytes,
+                copy.unreferenced_prefix,
+                copy.pointers,
+                copy.address,
+                copy.reached_from
+            );
+        }
     }
 
     if !init_fini.init_entries.is_empty() || !init_fini.fini_entries.is_empty() {
@@ -330,7 +351,7 @@ fn run() -> Result<()> {
             &plan,
             imports,
             &dyn_info.needed,
-            &whole_section_copies,
+            &data_section_copies,
         );
         return Ok(());
     }
@@ -521,7 +542,7 @@ fn print_merge_plan(
     plan: &types::MergePlan,
     imports: &[types::ImportedSymbol],
     needed: &[String],
-    whole_section_copies: &[types::WholeSectionCopy],
+    data_section_copies: &[types::DataSectionCopy],
 ) {
     use std::collections::BTreeMap;
 
@@ -560,13 +581,19 @@ fn print_merge_plan(
     // The totals behind the per-copy warnings printed above: how much of what
     // is about to be merged is there because a data object could not be
     // bounded, rather than because a symbol the executable imports needs it.
-    if !whole_section_copies.is_empty() {
-        let bytes: usize = whole_section_copies.iter().map(|c| c.bytes).sum();
-        let pointers: usize = whole_section_copies.iter().map(|c| c.pointers).sum();
+    if !data_section_copies.is_empty() {
+        let bytes: usize = data_section_copies.iter().map(|c| c.bytes).sum();
+        let pointers: usize = data_section_copies.iter().map(|c| c.pointers).sum();
+        let whole = data_section_copies
+            .iter()
+            .filter(|c| c.is_whole_section())
+            .count();
         println!(
-            "  data sections merged whole for want of a bound: {} ({} bytes, \
-             {} pointers rooting further extraction)",
-            whole_section_copies.len(),
+            "  data sections copied for want of a symbol: {} ({} of them whole \
+             for want of a bound, {} bytes, {} pointers rooting further \
+             extraction)",
+            data_section_copies.len(),
+            whole,
             bytes,
             pointers
         );
