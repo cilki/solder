@@ -169,30 +169,41 @@ fn run() -> Result<()> {
     // symbols asked for. A copy that is exactly the bytes referenced is not
     // worth a line; the two that are each explain themselves differently.
     for copy in data_section_copies.iter().filter(|c| c.is_oversized()) {
-        if copy.is_whole_section() {
+        if copy.runs_to_section_end() {
+            // The copy's end is where the section's is, so what it took is
+            // either all of the section or everything from its first reference
+            // on.
+            let extent = if copy.start_offset == 0 {
+                format!("merged whole — {} bytes", copy.bytes)
+            } else {
+                format!(
+                    "merged {} of {} bytes, everything from offset {} on",
+                    copy.bytes, copy.section_bytes, copy.start_offset
+                )
+            };
             warn!(
-                "{} {}: merged whole — {} bytes and {} pointers that root further \
-                 extraction — because no symbol and no unwind record bounds the \
-                 object at {:#x} that '{}' references, and the reference says \
-                 nothing about its size either",
+                "{} {}: {extent} and {} pointers that root further extraction — \
+                 because no symbol and no unwind record bounds the object at \
+                 {:#x} that '{}' references, and the reference says nothing \
+                 about its size either",
                 copy.library.display(),
                 copy.section,
-                copy.bytes,
                 copy.pointers,
                 copy.address,
                 copy.reached_from
             );
         } else {
             warn!(
-                "{} {}: merged {} of {} bytes — of which the first {} precede \
-                 everything the merge references — and {} pointers that root \
-                 further extraction, because no symbol and no unwind record \
-                 bounds the object at {:#x} that '{}' references, so the copy is \
-                 anchored at the section's first byte",
+                "{} {}: merged {} of {} bytes from offset {} — of which the first \
+                 {} precede everything the merge references, kept because they \
+                 hold pointers the extraction already rests on — and {} pointers \
+                 that root further extraction, because no symbol and no unwind \
+                 record bounds the object at {:#x} that '{}' references",
                 copy.library.display(),
                 copy.section,
                 copy.bytes,
                 copy.section_bytes,
+                copy.start_offset,
                 copy.unreferenced_prefix,
                 copy.pointers,
                 copy.address,
@@ -586,7 +597,7 @@ fn print_merge_plan(
         let pointers: usize = data_section_copies.iter().map(|c| c.pointers).sum();
         let whole = data_section_copies
             .iter()
-            .filter(|c| c.is_whole_section())
+            .filter(|c| c.runs_to_section_end())
             .count();
         println!(
             "  data sections copied for want of a symbol: {} ({} of them whole \

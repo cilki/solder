@@ -288,15 +288,22 @@ pub struct ExtractedUnit {
     pub relocations: Vec<ExtractedReloc>,
 }
 
+/// Alignment of a copied data section, and so of every object in it: the
+/// objects a blob holds are placed relative to its first byte, and 32 bytes
+/// covers every aligned access x86-64 has (`movdqa` wants 16, the AVX forms
+/// 32). It is also the granularity the copy's start can move in, since moving
+/// it by anything else would change what each object in it is aligned to.
+pub const DATA_BLOB_ALIGNMENT: u64 = 32;
+
 /// A data section the merge copied because it could not name the object that
 /// was referenced inside it.
 ///
 /// Extraction reaches a data address through a symbol, through an unwind
 /// record, or — failing both — through a blob of the containing section. A GOT
 /// is sliced per slot, which is exact and is not recorded here. Every other
-/// section is copied from its first byte up to the last byte any reference
-/// into it reads, and then *every* pointer in that range is followed and
-/// whatever it points at is extracted too.
+/// section is copied up to the last byte any reference into it reads, and then
+/// *every* pointer in that range is followed and whatever it points at is
+/// extracted too.
 ///
 /// How long that range is depends on what the references are. An instruction
 /// with a memory operand says how many bytes it touches, so the copy stops
@@ -316,14 +323,20 @@ pub struct DataSectionCopy {
     pub library: PathBuf,
     /// The section's name, e.g. `.data.rel.ro`.
     pub section: String,
-    /// Bytes copied, counted from the section's first byte.
+    /// Bytes copied.
     pub bytes: usize,
-    /// The whole of the section's contents, which `bytes` equals when nothing
-    /// bounded the copy.
+    /// The whole of the section's contents, which `bytes` equals when neither
+    /// end of the copy could be bounded.
     pub section_bytes: usize,
+    /// Where in the section the copied bytes start. The copy is built anchored
+    /// at the section's first byte, so that a later reference can extend it
+    /// without moving it, and is moved up to the lowest byte anything
+    /// references once the closure is complete.
+    pub start_offset: usize,
     /// How many of the copied bytes lie before the first byte anything
-    /// references — the price of anchoring the copy at the section rather than
-    /// at the object, and the one part of a bounded copy that is pure waste.
+    /// references. Below [`DATA_BLOB_ALIGNMENT`] that is the padding which
+    /// keeps the objects in the copy aligned; above it, a prefix the copy had
+    /// to keep because it holds pointers the extraction already rests on.
     pub unreferenced_prefix: usize,
     /// How many pointers the copied range holds: the dynamic relocations over
     /// it, each of which the merge has to make valid and so each of which
@@ -339,17 +352,20 @@ pub struct DataSectionCopy {
 }
 
 impl DataSectionCopy {
-    /// Whether the copy ran to the end of the section because nothing bounded
-    /// it — the one step of the merge with no bound on it.
-    pub fn is_whole_section(&self) -> bool {
-        self.bytes >= self.section_bytes
+    /// Whether the copy runs to the end of the section because nothing bounded
+    /// what the reference reads — the one step of the merge with no bound on
+    /// it.
+    pub fn runs_to_section_end(&self) -> bool {
+        self.start_offset + self.bytes >= self.section_bytes
     }
 
     /// Whether the copy holds bytes nothing asked for. A bounded copy that
     /// begins where the first reference does and ends where the last one does
-    /// is exactly the merged code's own reads and is not worth a word.
+    /// is exactly the merged code's own reads and is not worth a word; so is
+    /// one carrying no more than the alignment padding under its first
+    /// reference.
     pub fn is_oversized(&self) -> bool {
-        self.is_whole_section() || self.unreferenced_prefix > 0
+        self.runs_to_section_end() || self.unreferenced_prefix as u64 >= DATA_BLOB_ALIGNMENT
     }
 }
 
