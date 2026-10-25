@@ -48,16 +48,19 @@ their transitive closure inside the library. What the closure costs is bounded
 less by how interconnected the library is than by how precisely the merge can
 bound a data object: an address no symbol covers is bounded by the reference
 that reached it, and where the reference says nothing — `lea` hands out an
-address without saying what is at it — `solder` falls back to copying the whole
-containing section and extracting everything the pointers in it name. One such
-reference into a pointer-dense section pulls in most of the library. The
-fixtures under `test/` show both shapes:
+address without saying what is at it — by the next object the library *does*
+name, which the unnamed one cannot run into. A library that exports its
+variables leaves that bound something to work with; a stripped one names
+nothing at all in its data sections, and `solder` falls back to copying the
+whole containing section and extracting everything the pointers in it name.
+One such reference into a pointer-dense section pulls in most of the library.
+The fixtures under `test/` show both shapes:
 
 | executable | merged library | before | after |
 | ---------- | -------------- | -----: | ----: |
 | `grep`     | `libpcre2-8.so.0` (695K) |  198K |  871K |
 | `md5sum`   | `libcrypto.so.3` (6.2M)  |   54K |   76K |
-| `bash`     | `libtinfo.so.6` (215K)   | 1.2M  |  1.6M |
+| `bash`     | `libtinfo.so.6` (215K)   | 1.2M  |  1.5M |
 
 `md5sum`'s three MD5 entry points reach about 3K of libcrypto's code and one
 16-byte constant, and that is all its merge copies: every data object they
@@ -86,19 +89,21 @@ their timestamps dropped:
 
 ```console
 $ solder bash -L ./libs
-WARN solder: ./libs/libtinfo.so.6 .data.rel.ro: merged whole — 12168 bytes and
-  1500 pointers that root further extraction — because no symbol and no unwind
-  record bounds the object at 0x327a0 that '.solder.anon.0x11cc0' references,
-  and the reference says nothing about its size either
+WARN solder: ./libs/libtinfo.so.6 .data.rel.ro: merged 96 of 12168 bytes from
+  offset 4032, up to the next symbol the library defines in it, and 9 pointers
+  that root further extraction — because no symbol and no unwind record bounds
+  the object at 0x327a0 that '.solder.anon.0x11cc0' references, and the
+  reference says nothing about its size either
 ```
 
 What a line attributes the copy to is whatever was being extracted when the
 reference was found: a symbol, a `.solder.anon.<address>` unit standing in for a
 stripped library's local helper, or another section whose own pointers reached
 in. The lines therefore read as a chain, outermost first — above, a symbol-less
-local helper in libtinfo touches `.data.rel.ro`, and its 1,500 pointers are what
-root everything they name. A copy that is exactly the bytes the merged code
-reads gets no line; `--dry-run` adds the totals to the plan it prints.
+local helper in libtinfo touches `.data.rel.ro` 4,032 bytes in, and the copy
+runs from there to the next table the library exports, rooting the nine pointers
+in between. A copy that is exactly the bytes the merged code reads gets no line;
+`--dry-run` adds the totals to the plan it prints.
 
 ### Inherited dependencies
 
