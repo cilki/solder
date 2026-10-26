@@ -398,54 +398,166 @@ const DT_RELR: u64 = object::elf::DT_RELR.0 as u64;
 /// `DT_RELRSZ`: that table's size in bytes.
 const DT_RELRSZ: u64 = object::elf::DT_RELRSZ.0 as u64;
 
-/// Refuse a library whose relative relocations are packed into `DT_RELR`.
+/// One `Elf64_Relr` word.
+const RELR_ENTRY_SIZE: u64 = 8;
+
+/// A bitmap word describes the 63 pointer slots following the address its
+/// predecessor set, one per bit above bit 0.
+const RELR_BITS_PER_WORD: u64 = 63;
+
+/// A relative relocation decoded out of a `DT_RELR` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelrReloc {
+    /// Virtual address of the 64-bit slot the loader rebases.
+    pub vaddr: u64,
+    /// The word that slot holds as linked, which is the address it points at.
+    ///
+    /// A `DT_RELR` entry has no addend field: the loader's whole action is
+    /// `*slot += load_base`, so the in-place word is the library-relative
+    /// address an `R_X86_64_RELATIVE` would have spelled out in `r_addend`.
+    /// Reading it here is what lets a packed entry be lifted by the same code
+    /// that lifts an explicit one.
+    pub addend: u64,
+}
+
+/// Decode the relative relocations a library packs into `DT_RELR`, or an empty
+/// list when it has none.
 ///
 /// `ld -z pack-relative-relocs` replaces a library's `R_X86_64_RELATIVE`
 /// entries with a `DT_RELR` bitmap that says the same thing in about a
-/// hundredth of the space — 1503 entries of `libtinfo.so.6`'s `.rela.dyn`,
-/// 36072 bytes, pack into 216. Several distributions have linked that way
-/// since 2023, so it is an ordinary shape for a library to arrive in.
+/// hundredth of the space — the 1503 relative entries of `libtinfo.so.6`'s
+/// `.rela.dyn`, 36072 bytes, pack into 216. Several distributions have linked
+/// that way since 2023, so it is an ordinary shape for a library to arrive in.
 ///
-/// Nothing in solder reads it. Extraction finds a library's relocations
-/// through `object`'s `dynamic_relocations`, which walks `SHT_REL`/`SHT_RELA`
-/// sections and skips `SHT_RELR` — so the invariant
-/// [`collect_dynamic_range_relocs`](crate::extractor) rests on, that a linked
-/// shared object carries its data relocations in `.rela.dyn`, quietly stops
-/// holding.
+/// Nothing but this reads it: extraction finds a library's relocations through
+/// `object`'s `dynamic_relocations`, which walks `SHT_REL`/`SHT_RELA` sections
+/// and skips `SHT_RELR`. Left undecoded, the invariant
+/// [`collect_dynamic_range_relocs`](crate::extractor) rests on — that a linked
+/// shared object carries its data relocations in `.rela.dyn` — quietly stops
+/// holding, and the merge is not smaller but wrong in two ways: every pointer
+/// in the data it copies keeps the address the library was linked at, with no
+/// relocation to rebase it into the merged segment, and those same pointers
+/// are what roots the rest of the extraction, so the units they point at are
+/// never copied in either. `test/bash` merged against a `DT_RELR` build of
+/// `libtinfo.so.6` used to come out six units short, with ten function
+/// pointers in `.solder.data` still holding libtinfo's own offsets — addresses
+/// that land in the middle of bash's `.text` once the merged binary loads.
 ///
-/// Missing them does not make for a smaller merge but a wrong one, in two
-/// ways. Every pointer in the data the merge copies keeps the address the
-/// library was linked at, with no relocation to rebase it into the merged
-/// segment. And those same pointers are what roots the rest of the
-/// extraction, so the units they point at are never copied in either.
-/// `test/bash` merged against a `DT_RELR` build of `libtinfo.so.6` comes out
-/// six units short, with ten function pointers in `.solder.data` still
-/// holding libtinfo's own offsets — addresses that land in the middle of
-/// bash's `.text` once the merged binary is loaded.
+/// The encoding (generic-abi `DT_RELR`) is a stream of 64-bit words. An even
+/// word is an address: that slot is relocated, and the next word describes the
+/// run starting eight bytes later. An odd word is a bitmap of the 63 slots
+/// following that point, bit *n* standing for the slot `8 * n` bytes in. A
+/// stream cannot open with a bitmap, since there is no address for it to be
+/// relative to.
 ///
-/// Refusing is what the merge can honestly do with a library it cannot read,
-/// as for the relocation types extraction cannot lift.
-pub fn refuse_packed_relative_relocs(bytes: &[u8], path: &Path) -> Result<()> {
+/// Anything unreadable here is an error rather than a skipped entry: a
+/// relative relocation that goes missing is a stale pointer in the merged
+/// binary, which is exactly what reading the table at all is for.
+pub fn packed_relative_relocs(elf: &ElfFile64<'_>, path: &Path) -> Result<Vec<RelrReloc>> {
+    let bytes = elf.data();
     let dynamic = DynamicTable::parse(bytes)
         .with_context(|| format!("reading {}'s .dynamic", path.display()))?;
 
-    // The three `DT_RELR*` tags are emitted as a set, but it is `DT_RELRSZ`
-    // that says whether the table relocates anything: an empty one is nothing
-    // for the merge to be missing.
+    let Some(table_va) = dynamic.value_of(DT_RELR) else {
+        return Ok(Vec::new());
+    };
+    // The `DT_RELR*` tags are emitted as a set, but it is `DT_RELRSZ` that
+    // says whether the table relocates anything — and it is the size glibc
+    // reads to decide the same thing, so a tag without one is an empty table
+    // to the loader too.
     let size = dynamic.value_of(DT_RELRSZ).unwrap_or(0);
-    if dynamic.value_of(DT_RELR).is_none() || size == 0 {
-        return Ok(());
+    if size == 0 {
+        return Ok(Vec::new());
     }
 
-    bail!(
-        "{}: its relative relocations are packed into DT_RELR ({size} bytes), which solder \
-         cannot read. Merging it would copy data whose pointers keep this library's \
-         link-time addresses, with nothing to rebase them into the merged segment, and \
-         would leave behind the units only those pointers reach. Merge a build linked with \
-         `-Wl,-z,nopack-relative-relocs`, which keeps them as R_X86_64_RELATIVE entries in \
-         .rela.dyn",
-        path.display()
-    );
+    if !size.is_multiple_of(RELR_ENTRY_SIZE) {
+        bail!(
+            "{}: DT_RELRSZ is {size} bytes, not a whole number of {RELR_ENTRY_SIZE}-byte \
+             DT_RELR entries",
+            path.display()
+        );
+    }
+    let table_offset = va_to_file_offset(elf, table_va).with_context(|| {
+        format!(
+            "{}: DT_RELR names a table at {table_va:#x}, which no loaded segment's file \
+             contents cover",
+            path.display()
+        )
+    })?;
+    let table = usize::try_from(table_offset)
+        .ok()
+        .and_then(|at| at.checked_add(size as usize).map(|end| at..end))
+        .and_then(|range| bytes.get(range))
+        .with_context(|| {
+            format!(
+                "{}: the {size}-byte DT_RELR table at {table_va:#x} runs past the end of this \
+                 {}-byte file",
+                path.display(),
+                bytes.len()
+            )
+        })?;
+
+    let mut relocs = Vec::with_capacity(table.len());
+    // Where the next bitmap word starts counting from. `None` until an address
+    // word has set it.
+    let mut cursor: Option<u64> = None;
+    for word in table
+        .chunks_exact(RELR_ENTRY_SIZE as usize)
+        .map(|w| u64::from_le_bytes(w.try_into().expect("8 bytes")))
+    {
+        if word & 1 == 0 {
+            relocs.push(relr_slot(elf, path, word)?);
+            cursor = Some(word.saturating_add(RELR_ENTRY_SIZE));
+            continue;
+        }
+        let base = cursor.with_context(|| {
+            format!(
+                "{}: the DT_RELR table at {table_va:#x} opens with the bitmap word \
+                 {word:#x}, which has no address to be relative to",
+                path.display()
+            )
+        })?;
+        let mut bits = word >> 1;
+        let mut slot = base;
+        while bits != 0 {
+            if bits & 1 != 0 {
+                relocs.push(relr_slot(elf, path, slot)?);
+            }
+            bits >>= 1;
+            slot = slot.saturating_add(RELR_ENTRY_SIZE);
+        }
+        cursor = Some(base.saturating_add(RELR_BITS_PER_WORD * RELR_ENTRY_SIZE));
+    }
+
+    Ok(relocs)
+}
+
+/// One slot a `DT_RELR` stream named, paired with the link-time address it
+/// holds — see [`RelrReloc::addend`] for why that word is the addend.
+fn relr_slot(elf: &ElfFile64<'_>, path: &Path, vaddr: u64) -> Result<RelrReloc> {
+    if !vaddr.is_multiple_of(RELR_ENTRY_SIZE) {
+        bail!(
+            "{}: DT_RELR relocates {vaddr:#x}, which is not a {RELR_ENTRY_SIZE}-byte aligned \
+             pointer slot",
+            path.display()
+        );
+    }
+    // The slot has to be backed by file contents, not just mapped: its own
+    // word is the addend, so a `.bss` slot would relocate to nothing. The
+    // linker never puts one there, exactly because of that.
+    let at = va_to_file_offset(elf, vaddr).with_context(|| {
+        format!(
+            "{}: DT_RELR relocates {vaddr:#x}, which no loaded segment's file contents cover",
+            path.display()
+        )
+    })?;
+    let addend = read_u64(elf.data(), at as usize).with_context(|| {
+        format!(
+            "{}: reading the pointer DT_RELR relocates at {vaddr:#x}",
+            path.display()
+        )
+    })?;
+    Ok(RelrReloc { vaddr, addend })
 }
 
 /// Size of an `Elf64_Dyn`: `d_tag` (8 bytes) followed by `d_val`/`d_ptr`.
@@ -962,12 +1074,96 @@ mod merge_library_tests {
         }
     }
 
+    fn parse(bytes: &[u8]) -> ElfFile64<'_> {
+        ElfFile64::<object::Endianness>::parse(bytes).expect("parse the library")
+    }
+
+    /// The explicit `R_X86_64_RELATIVE` entries of a library's `.rela.dyn`,
+    /// read straight out of the table — the set a packed build has to decode
+    /// back to, byte for byte.
+    fn explicit_relative_relocs(bytes: &[u8]) -> Vec<RelrReloc> {
+        let table = SectionTable::parse(bytes)
+            .expect("section headers")
+            .expect("a section header table");
+        let rela = table
+            .sections
+            .iter()
+            .find(|s| s.name == ".rela.dyn")
+            .expect(".rela.dyn");
+        let at = rela.offset as usize;
+        let mut out = Vec::new();
+        for i in 0..rela.size as usize / 24 {
+            let entry = &bytes[at + i * 24..][..24];
+            let r_info = u64::from_le_bytes(entry[8..16].try_into().expect("r_info"));
+            // `r_info` of a relative entry is its type alone: it names no
+            // symbol, so the symbol half of the field is zero.
+            if r_info == u64::from(object::elf::R_X86_64_RELATIVE.0) {
+                out.push(RelrReloc {
+                    vaddr: u64::from_le_bytes(entry[0..8].try_into().expect("r_offset")),
+                    addend: u64::from_le_bytes(entry[16..24].try_into().expect("r_addend")),
+                });
+            }
+        }
+        out.sort_unstable_by_key(|r| r.vaddr);
+        out
+    }
+
+    /// A `DT_RELR` table decodes back to exactly the relocations it packs —
+    /// the same slots, each with the same link-time address, as the
+    /// `.rela.dyn` entries the pack replaced.
+    ///
+    /// This is the whole of what makes a packed library mergeable: a slot the
+    /// decoder misses is a pointer in the merged binary that keeps the address
+    /// the library was linked at, and a target it gets wrong is a pointer at
+    /// the wrong byte. Holding it to real libraries rather than to a
+    /// hand-written stream is what checks the bitmap runs the encoding spends
+    /// its space on — libtinfo's 1503 entries come to 27 bitmap words.
+    #[test]
+    fn a_packed_table_decodes_to_the_relocations_it_replaced() {
+        for name in TEST_LIBS {
+            let original = read_test_lib(name);
+            let (packed, expected) = relr_packing::pack_relative_relocs(&original);
+
+            assert_eq!(
+                expected,
+                explicit_relative_relocs(&original),
+                "{name}: the pack did not take the whole of .rela.dyn's relative entries"
+            );
+            assert!(
+                expected.len() > 10,
+                "{name}: only {} relative relocations to pack",
+                expected.len()
+            );
+            assert_eq!(
+                explicit_relative_relocs(&packed),
+                Vec::new(),
+                "{name}: .rela.dyn still spells out relative entries after packing"
+            );
+
+            let decoded = packed_relative_relocs(&parse(&packed), Path::new(name))
+                .unwrap_or_else(|e| panic!("{name}: decoding DT_RELR: {e:#}"));
+            assert_eq!(decoded, expected, "{name}");
+        }
+    }
+
+    /// The committed fixtures keep their relative relocations in `.rela.dyn`,
+    /// where `object` reads them, so there is no table to decode and nothing
+    /// for this to add.
+    #[test]
+    fn a_library_with_no_dt_relr_yields_no_relocations() {
+        for name in TEST_LIBS {
+            let bytes = read_test_lib(name);
+            let decoded = packed_relative_relocs(&parse(&bytes), Path::new(name))
+                .unwrap_or_else(|e| panic!("{name} should be mergeable: {e:#}"));
+            assert_eq!(decoded, Vec::new(), "{name}");
+        }
+    }
+
     /// A real library with the `DT_RELR` tags written over the spare
-    /// `.dynamic` slots the linker leaves past `DT_NULL`. That is the whole of
-    /// how a `-z pack-relative-relocs` build differs from the fixtures in what
-    /// this check reads; the table those tags name is somewhere else in the
-    /// file, and the check never follows them to it.
-    fn with_packed_relr(name: &str, size: u64) -> Vec<u8> {
+    /// `.dynamic` slots the linker leaves past `DT_NULL`, naming a table that
+    /// is not there. The tags are the whole of how a packed build announces
+    /// itself, so this is how a malformed one arrives.
+    fn with_relr_tags(name: &str, table_va: u64, size: u64) -> Vec<u8> {
         let mut bytes = read_test_lib(name);
         let dynamic = DynamicTable::parse(&bytes).expect(".dynamic of a test library");
         let at = dynamic.used();
@@ -977,7 +1173,7 @@ mod merge_library_tests {
             dynamic.capacity() - at
         );
 
-        for (i, (tag, val)) in [(DT_RELR, 0x1000), (DT_RELRSZ, size)]
+        for (i, (tag, val)) in [(DT_RELR, table_va), (DT_RELRSZ, size)]
             .into_iter()
             .enumerate()
         {
@@ -992,44 +1188,236 @@ mod merge_library_tests {
         bytes
     }
 
-    /// The fixtures keep their relative relocations in `.rela.dyn`, which is
-    /// the only reason merging them produces correct pointers — so the check
-    /// has to let them through, or it would refuse every merge solder can do.
+    /// A table solder cannot read has to fail the merge, not yield the part of
+    /// itself that decoded: the relocations it withholds are the pointers the
+    /// merged binary would carry stale, which is the whole reason for reading
+    /// it. Each of these is a shape a size or an address field can take —
+    /// a length that is not a whole number of entries, and a table outside the
+    /// loaded image.
     #[test]
-    fn the_libraries_solder_merges_have_readable_relative_relocs() {
-        for name in TEST_LIBS {
-            refuse_packed_relative_relocs(&read_test_lib(name), Path::new(name))
-                .unwrap_or_else(|e| panic!("{name} should be mergeable: {e:#}"));
-        }
-    }
-
-    /// The one that used to merge *wrongly*: `object`'s `dynamic_relocations`
-    /// walks `SHT_RELA` only, so a packed library's relative relocations were
-    /// not refused, not warned about and not read — the merge copied its data
-    /// with every pointer still holding a link-time address and exited 0.
-    #[test]
-    fn a_library_with_packed_relative_relocs_is_refused() {
-        for name in TEST_LIBS {
-            let bytes = with_packed_relr(name, 216);
-            let path = PathBuf::from("/sysroot/lib").join(name);
+    fn a_dt_relr_table_that_cannot_be_read_is_refused() {
+        let name = TEST_LIBS[0];
+        let path = PathBuf::from("/sysroot/lib").join(name);
+        for (table_va, size, expected) in [
+            (0x4518, 12, "not a whole number"),
+            (0xdead_0000, 216, "no loaded segment"),
+        ] {
+            let bytes = with_relr_tags(name, table_va, size);
             let err = format!(
                 "{:#}",
-                refuse_packed_relative_relocs(&bytes, &path)
-                    .expect_err("a packed library must be refused")
+                packed_relative_relocs(&parse(&bytes), &path)
+                    .expect_err("an unreadable DT_RELR table must be refused")
             );
-            assert!(err.contains("DT_RELR"), "{err}");
-            assert!(err.contains("216 bytes"), "{err}");
+            assert!(err.contains(expected), "{err}");
             assert!(err.contains(&path.display().to_string()), "{err}");
         }
     }
 
-    /// `DT_RELR` naming an empty table relocates nothing, so there is nothing
-    /// the merge would be missing and nothing to refuse the library over.
+    /// A stream whose first word is a bitmap has no address for that bitmap to
+    /// count from, so there is no reading it — the loader would take the
+    /// relocated slots to start at 0.
     #[test]
-    fn a_packed_table_with_no_entries_is_accepted() {
-        let bytes = with_packed_relr(TEST_LIBS[0], 0);
-        refuse_packed_relative_relocs(&bytes, Path::new(TEST_LIBS[0]))
+    fn a_dt_relr_table_opening_with_a_bitmap_is_refused() {
+        let name = TEST_LIBS[0];
+        let original = read_test_lib(name);
+        let (mut packed, _) = relr_packing::pack_relative_relocs(&original);
+
+        let table_va = DynamicTable::parse(&packed)
+            .expect(".dynamic")
+            .value_of(DT_RELR)
+            .expect("DT_RELR");
+        let at = va_to_file_offset(&parse(&packed), table_va).expect("the table is file-backed");
+        // Set bit 0 of the leading address word, which is what marks a word as
+        // a bitmap.
+        packed[at as usize] |= 1;
+
+        let err = format!(
+            "{:#}",
+            packed_relative_relocs(&parse(&packed), Path::new(name))
+                .expect_err("a stream cannot open with a bitmap word")
+        );
+        assert!(err.contains("no address to be relative to"), "{err}");
+    }
+
+    /// `DT_RELR` naming an empty table relocates nothing, so there is nothing
+    /// to decode and nothing to refuse the library over.
+    #[test]
+    fn an_empty_dt_relr_table_yields_no_relocations() {
+        let bytes = with_relr_tags(TEST_LIBS[0], 0x4518, 0);
+        let decoded = packed_relative_relocs(&parse(&bytes), Path::new(TEST_LIBS[0]))
             .expect("an empty DT_RELR table withholds nothing");
+        assert_eq!(decoded, Vec::new());
+    }
+}
+
+/// Repacking a library's relative relocations the way
+/// `ld -z pack-relative-relocs` does, so the decoder and extraction can both
+/// be held to a real `DT_RELR` build without one being committed as a fixture.
+///
+/// A fixture would be the stronger input, but there is no linker in the test
+/// environment to produce one and a hand-built stream would only check the
+/// decoder against the encoder's idea of the format. Repacking a committed
+/// library keeps the relocated set provably the same — the `.rela.dyn` entries
+/// it replaces are right there to compare against — which is what makes
+/// "extracting the packed build gives the same units as the unpacked one" an
+/// assertion about solder and not about the fixture.
+#[cfg(test)]
+pub(crate) mod relr_packing {
+    use super::*;
+
+    /// `sizeof (Elf64_Rela)`.
+    const RELA_ENTRY_SIZE: usize = 24;
+
+    /// Move every `R_X86_64_RELATIVE` entry of `bytes`' `.rela.dyn` into a
+    /// `DT_RELR` table, returning the repacked image and the relocations that
+    /// table now carries, in address order.
+    ///
+    /// A packed entry has no addend field — the loader's whole action is
+    /// `*slot += load_base` — so each relocated slot is given the `r_addend`
+    /// its explicit entry spelled out, which is what the linker writes there
+    /// when it packs them. The entries that survive are compacted to the front
+    /// of `.rela.dyn`, the table goes in the space that frees up, and the
+    /// section's `sh_size` and `DT_RELASZ` are cut to the survivors — so
+    /// `object`'s `dynamic_relocations`, which reads the section, sees exactly
+    /// what it would see of a packed build: the relative entries gone.
+    pub(crate) fn pack_relative_relocs(bytes: &[u8]) -> (Vec<u8>, Vec<RelrReloc>) {
+        let elf = ElfFile64::<object::Endianness>::parse(bytes).expect("parse the library");
+        let mut out = bytes.to_vec();
+
+        let table = SectionTable::parse(bytes)
+            .expect("section headers")
+            .expect("a section header table");
+        let rela = table
+            .sections
+            .iter()
+            .find(|s| s.name == ".rela.dyn")
+            .expect(".rela.dyn");
+        let shdr_at = table.offset + rela.index * SHDR_SIZE;
+        let rela_at = rela.offset as usize;
+        let rela_size = rela.size as usize;
+        assert_eq!(
+            rela_size % RELA_ENTRY_SIZE,
+            0,
+            ".rela.dyn is not a whole number of entries"
+        );
+
+        let mut packed: Vec<RelrReloc> = Vec::new();
+        let mut kept: Vec<u8> = Vec::new();
+        for i in 0..rela_size / RELA_ENTRY_SIZE {
+            let entry = &bytes[rela_at + i * RELA_ENTRY_SIZE..][..RELA_ENTRY_SIZE];
+            let r_info = u64::from_le_bytes(entry[8..16].try_into().expect("r_info"));
+            if r_info == u64::from(object::elf::R_X86_64_RELATIVE.0) {
+                packed.push(RelrReloc {
+                    vaddr: u64::from_le_bytes(entry[0..8].try_into().expect("r_offset")),
+                    addend: u64::from_le_bytes(entry[16..24].try_into().expect("r_addend")),
+                });
+            } else {
+                kept.extend_from_slice(entry);
+            }
+        }
+        packed.sort_unstable_by_key(|r| r.vaddr);
+        assert!(
+            !packed.is_empty(),
+            "the library has no relative relocations to pack"
+        );
+
+        let stream = encode(&packed);
+        let stream_bytes = stream.len() * RELR_ENTRY_SIZE as usize;
+        assert!(
+            kept.len() + stream_bytes <= rela_size,
+            "the packed table does not fit in the {rela_size} bytes .rela.dyn frees up"
+        );
+
+        // The word in the slot is a packed entry's only addend.
+        for reloc in &packed {
+            let at = va_to_file_offset(&elf, reloc.vaddr).expect("a relocated slot is file-backed");
+            out[at as usize..][..8].copy_from_slice(&reloc.addend.to_le_bytes());
+        }
+
+        out[rela_at..][..kept.len()].copy_from_slice(&kept);
+        let stream_at = rela_at + kept.len();
+        for (i, word) in stream.iter().enumerate() {
+            out[stream_at + i * RELR_ENTRY_SIZE as usize..][..8]
+                .copy_from_slice(&word.to_le_bytes());
+        }
+        out[stream_at + stream_bytes..rela_at + rela_size].fill(0);
+        out[shdr_at + SH_SIZE..][..8].copy_from_slice(&(kept.len() as u64).to_le_bytes());
+
+        let dynamic = DynamicTable::parse(bytes).expect(".dynamic of a test library");
+        let mut set = |tag: u64, val: u64| {
+            if let Some(i) = dynamic.index_of(tag) {
+                out[dynamic.value_offset(i)..][..8].copy_from_slice(&val.to_le_bytes());
+            }
+        };
+        set(object::elf::DT_RELASZ.0 as u64, kept.len() as u64);
+        // `DT_RELACOUNT` counts the relative entries `.rela.dyn` opens with,
+        // and there are none left.
+        set(object::elf::DT_RELACOUNT.0 as u64, 0);
+
+        // The `DT_RELR*` tags go over the spare slots the linker leaves past
+        // `DT_NULL`, with one more for the terminator that moves past them.
+        let tags = [
+            (DT_RELR, rela.addr + kept.len() as u64),
+            (DT_RELRSZ, stream_bytes as u64),
+            (object::elf::DT_RELRENT.0 as u64, RELR_ENTRY_SIZE),
+        ];
+        let at = dynamic.used();
+        assert!(
+            at + tags.len() < dynamic.capacity(),
+            "{} spare .dynamic slots, need {}",
+            dynamic.capacity() - at,
+            tags.len() + 1
+        );
+        for (i, (tag, val)) in tags.into_iter().enumerate() {
+            let o = dynamic.entry_offset(at + i);
+            out[o..o + 8].copy_from_slice(&tag.to_le_bytes());
+            out[o + 8..o + 16].copy_from_slice(&val.to_le_bytes());
+        }
+        let end = dynamic.entry_offset(at + tags.len());
+        out[end..end + DYN_ENTRY_SIZE].fill(0);
+
+        (out, packed)
+    }
+
+    /// Encode `relocs`, in address order, as a `DT_RELR` stream: an address
+    /// word for the slot that opens each run, then one bitmap word per 63
+    /// slots the run goes on to cover.
+    ///
+    /// This is the linker's side of the format that
+    /// [`packed_relative_relocs`](super::packed_relative_relocs) reads, and
+    /// the only reason it is spelled out here rather than taken from a
+    /// reference encoder: the decoder has to be checked against a stream it
+    /// did not produce.
+    fn encode(relocs: &[RelrReloc]) -> Vec<u64> {
+        let slots: Vec<u64> = relocs.iter().map(|r| r.vaddr).collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < slots.len() {
+            out.push(slots[i]);
+            let mut base = slots[i] + RELR_ENTRY_SIZE;
+            i += 1;
+            loop {
+                let mut bits = 0u64;
+                while let Some(&slot) = slots.get(i) {
+                    let Some(bit) = slot
+                        .checked_sub(base)
+                        .map(|d| d / RELR_ENTRY_SIZE)
+                        .filter(|&d| d < RELR_BITS_PER_WORD)
+                    else {
+                        break;
+                    };
+                    assert_eq!(slot % RELR_ENTRY_SIZE, 0, "{slot:#x} is not a pointer slot");
+                    bits |= 1 << bit;
+                    i += 1;
+                }
+                if bits == 0 {
+                    break;
+                }
+                out.push((bits << 1) | 1);
+                base += RELR_BITS_PER_WORD * RELR_ENTRY_SIZE;
+            }
+        }
+        out
     }
 }
 

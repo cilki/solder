@@ -325,31 +325,30 @@ impl ExtractionState {
         let path = self.lib_path(lib);
         let bytes =
             Rc::new(MappedElf::open(&path).with_context(|| format!("reading {}", path.display()))?);
-        // First sight of a library the merge takes code or data out of, and the
-        // one place every extracted byte comes through — including a library
-        // reached only by a cross-library reference, which the executable
-        // imports nothing from and no earlier stage looks at. A library whose
-        // relative relocations solder cannot see has to be refused here, before
-        // any of its data is copied.
-        crate::elf_reader::refuse_packed_relative_relocs(bytes.bytes(), &path)?;
         self.lib_bytes_cache[lib.0 as usize] = Some(Rc::clone(&bytes));
         Ok(bytes)
     }
 
     /// Return the symbol index for `lib`, building and caching it on first use.
-    fn lib_index(&mut self, lib: LibId, elf: &object::read::elf::ElfFile64<'_>) -> Rc<LibIndex> {
+    fn lib_index(
+        &mut self,
+        lib: LibId,
+        elf: &object::read::elf::ElfFile64<'_>,
+    ) -> Result<Rc<LibIndex>> {
         if let Some(idx) = &self.lib_index_cache[lib.0 as usize] {
-            return Rc::clone(idx);
+            return Ok(Rc::clone(idx));
         }
-        let idx = Rc::new(LibIndex::build(elf));
+        let path = self.lib_path(lib);
+        let idx = Rc::new(LibIndex::build(elf, &path)?);
         debug!(
-            lib = %self.lib_path(lib).display(),
+            lib = %path.display(),
             symbols = idx.by_name.len(),
             fdes = idx.fdes.fde_count(),
+            packed_relative_relocs = idx.relr.len(),
             "Indexed library"
         );
         self.lib_index_cache[lib.0 as usize] = Some(Rc::clone(&idx));
-        idx
+        Ok(idx)
     }
 
     /// Zero the copied GOT slots at `slots` within `bytes` and register a fixup
@@ -708,7 +707,7 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
         bail!("{}: not a 64-bit ELF shared library", lib_path.display());
     };
 
-    let lib_index = state.lib_index(key.lib, elf64);
+    let lib_index = state.lib_index(key.lib, elf64)?;
     let lib = Lib {
         id: key.lib,
         path: &lib_path,
@@ -1182,10 +1181,19 @@ struct LibIndex {
     /// Exact function bounds from `.eh_frame`, which cover code the symbol
     /// tables say nothing about (see `resolve_owning_unit`).
     fdes: crate::eh_frame::FdeTable,
+    /// The relative relocations the library packs into `DT_RELR`, decoded (see
+    /// [`crate::elf_reader::packed_relative_relocs`]).
+    ///
+    /// `object`'s `dynamic_relocations` walks `SHT_REL`/`SHT_RELA` sections and
+    /// skips `SHT_RELR`, so a `-z pack-relative-relocs` build's relative
+    /// relocations reach extraction only through here. Decoding them is a read
+    /// of the whole table and of one word per entry, so it is done once with
+    /// the rest of the per-library lookups rather than per extracted unit.
+    relr: Vec<crate::elf_reader::RelrReloc>,
 }
 
 impl LibIndex {
-    fn build(elf: &object::read::elf::ElfFile64<'_>) -> Self {
+    fn build(elf: &object::read::elf::ElfFile64<'_>, path: &Path) -> Result<Self> {
         let mut by_name: FastMap<String, SymInfo> = FastMap::default();
         let mut addr_to_name: FastMap<u64, String> = FastMap::default();
         let mut addrs_by_section: Vec<(u64, usize)> = Vec::new();
@@ -1256,7 +1264,7 @@ impl LibIndex {
             .map(|(data, vaddr)| crate::eh_frame::FdeTable::parse(data, vaddr))
             .unwrap_or_default();
 
-        LibIndex {
+        Ok(LibIndex {
             by_name,
             addr_to_name,
             addrs_by_section,
@@ -1264,7 +1272,8 @@ impl LibIndex {
             plt_spans,
             got_to_name,
             fdes,
-        }
+            relr: crate::elf_reader::packed_relative_relocs(elf, path)?,
+        })
     }
 
     /// The PLT section covering `addr`, as `(section address, section index)`.
@@ -1322,6 +1331,77 @@ struct Lib<'a, 'data> {
     path: &'a Path,
     elf: &'a object::read::elf::ElfFile64<'data>,
     index: &'a LibIndex,
+}
+
+/// One dynamic relocation of a library, from the `.rela.dyn`/`.rela.plt` the
+/// `object` crate reads or decoded out of the library's `DT_RELR` table.
+///
+/// The two arrive by different routes but say the same kind of thing, and a
+/// `DT_RELR` entry is an `R_X86_64_RELATIVE` in every respect but how it was
+/// written down — so normalising both to this is what lets one copy of
+/// "resolve a relative slot's target" serve them, rather than a second copy of
+/// [`collect_dynamic_range_relocs`]'s body for the packed form.
+#[derive(Clone, Copy)]
+struct DynReloc {
+    /// Virtual address of the slot the relocation patches.
+    offset: u64,
+    kind: object::RelocationKind,
+    encoding: object::RelocationEncoding,
+    /// The ELF `r_type`, which is all that tells the dynamic relocation types
+    /// `object` does not name apart (see [`reject_unliftable_dynamic_reloc`]).
+    r_type: Option<u32>,
+    /// Field width in bits, 0 where `object` declines to say.
+    size: u8,
+    addend: i64,
+    /// `.dynsym` index of the symbol the slot resolves to; `None` for a
+    /// relative entry, whose addend is the whole of its target.
+    symbol: Option<object::SymbolIndex>,
+}
+
+/// Every dynamic relocation of `lib`: its explicit `.rela.dyn`/`.rela.plt`
+/// entries followed by the ones its `DT_RELR` table packs.
+///
+/// The explicit entries come first so that a slot named by both — which no
+/// linker emits, the two forms being alternatives — keeps the resolution the
+/// explicit entry gives it, matching the first-writer-wins rule
+/// [`collect_dynamic_range_relocs`] already applies within `.rela.dyn`.
+fn dynamic_relocs<'a>(lib: Lib<'a, '_>) -> impl Iterator<Item = DynReloc> + 'a {
+    let explicit = lib
+        .elf
+        .dynamic_relocations()
+        .into_iter()
+        .flatten()
+        .map(|(offset, reloc)| DynReloc {
+            offset,
+            kind: reloc.kind(),
+            encoding: reloc.encoding(),
+            r_type: elf_r_type(&reloc),
+            size: reloc.size(),
+            addend: reloc.addend(),
+            symbol: match reloc.target() {
+                object::RelocationTarget::Symbol(si) => Some(si),
+                _ => None,
+            },
+        });
+
+    let packed = lib.index.relr.iter().map(|entry| DynReloc {
+        offset: entry.vaddr,
+        // Exactly what `object` reports for an `R_X86_64_RELATIVE` of
+        // `.rela.dyn`: a kind and an encoding it does not name, of a width it
+        // does not state, which the loop below widens to the 64-bit slot it
+        // is. Reporting them the same way is what makes the extracted
+        // relocation indistinguishable from the explicit form's —
+        // `a_packed_library_extracts_the_same_as_an_unpacked_one` holds the
+        // two to that.
+        kind: object::RelocationKind::Unknown,
+        encoding: object::RelocationEncoding::Unknown,
+        r_type: Some(object::elf::R_X86_64_RELATIVE.0),
+        size: 0,
+        addend: entry.addend as i64,
+        symbol: None,
+    });
+
+    explicit.chain(packed)
 }
 
 /// Find a symbol by name using the precomputed library index, falling back to
@@ -2034,9 +2114,6 @@ fn collect_dynamic_range_relocs(
     state: &mut ExtractionState,
     relocs: &mut UnitRelocs,
 ) -> Result<()> {
-    let Some(dyn_relocs) = lib.elf.dynamic_relocations() else {
-        return Ok(());
-    };
     // Which offsets this pass has already filled, so two entries naming the
     // same slot leave the first resolution standing. Scanning `relocs` for
     // each candidate instead made this quadratic in the number of relocations
@@ -2048,7 +2125,8 @@ fn collect_dynamic_range_relocs(
         .iter()
         .map(|r| r.offset_within_unit)
         .collect();
-    for (roff, reloc) in dyn_relocs {
+    for reloc in dynamic_relocs(lib) {
+        let roff = reloc.offset;
         if !range.contains(&roff) {
             continue;
         }
@@ -2058,17 +2136,16 @@ fn collect_dynamic_range_relocs(
         }
 
         // Validate relocation kind (same as code extraction)
-        let kind = reloc.kind();
-        let encoding = reloc.encoding();
+        let kind = reloc.kind;
+        let encoding = reloc.encoding;
         reject_got_reloc(kind, encoding, ctx, lib.path)?;
-        reject_unliftable_dynamic_reloc(kind, elf_r_type(&reloc), ctx, lib.path)?;
+        reject_unliftable_dynamic_reloc(kind, reloc.r_type, ctx, lib.path)?;
 
         // Resolve the relocation target symbol. Dynamic relocation symbol
         // indices refer to .dynsym, not .symtab.
-        let target_sym = match reloc.target() {
-            object::RelocationTarget::Symbol(si) => dynamic_symbol_by_index(lib.elf, si),
-            _ => None,
-        };
+        let target_sym = reloc
+            .symbol
+            .and_then(|si| dynamic_symbol_by_index(lib.elf, si));
 
         // Set for relocations whose own addend was consumed while resolving the
         // target (see the RELATIVE case below); holds the offset into the
@@ -2135,7 +2212,7 @@ fn collect_dynamic_range_relocs(
             // target is a unit interior — or the old VA would be added on top
             // of the resolved new address.
             resolved_addend = Some(0);
-            let addend_va = reloc.addend() as u64;
+            let addend_va = reloc.addend as u64;
 
             if let Some(dep) = reserve_unit_at(lib, addend_va, state) {
                 resolved_addend = Some(dep.offset as i64);
@@ -2171,7 +2248,7 @@ fn collect_dynamic_range_relocs(
         // slot. `reject_unliftable_dynamic_reloc` above is what makes widening
         // the 0 sound: it is the only reason the unnamed types reaching here
         // are those three and not, say, a TLS offset.
-        let reloc_size = if reloc.size() == 0 { 64 } else { reloc.size() };
+        let reloc_size = if reloc.size == 0 { 64 } else { reloc.size };
 
         occupied.insert(offset_within_unit);
         relocs.relocations.push(ExtractedReloc {
@@ -2179,7 +2256,7 @@ fn collect_dynamic_range_relocs(
             kind,
             encoding,
             size: reloc_size,
-            addend: resolved_addend.unwrap_or_else(|| reloc.addend()),
+            addend: resolved_addend.unwrap_or(reloc.addend),
             target,
         });
     }
@@ -2839,25 +2916,20 @@ fn extract_init_fini_arrays(lib: Lib<'_, '_>) -> Result<InitFiniArrays> {
     let lib_path = lib.path;
     let mut result = InitFiniArrays::default();
 
-    // Function addresses for init/fini slots, recovered from .rela.dyn:
-    // R_X86_64_RELATIVE carries the address in its addend; a symbol-based
+    // Function addresses for init/fini slots, recovered from the library's
+    // dynamic relocations: R_X86_64_RELATIVE — spelled out in .rela.dyn or
+    // packed into DT_RELR — carries the address in its addend; a symbol-based
     // relocation (e.g. R_X86_64_64) resolves to symbol address + addend.
     let mut reloc_targets: HashMap<u64, u64> = HashMap::new();
-    if let Some(dyn_relocs) = lib.elf.dynamic_relocations() {
-        for (roff, reloc) in dyn_relocs {
-            let func_vaddr = match reloc.target() {
-                object::RelocationTarget::Symbol(si) => {
-                    match dynamic_symbol_by_index(lib.elf, si) {
-                        Some(sym) if !sym.is_undefined() => {
-                            sym.address().wrapping_add(reloc.addend() as u64)
-                        }
-                        _ => continue,
-                    }
-                }
-                _ => reloc.addend() as u64,
-            };
-            reloc_targets.insert(roff, func_vaddr);
-        }
+    for reloc in dynamic_relocs(lib) {
+        let func_vaddr = match reloc.symbol {
+            Some(si) => match dynamic_symbol_by_index(lib.elf, si) {
+                Some(sym) if !sym.is_undefined() => sym.address().wrapping_add(reloc.addend as u64),
+                _ => continue,
+            },
+            None => reloc.addend as u64,
+        };
+        reloc_targets.insert(reloc.offset, func_vaddr);
     }
 
     for section in lib.elf.sections() {
@@ -2930,6 +3002,8 @@ fn extract_init_fini_arrays(lib: Lib<'_, '_>) -> Result<InitFiniArrays> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::*;
 
     fn test_state() -> ExtractionState {
@@ -3039,7 +3113,11 @@ mod tests {
             panic!("not ELF64")
         };
         let lib_id = state.lib_id(&lib);
-        let sym_vaddr = state.lib_index(lib_id, elf64).by_name["strnames"].vaddr;
+        let sym_vaddr = state
+            .lib_index(lib_id, elf64)
+            .expect("index libtinfo.so.6")
+            .by_name["strnames"]
+            .vaddr;
 
         let relative_slots: Vec<u64> = elf64
             .dynamic_relocations()
@@ -3299,59 +3377,151 @@ mod tests {
         }
     }
 
-    /// `libtinfo.so.6` with the `DT_RELR` tags written over the spare
-    /// `.dynamic` slots past `DT_NULL`, as a file extraction can open. To
-    /// anything reading `.dynamic` this is a `-z pack-relative-relocs` build:
-    /// the relocations themselves stay in `.rela.dyn`, which only makes the
-    /// test stricter — extraction has to refuse the library on the tags alone,
-    /// before it finds there is anything readable there.
-    fn lib_with_packed_relr() -> tempfile::NamedTempFile {
-        use crate::elf_reader::{DYN_ENTRY_SIZE, DynamicTable};
-
-        let mut bytes = std::fs::read(test_lib("libtinfo.so.6")).expect("read libtinfo.so.6");
-        let dynamic = DynamicTable::parse(&bytes).expect(".dynamic of libtinfo.so.6");
-        let at = dynamic.used();
-        assert!(
-            at + 3 <= dynamic.capacity(),
-            "libtinfo.so.6: {} spare .dynamic slots, need 3",
-            dynamic.capacity() - at
-        );
-
-        let tags = [
-            (object::elf::DT_RELR.0 as u64, 0x1000u64),
-            (object::elf::DT_RELRSZ.0 as u64, 216),
-        ];
-        for (i, (tag, val)) in tags.into_iter().enumerate() {
-            let o = dynamic.entry_offset(at + i);
-            bytes[o..o + 8].copy_from_slice(&tag.to_le_bytes());
-            bytes[o + 8..o + 16].copy_from_slice(&val.to_le_bytes());
-        }
-        let end = dynamic.entry_offset(at + 2);
-        bytes[end..end + DYN_ENTRY_SIZE].fill(0);
-
+    /// `libtinfo.so.6` relinked as `-z pack-relative-relocs` would have it —
+    /// every `R_X86_64_RELATIVE` entry of `.rela.dyn` moved into a `DT_RELR`
+    /// table — written where extraction can open it. See
+    /// [`crate::elf_reader::relr_packing`] for what the repack does and does
+    /// not reproduce.
+    fn lib_with_packed_relr() -> (tempfile::NamedTempFile, usize) {
+        let original = std::fs::read(test_lib("libtinfo.so.6")).expect("read libtinfo.so.6");
+        let (packed, relocs) = crate::elf_reader::relr_packing::pack_relative_relocs(&original);
         let out = tempfile::Builder::new()
             .suffix(".so.6")
             .tempfile()
             .expect("temp library");
-        std::fs::write(out.path(), &bytes).expect("write the packed library");
-        out
+        std::fs::write(out.path(), &packed).expect("write the packed library");
+        (out, relocs.len())
     }
 
-    /// The refusal has to be reached from extraction, not merely available to
-    /// be called: `lib_bytes` is where a library the merge takes code out of is
-    /// first opened — including one reached only through a cross-library
-    /// reference, which no earlier stage of the merge looks at — so it is the
-    /// only gate every packed library is certain to pass through.
+    /// What extracting `sym` from `lib` produced, spelled out in terms that do
+    /// not depend on the order the relocations were walked in: every unit by
+    /// name, with its bytes and each of its relocations describing its target
+    /// by the *name* of the unit it reaches rather than by the `UnitId`
+    /// extraction happened to hand out.
+    ///
+    /// Ids are allocated in the order targets are first reached, so they turn
+    /// on the order of the relocation walk — which is exactly what differs
+    /// between a `.rela.dyn` build and a packed one, the packed entries being
+    /// appended to the explicit ones rather than interleaved with them in
+    /// address order. Names and bytes do not turn on it, and they are what has
+    /// to come out the same.
+    fn extraction_of(lib: &Path, sym: &str) -> BTreeMap<String, (Vec<u8>, BTreeSet<String>)> {
+        let mut state = test_state();
+        let key = key_in(&mut state, lib, sym);
+        reserve_and_extract(&key, &mut state)
+            .unwrap_or_else(|e| panic!("extracting {sym} from {}: {e:#}", lib.display()));
+
+        // A copied blob is named after the file it came from, which is the one
+        // thing that legitimately differs between the two builds.
+        let file = lib.file_name().unwrap_or_default().to_string_lossy();
+        let anonymise = |name: &str| name.replace(file.as_ref(), "<lib>");
+
+        let name_of: FastMap<u32, String> = state
+            .units
+            .iter()
+            .map(|u| (u.id.0, anonymise(&u.name)))
+            .collect();
+        state
+            .units
+            .iter()
+            .map(|u| {
+                let relocs = u
+                    .relocations
+                    .iter()
+                    .map(|r| {
+                        let target = match &r.target {
+                            RelocTarget::MergedUnit(id) => name_of[&id.0].clone(),
+                            RelocTarget::DataBlobOffset(id, off) => {
+                                format!("{}+{off:#x}", name_of[&id.0])
+                            }
+                            RelocTarget::External(name) => format!("extern '{name}'"),
+                        };
+                        format!(
+                            "{:#x}: {:?}/{:?} {} bits, addend {} -> {target}",
+                            r.offset_within_unit, r.kind, r.encoding, r.size, r.addend
+                        )
+                    })
+                    .collect();
+                (anonymise(&u.name), (u.bytes.clone(), relocs))
+            })
+            .collect()
+    }
+
+    /// A library whose relative relocations are packed into `DT_RELR` has to
+    /// extract to the same units as the same library with them spelled out in
+    /// `.rela.dyn`. The two say the same thing about the same slots, so
+    /// anything else is solder reading one of the forms wrong.
+    ///
+    /// `strnames` is ncurses' table of 414 pointers into `.rodata`, every one
+    /// of them covered by a relative relocation, and the blob they drag in
+    /// is rooted by those pointers alone — so a packed entry that went
+    /// unread showed up twice over: as a slot left holding a libtinfo address,
+    /// and as the `.rodata` copy that never happened.
     #[test]
-    fn a_library_with_packed_relative_relocs_does_not_extract() {
-        let lib = lib_with_packed_relr();
+    fn a_packed_library_extracts_the_same_as_an_unpacked_one() {
+        let (packed, count) = lib_with_packed_relr();
+        assert!(count > 1000, "only {count} relocations were packed");
+
+        let from_rela = extraction_of(&test_lib("libtinfo.so.6"), "strnames");
+        let from_relr = extraction_of(packed.path(), "strnames");
+
+        // The copied `.rodata` blob as well as `strnames` itself: the pointers
+        // are what reaches it, so a missed relocation shows up as a missing
+        // unit rather than only as a missing relocation.
+        assert_eq!(
+            from_rela.keys().collect::<Vec<_>>(),
+            from_relr.keys().collect::<Vec<_>>(),
+            "the two builds extracted different units"
+        );
+        for (name, expected) in &from_rela {
+            let got = &from_relr[name];
+            assert_eq!(expected.1, got.1, "unit '{name}': relocations differ");
+            assert_eq!(
+                expected.0,
+                got.0,
+                "unit '{name}': {} bytes against {}",
+                expected.0.len(),
+                got.0.len()
+            );
+        }
+    }
+
+    /// A `DT_RELR` table extraction cannot read has to fail the merge there
+    /// and then. `lib_index` is where a library the merge takes bytes out of is
+    /// first read — including one reached only through a cross-library
+    /// reference, which no earlier stage of the merge looks at — so it is the
+    /// gate every packed library is certain to pass through.
+    #[test]
+    fn a_library_with_an_unreadable_dt_relr_table_does_not_extract() {
+        use crate::elf_reader::DynamicTable;
+
+        let original = std::fs::read(test_lib("libtinfo.so.6")).expect("read libtinfo.so.6");
+        let (mut bytes, _) = crate::elf_reader::relr_packing::pack_relative_relocs(&original);
+
+        // Point DT_RELR outside the loaded image, which is the one way a table
+        // named in `.dynamic` can be unreadable without the file being
+        // malformed anywhere else.
+        let dynamic = DynamicTable::parse(&bytes).expect(".dynamic");
+        let at = dynamic.value_offset(
+            dynamic
+                .index_of(object::elf::DT_RELR.0 as u64)
+                .expect("DT_RELR"),
+        );
+        bytes[at..at + 8].copy_from_slice(&0xdead_0000u64.to_le_bytes());
+
+        let lib = tempfile::Builder::new()
+            .suffix(".so.6")
+            .tempfile()
+            .expect("temp library");
+        std::fs::write(lib.path(), &bytes).expect("write the library");
+
         let mut state = test_state();
         let key = key_in(&mut state, lib.path(), "strnames");
         let err = match reserve_and_extract(&key, &mut state) {
             Err(e) => e,
             Ok(_) => panic!(
-                "a DT_RELR library's relative relocations cannot be read, but \
-                 extraction succeeded"
+                "a DT_RELR table that cannot be read withholds relative \
+                 relocations, but extraction succeeded"
             ),
         };
         let msg = format!("{err:#}");
@@ -3382,7 +3552,7 @@ mod tests {
             let path = test_lib(name);
             let bytes = std::fs::read(&path).expect("read the library");
             let elf = parse_lib(&bytes);
-            let index = LibIndex::build(&elf);
+            let index = LibIndex::build(&elf, &path).expect("index the library");
             let lib = Lib {
                 // Nothing under test here reaches an `ExtractionState`, so the
                 // id this handle carries is never used to key anything.
@@ -3809,7 +3979,7 @@ mod tests {
 
             let mut state = test_state();
             let lib_id = state.lib_id(&lib);
-            let index = state.lib_index(lib_id, &elf);
+            let index = state.lib_index(lib_id, &elf).expect("index the library");
             let arrays = extract_init_fini_arrays(Lib {
                 id: lib_id,
                 path: &lib,
@@ -3881,7 +4051,7 @@ mod tests {
             panic!("not ELF64")
         };
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, elf64);
+        let index = state.lib_index(lib_id, elf64).expect("index the library");
         let data = elf64.section_by_name(".data").expect(".data").address();
 
         let handle = Lib {
@@ -3993,7 +4163,7 @@ mod tests {
 
         let mut state = test_state();
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         let handle = Lib {
             id: lib_id,
             path: &lib,
@@ -4061,7 +4231,7 @@ mod tests {
 
         let mut state = test_state();
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         let handle = Lib {
             id: lib_id,
             path: &lib,
@@ -4316,7 +4486,7 @@ mod tests {
         let key = key_in(&mut state, &lib, "_nc_setupterm");
         reserve_and_extract(&key, &mut state).expect("extract _nc_setupterm");
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         let handle = Lib {
             id: lib_id,
             path: &lib,
@@ -4436,7 +4606,7 @@ mod tests {
 
         let mut state = test_state();
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         let handle = Lib {
             id: lib_id,
             path: &lib,
@@ -4511,7 +4681,7 @@ mod tests {
 
         let mut state = test_state();
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         let handle = Lib {
             id: lib_id,
             path: &lib,
@@ -4603,7 +4773,7 @@ mod tests {
 
             let mut state = test_state();
             let lib_id = state.lib_id(path);
-            let index = state.lib_index(lib_id, &elf);
+            let index = state.lib_index(lib_id, &elf).expect("index the library");
             let handle = Lib {
                 id: lib_id,
                 path,
@@ -4663,7 +4833,7 @@ mod tests {
         let lib_id = state.lib_id(&lib);
         let bytes = std::fs::read(&lib).expect("read library");
         let elf = parse_lib(&bytes);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
 
         for sym in ["MD5_Init", "MD5_Update", "MD5_Final"] {
             let key = key_in(&mut state, &lib, sym);
@@ -4751,7 +4921,7 @@ mod tests {
 
         let mut state = test_state();
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         let handle = Lib {
             id: lib_id,
             path: &lib,
@@ -4870,7 +5040,7 @@ mod tests {
 
         let mut state = test_state();
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         let handle = Lib {
             id: lib_id,
             path: &lib,
@@ -4974,7 +5144,7 @@ mod tests {
 
         let mut state = test_state();
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         let handle = Lib {
             id: lib_id,
             path: &lib,
@@ -5093,7 +5263,7 @@ mod tests {
 
         let mut state = test_state();
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         let handle = Lib {
             id: lib_id,
             path: &lib,
@@ -5390,7 +5560,7 @@ mod tests {
         let bytes = std::fs::read(&lib).expect("read library");
         let elf = parse_lib(&bytes);
         let lib_id = state.lib_id(&lib);
-        let index = state.lib_index(lib_id, &elf);
+        let index = state.lib_index(lib_id, &elf).expect("index the library");
         assert_eq!(
             index.fdes.containing(FUNC),
             Some((FUNC, FUNC_END)),
