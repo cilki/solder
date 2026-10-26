@@ -391,6 +391,63 @@ pub fn validate_merge_library(bytes: &[u8], path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `DT_RELR`: the address of the compact relative relocation table.
+/// `goblin::elf::dynamic` does not name the tag, and `object` names it only as
+/// a `DynamicTag` newtype, so both reach `DynamicTable` as a plain `u64`.
+const DT_RELR: u64 = object::elf::DT_RELR.0 as u64;
+/// `DT_RELRSZ`: that table's size in bytes.
+const DT_RELRSZ: u64 = object::elf::DT_RELRSZ.0 as u64;
+
+/// Refuse a library whose relative relocations are packed into `DT_RELR`.
+///
+/// `ld -z pack-relative-relocs` replaces a library's `R_X86_64_RELATIVE`
+/// entries with a `DT_RELR` bitmap that says the same thing in about a
+/// hundredth of the space — 1503 entries of `libtinfo.so.6`'s `.rela.dyn`,
+/// 36072 bytes, pack into 216. Several distributions have linked that way
+/// since 2023, so it is an ordinary shape for a library to arrive in.
+///
+/// Nothing in solder reads it. Extraction finds a library's relocations
+/// through `object`'s `dynamic_relocations`, which walks `SHT_REL`/`SHT_RELA`
+/// sections and skips `SHT_RELR` — so the invariant
+/// [`collect_dynamic_range_relocs`](crate::extractor) rests on, that a linked
+/// shared object carries its data relocations in `.rela.dyn`, quietly stops
+/// holding.
+///
+/// Missing them does not make for a smaller merge but a wrong one, in two
+/// ways. Every pointer in the data the merge copies keeps the address the
+/// library was linked at, with no relocation to rebase it into the merged
+/// segment. And those same pointers are what roots the rest of the
+/// extraction, so the units they point at are never copied in either.
+/// `test/bash` merged against a `DT_RELR` build of `libtinfo.so.6` comes out
+/// six units short, with ten function pointers in `.solder.data` still
+/// holding libtinfo's own offsets — addresses that land in the middle of
+/// bash's `.text` once the merged binary is loaded.
+///
+/// Refusing is what the merge can honestly do with a library it cannot read,
+/// as for the relocation types extraction cannot lift.
+pub fn refuse_packed_relative_relocs(bytes: &[u8], path: &Path) -> Result<()> {
+    let dynamic = DynamicTable::parse(bytes)
+        .with_context(|| format!("reading {}'s .dynamic", path.display()))?;
+
+    // The three `DT_RELR*` tags are emitted as a set, but it is `DT_RELRSZ`
+    // that says whether the table relocates anything: an empty one is nothing
+    // for the merge to be missing.
+    let size = dynamic.value_of(DT_RELRSZ).unwrap_or(0);
+    if dynamic.value_of(DT_RELR).is_none() || size == 0 {
+        return Ok(());
+    }
+
+    bail!(
+        "{}: its relative relocations are packed into DT_RELR ({size} bytes), which solder \
+         cannot read. Merging it would copy data whose pointers keep this library's \
+         link-time addresses, with nothing to rebase them into the merged segment, and \
+         would leave behind the units only those pointers reach. Merge a build linked with \
+         `-Wl,-z,nopack-relative-relocs`, which keeps them as R_X86_64_RELATIVE entries in \
+         .rela.dyn",
+        path.display()
+    );
+}
+
 /// Size of an `Elf64_Dyn`: `d_tag` (8 bytes) followed by `d_val`/`d_ptr`.
 pub const DYN_ENTRY_SIZE: usize = 16;
 
@@ -903,6 +960,76 @@ mod merge_library_tests {
             let err = rejection(&bytes);
             assert!(err.contains("ELF"), "{err}");
         }
+    }
+
+    /// A real library with the `DT_RELR` tags written over the spare
+    /// `.dynamic` slots the linker leaves past `DT_NULL`. That is the whole of
+    /// how a `-z pack-relative-relocs` build differs from the fixtures in what
+    /// this check reads; the table those tags name is somewhere else in the
+    /// file, and the check never follows them to it.
+    fn with_packed_relr(name: &str, size: u64) -> Vec<u8> {
+        let mut bytes = read_test_lib(name);
+        let dynamic = DynamicTable::parse(&bytes).expect(".dynamic of a test library");
+        let at = dynamic.used();
+        assert!(
+            at + 3 <= dynamic.capacity(),
+            "{name}: {} spare .dynamic slots, need 3",
+            dynamic.capacity() - at
+        );
+
+        for (i, (tag, val)) in [(DT_RELR, 0x1000), (DT_RELRSZ, size)]
+            .into_iter()
+            .enumerate()
+        {
+            let o = dynamic.entry_offset(at + i);
+            bytes[o..o + 8].copy_from_slice(&tag.to_le_bytes());
+            bytes[o + 8..o + 16].copy_from_slice(&val.to_le_bytes());
+        }
+        // The slot after the two becomes the new DT_NULL terminator; the ones
+        // past the old terminator are not guaranteed to be zeroed.
+        let end = dynamic.entry_offset(at + 2);
+        bytes[end..end + DYN_ENTRY_SIZE].fill(0);
+        bytes
+    }
+
+    /// The fixtures keep their relative relocations in `.rela.dyn`, which is
+    /// the only reason merging them produces correct pointers — so the check
+    /// has to let them through, or it would refuse every merge solder can do.
+    #[test]
+    fn the_libraries_solder_merges_have_readable_relative_relocs() {
+        for name in TEST_LIBS {
+            refuse_packed_relative_relocs(&read_test_lib(name), Path::new(name))
+                .unwrap_or_else(|e| panic!("{name} should be mergeable: {e:#}"));
+        }
+    }
+
+    /// The one that used to merge *wrongly*: `object`'s `dynamic_relocations`
+    /// walks `SHT_RELA` only, so a packed library's relative relocations were
+    /// not refused, not warned about and not read — the merge copied its data
+    /// with every pointer still holding a link-time address and exited 0.
+    #[test]
+    fn a_library_with_packed_relative_relocs_is_refused() {
+        for name in TEST_LIBS {
+            let bytes = with_packed_relr(name, 216);
+            let path = PathBuf::from("/sysroot/lib").join(name);
+            let err = format!(
+                "{:#}",
+                refuse_packed_relative_relocs(&bytes, &path)
+                    .expect_err("a packed library must be refused")
+            );
+            assert!(err.contains("DT_RELR"), "{err}");
+            assert!(err.contains("216 bytes"), "{err}");
+            assert!(err.contains(&path.display().to_string()), "{err}");
+        }
+    }
+
+    /// `DT_RELR` naming an empty table relocates nothing, so there is nothing
+    /// the merge would be missing and nothing to refuse the library over.
+    #[test]
+    fn a_packed_table_with_no_entries_is_accepted() {
+        let bytes = with_packed_relr(TEST_LIBS[0], 0);
+        refuse_packed_relative_relocs(&bytes, Path::new(TEST_LIBS[0]))
+            .expect("an empty DT_RELR table withholds nothing");
     }
 }
 

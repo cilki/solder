@@ -325,6 +325,13 @@ impl ExtractionState {
         let path = self.lib_path(lib);
         let bytes =
             Rc::new(MappedElf::open(&path).with_context(|| format!("reading {}", path.display()))?);
+        // First sight of a library the merge takes code or data out of, and the
+        // one place every extracted byte comes through — including a library
+        // reached only by a cross-library reference, which the executable
+        // imports nothing from and no earlier stage looks at. A library whose
+        // relative relocations solder cannot see has to be refused here, before
+        // any of its data is copied.
+        crate::elf_reader::refuse_packed_relative_relocs(bytes.bytes(), &path)?;
         self.lib_bytes_cache[lib.0 as usize] = Some(Rc::clone(&bytes));
         Ok(bytes)
     }
@@ -3290,6 +3297,65 @@ mod tests {
             reserve_and_extract(&key, &mut state)
                 .unwrap_or_else(|e| panic!("r_type {r_type} should still extract: {e:#}"));
         }
+    }
+
+    /// `libtinfo.so.6` with the `DT_RELR` tags written over the spare
+    /// `.dynamic` slots past `DT_NULL`, as a file extraction can open. To
+    /// anything reading `.dynamic` this is a `-z pack-relative-relocs` build:
+    /// the relocations themselves stay in `.rela.dyn`, which only makes the
+    /// test stricter — extraction has to refuse the library on the tags alone,
+    /// before it finds there is anything readable there.
+    fn lib_with_packed_relr() -> tempfile::NamedTempFile {
+        use crate::elf_reader::{DYN_ENTRY_SIZE, DynamicTable};
+
+        let mut bytes = std::fs::read(test_lib("libtinfo.so.6")).expect("read libtinfo.so.6");
+        let dynamic = DynamicTable::parse(&bytes).expect(".dynamic of libtinfo.so.6");
+        let at = dynamic.used();
+        assert!(
+            at + 3 <= dynamic.capacity(),
+            "libtinfo.so.6: {} spare .dynamic slots, need 3",
+            dynamic.capacity() - at
+        );
+
+        let tags = [
+            (object::elf::DT_RELR.0 as u64, 0x1000u64),
+            (object::elf::DT_RELRSZ.0 as u64, 216),
+        ];
+        for (i, (tag, val)) in tags.into_iter().enumerate() {
+            let o = dynamic.entry_offset(at + i);
+            bytes[o..o + 8].copy_from_slice(&tag.to_le_bytes());
+            bytes[o + 8..o + 16].copy_from_slice(&val.to_le_bytes());
+        }
+        let end = dynamic.entry_offset(at + 2);
+        bytes[end..end + DYN_ENTRY_SIZE].fill(0);
+
+        let out = tempfile::Builder::new()
+            .suffix(".so.6")
+            .tempfile()
+            .expect("temp library");
+        std::fs::write(out.path(), &bytes).expect("write the packed library");
+        out
+    }
+
+    /// The refusal has to be reached from extraction, not merely available to
+    /// be called: `lib_bytes` is where a library the merge takes code out of is
+    /// first opened — including one reached only through a cross-library
+    /// reference, which no earlier stage of the merge looks at — so it is the
+    /// only gate every packed library is certain to pass through.
+    #[test]
+    fn a_library_with_packed_relative_relocs_does_not_extract() {
+        let lib = lib_with_packed_relr();
+        let mut state = test_state();
+        let key = key_in(&mut state, lib.path(), "strnames");
+        let err = match reserve_and_extract(&key, &mut state) {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "a DT_RELR library's relative relocations cannot be read, but \
+                 extraction succeeded"
+            ),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("DT_RELR"), "{msg}");
     }
 
     /// Every committed fixture library, so a trait of the linker's output is
