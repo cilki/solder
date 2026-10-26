@@ -167,7 +167,7 @@ fn run() -> Result<()> {
     // symbols asked for. A copy that is exactly the bytes referenced is not
     // worth a line; the two that are each explain themselves differently.
     for copy in data_section_copies.iter().filter(|c| c.is_oversized()) {
-        if copy.end_unbounded {
+        if let Some(unbounded) = &copy.unbounded_end {
             // Nothing says where the referenced object ends, so the copy runs
             // to the next thing the library does name — and in a library that
             // names nothing in its data sections, that is the section's end.
@@ -188,8 +188,8 @@ fn run() -> Result<()> {
                 copy.library.display(),
                 copy.section,
                 copy.pointers,
-                copy.address,
-                copy.reached_from
+                unbounded.address,
+                unbounded.reached_from
             );
         } else {
             warn!(
@@ -581,7 +581,7 @@ fn render_merge_plan(
         let pointers: usize = data_section_copies.iter().map(|c| c.pointers).sum();
         let unbounded = data_section_copies
             .iter()
-            .filter(|c| c.end_unbounded)
+            .filter(|c| c.unbounded_end.is_some())
             .count();
         say!(
             "  data sections copied for want of a symbol: {} ({} of them with no \
@@ -659,7 +659,7 @@ mod dry_run_report_tests {
     use super::{render_merge_plan, write_report};
     use crate::types::{
         AssignedUnit, DataSectionCopy, ExtractedUnit, ImportKind, ImportedSymbol, InitFiniPlan,
-        MergePlan, MergedArray, SectionKind, UnitId,
+        MergePlan, MergedArray, SectionKind, UnboundedEnd, UnitId,
     };
     use std::io::{self, ErrorKind, Write};
     use std::path::{Path, PathBuf};
@@ -745,7 +745,10 @@ mod dry_run_report_tests {
             start_offset,
             unreferenced_prefix: 0,
             pointers,
-            end_unbounded,
+            unbounded_end: end_unbounded.then(|| UnboundedEnd {
+                address: 0x1040,
+                reached_from: "bar".to_owned(),
+            }),
             address: 0x1000,
             reached_from: "foo".to_owned(),
         }

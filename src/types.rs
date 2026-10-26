@@ -346,17 +346,39 @@ pub struct DataSectionCopy {
     /// the copy drags in, and it is zero for a section ld.so never writes to —
     /// a `.rodata` copied whole is expensive in bytes only.
     pub pointers: usize,
-    /// Whether the reference that reaches furthest into the section is one
-    /// that says nothing about the size of what it points at, so the copy ends
-    /// where the next symbol or the section does rather than where the merged
-    /// code stops reading. That is the one step of the merge with no bound of
-    /// its own, and the bytes and pointers between the last read and that end
-    /// are what it costs.
-    pub end_unbounded: bool,
+    /// The reference the copy's end comes from, when that reference is one
+    /// that says nothing about the size of what it points at: the copy then
+    /// ends where the next symbol or the section does rather than where the
+    /// merged code stops reading. That is the one step of the merge with no
+    /// bound of its own, and the bytes and pointers between the last read and
+    /// that end are what it costs. `None` when some read reaches at least as
+    /// far, so every byte of the copy is a byte the merged code reads — the
+    /// copy still exists because no symbol covered the address it was asked
+    /// about, but its extent is justified.
+    ///
+    /// This is deliberately not [`Self::address`]: the reference that *creates*
+    /// the copy is the first one into the section, and that one is often a
+    /// bounded read of a few bytes, while the one that decides the extent can
+    /// be any later reference. Reporting the first as though it were the
+    /// unbounded one sends a reader of the warning to an instruction that cost
+    /// nothing.
+    pub unbounded_end: Option<UnboundedEnd>,
     /// The address whose reference caused the copy.
     pub address: u64,
     /// The unit being extracted when that reference was found: a symbol name,
     /// or the name of another section whose own pointers reached in here.
+    pub reached_from: String,
+}
+
+/// The reference a [`DataSectionCopy`] runs to the end of its bound for: the
+/// one that says nothing about the size of what it points at and reaches
+/// furthest into the section.
+#[derive(Debug, Clone)]
+pub struct UnboundedEnd {
+    /// The address the reference names.
+    pub address: u64,
+    /// The unit being extracted when it was found: a symbol name, or the name
+    /// of another section whose own pointers reached in here.
     pub reached_from: String,
 }
 
@@ -374,7 +396,7 @@ impl DataSectionCopy {
     /// one carrying no more than the alignment padding under its first
     /// reference.
     pub fn is_oversized(&self) -> bool {
-        self.end_unbounded || self.unreferenced_prefix as u64 >= DATA_BLOB_ALIGNMENT
+        self.unbounded_end.is_some() || self.unreferenced_prefix as u64 >= DATA_BLOB_ALIGNMENT
     }
 }
 

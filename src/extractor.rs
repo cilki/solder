@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use crate::elf_reader::MappedElf;
 use crate::types::{
     DATA_BLOB_ALIGNMENT, DataSectionCopy, ExtractedReloc, ExtractedUnit, GotSlotFixup,
-    InitFiniArrays, InitFiniEntry, RelocTarget, SectionKind, UnitId,
+    InitFiniArrays, InitFiniEntry, RelocTarget, SectionKind, UnboundedEnd, UnitId,
 };
 
 /// The map the extractor's own caches are kept in.
@@ -124,7 +124,7 @@ struct DataBlobInfo {
     /// reach, and how far the ones that say nothing reach through
     /// [`needed_prefix`]'s fallback — the next object the library names, or the
     /// section. The copy's extent is the larger of the two; *which* of them it
-    /// is, is what [`DataSectionCopy::end_unbounded`] reports, and a tie goes
+    /// is, is what [`DataSectionCopy::unbounded_end`] reports, and a tie goes
     /// to the reads, since they justify the end on their own.
     read_to: u64,
     fallback_to: u64,
@@ -2384,7 +2384,7 @@ fn ensure_data_blob_extracted(
                     start_offset: 0,
                     unreferenced_prefix: sec.size as usize,
                     pointers: 0,
-                    end_unbounded: false,
+                    unbounded_end: None,
                     address: target_addr,
                     reached_from: ctx.to_string(),
                 });
@@ -2422,7 +2422,7 @@ fn ensure_data_blob_extracted(
     // resolve against the blob, and what
     // `DataSectionCopy::unreferenced_prefix` reports of whatever it could not.
     let offset = target_addr - base_vaddr;
-    let (first_ref, end_unbounded) = {
+    let (first_ref, end_unbounded, reaches_furthest) = {
         let info = state
             .data_blobs
             .get_mut(&blob_key)
@@ -2433,12 +2433,18 @@ fn ensure_data_blob_extracted(
         // reaching past an unbounded reference's fallback end bounds the copy
         // after all, and an unbounded one reaching past every read takes the
         // report back.
+        let mut reaches_furthest = false;
         if access_len.is_some() {
             info.read_to = info.read_to.max(needed);
-        } else {
-            info.fallback_to = info.fallback_to.max(needed);
+        } else if needed > info.fallback_to {
+            info.fallback_to = needed;
+            reaches_furthest = true;
         }
-        (info.first_ref, info.fallback_to > info.read_to)
+        (
+            info.first_ref,
+            info.fallback_to > info.read_to,
+            reaches_furthest,
+        )
     };
 
     grow_data_blob(lib, &sec, blob_key, needed, state)?;
@@ -2449,7 +2455,27 @@ fn ensure_data_blob_extracted(
         // the section's last byte and asks for nothing copied — and what
         // precedes the first reference is then no part of the copy.
         copy.unreferenced_prefix = first_ref.min(copy.bytes as u64) as usize;
-        copy.end_unbounded = end_unbounded;
+        // Name the reference the end actually comes from, which is this one
+        // only when it is the unbounded reference reaching furthest. An earlier
+        // one still holds the record otherwise, so it is left where it is
+        // rather than overwritten: the first reference into a section is
+        // routinely a bounded read, and reporting that one blamed the bytes on
+        // an instruction that asked for a handful of them.
+        //
+        // A read can only take the record away, never move it. The one thing
+        // that can leave the end unbounded again after a read has justified it
+        // is an unbounded reference past that read — and such a reference is
+        // past every earlier fallback too, since reads only ever grow
+        // `read_to` above them, so it arrives here as `reaches_furthest` and
+        // brings the record back with it.
+        if !end_unbounded {
+            copy.unbounded_end = None;
+        } else if reaches_furthest {
+            copy.unbounded_end = Some(UnboundedEnd {
+                address: target_addr,
+                reached_from: ctx.to_string(),
+            });
+        }
     }
 
     Ok(Some((info.id, info.base_vaddr)))
@@ -4022,7 +4048,7 @@ mod tests {
             .find(|c| c.section == ".data.rel.ro")
             .expect("the .data.rel.ro copy is recorded");
         assert!(
-            !copy.is_whole_section() && !copy.end_unbounded,
+            !copy.is_whole_section() && copy.unbounded_end.is_none(),
             "{copy:?} is bounded by the bytes the reads touch"
         );
         assert_eq!(copy.bytes, 0x408);
@@ -4480,7 +4506,7 @@ mod tests {
             .find(|c| c.section == ".data.rel.ro")
             .expect("the .data.rel.ro copy is recorded");
         assert!(
-            copy.end_unbounded && !copy.is_whole_section(),
+            copy.unbounded_end.is_some() && !copy.is_whole_section(),
             "a copy bounded by the next symbol is still a copy no reference \
              bounded: {copy:?}"
         );
@@ -4822,9 +4848,16 @@ mod tests {
             .expect("the .data blob");
         assert_eq!(copy.bytes, unit.bytes.len());
         assert!(
-            copy.end_unbounded && copy.is_oversized(),
+            copy.is_oversized(),
             "a reference that says nothing about what it points at is the case \
              this report exists for: {copy:?}"
+        );
+        assert_eq!(
+            copy.unbounded_end
+                .as_ref()
+                .map(|u| (u.address, u.reached_from.as_str())),
+            Some((addr, "a caller")),
+            "the only reference so far is the unbounded one: {copy:?}"
         );
         let fixups = state
             .got_slot_fixups
@@ -4850,8 +4883,129 @@ mod tests {
         };
         assert_eq!(copy.bytes, bytes_copied, "the read extended the copy");
         assert!(
-            !copy.end_unbounded && !copy.is_oversized(),
+            copy.unbounded_end.is_none() && !copy.is_oversized(),
             "the copy is the bytes the merged code reads: {copy:?}"
+        );
+    }
+
+    /// The reference that *creates* a copy and the reference that decides how
+    /// far it runs are routinely different ones, and the warning is about the
+    /// second: it says nothing bounds the object and that the reference says
+    /// nothing about its size either. Naming the first one instead said that
+    /// of a reference whose size is right there in the instruction — on
+    /// `test/bash` the 1,104 bytes taken out of `libtinfo.so.6`'s `.bss` were
+    /// blamed on a one-byte read of its first byte, which asks for one byte,
+    /// while the reference 1,084 bytes further in that actually cost them went
+    /// unnamed. Reading that warning to decide what to do about issue #66 sends
+    /// you to the wrong instruction in the wrong function.
+    #[test]
+    fn a_copy_names_the_reference_its_end_comes_from_not_the_one_that_began_it() {
+        let lib = test_lib("libtinfo.so.6");
+        let bytes = std::fs::read(&lib).expect("read library");
+        let elf = parse_lib(&bytes);
+        let sec = elf.section_by_name(".data").expect(".data");
+        let (sec_addr, sec_size, sec_index) = (sec.address(), sec.size(), sec.index());
+
+        let mut state = test_state();
+        let lib_id = state.lib_id(&lib);
+        let index = state.lib_index(lib_id, &elf);
+        let handle = Lib {
+            id: lib_id,
+            path: &lib,
+            elf: &elf,
+            index: &index,
+        };
+
+        // Where an unbounded reference's fallback can land: the start of each
+        // object the library both names and sizes in the section, taken from
+        // the index rather than re-derived, so the test asks the same question
+        // `needed_prefix` does.
+        let mut objects = Vec::new();
+        let mut at = sec_addr;
+        while let Some(next) = index.next_object_in_section(at, sec_index) {
+            if next >= sec_addr + sec_size {
+                break;
+            }
+            objects.push(next);
+            at = next;
+        }
+        let [first, second, .., last] = objects[..] else {
+            panic!("fixture moved: libtinfo's .data names fewer than three objects");
+        };
+        // `first` reaches less far than `second`, and `last` has nothing above
+        // it, so its fallback is the section's end.
+        assert!(
+            index.next_object_in_section(last, sec_index).is_none(),
+            "fixture moved: libtinfo's .data names something above {last:#x}"
+        );
+
+        // A bounded read of the section's first word is what opens the copy.
+        ensure_data_blob_extracted(handle, "the read", sec_addr, Some(8), &mut state)
+            .expect("copy .data")
+            .expect(".data is extractable");
+        let copy = |state: &ExtractionState| state.data_section_copies[0].clone();
+        assert_eq!(
+            (copy(&state).address, copy(&state).reached_from),
+            (sec_addr, "the read".to_owned())
+        );
+        assert!(
+            copy(&state).unbounded_end.is_none(),
+            "a read of eight bytes says how many it reads: {:?}",
+            copy(&state)
+        );
+
+        // An unbounded one further in takes the copy to the next object the
+        // library names, and is the reference the end now comes from. What
+        // opened the copy is untouched: that is a different question, and the
+        // other branch of the warning is the one that asks it.
+        ensure_data_blob_extracted(handle, "the lea", second, None, &mut state)
+            .expect("extend .data")
+            .expect(".data is extractable");
+        let reported = |state: &ExtractionState| {
+            copy(state)
+                .unbounded_end
+                .map(|u| (u.address, u.reached_from))
+        };
+        assert_eq!(reported(&state), Some((second, "the lea".to_owned())));
+        assert_eq!(
+            (copy(&state).address, copy(&state).reached_from),
+            (sec_addr, "the read".to_owned()),
+            "the reference that opened the copy was overwritten"
+        );
+
+        // A second unbounded reference that reaches less far costs nothing, so
+        // it does not take the record: the furthest one holds it, not the
+        // latest.
+        ensure_data_blob_extracted(handle, "a nearer lea", first, None, &mut state)
+            .expect("extend .data")
+            .expect(".data is extractable");
+        assert_eq!(reported(&state), Some((second, "the lea".to_owned())));
+
+        // A read reaching exactly as far justifies the end after all, and the
+        // copy stops being one with no bound.
+        let bounded_to = copy(&state).bytes as u64;
+        ensure_data_blob_extracted(
+            handle,
+            "a longer read",
+            sec_addr + bounded_to - 8,
+            Some(8),
+            &mut state,
+        )
+        .expect("read to the copy's end")
+        .expect(".data is extractable");
+        assert_eq!(reported(&state), None, "{:?}", copy(&state));
+
+        // And an unbounded reference past that read takes it back, naming
+        // itself: it is past every earlier fallback too, which is why the
+        // record can be dropped above without losing the one that held it.
+        ensure_data_blob_extracted(handle, "the last lea", last, None, &mut state)
+            .expect("extend .data")
+            .expect(".data is extractable");
+        assert_eq!(reported(&state), Some((last, "the last lea".to_owned())));
+        assert!(
+            copy(&state).is_whole_section(),
+            "nothing above the last named object bounds the copy: {:?}",
+            copy(&state)
         );
     }
 
