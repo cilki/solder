@@ -1,9 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use object::read::elf::ElfFile64;
-use object::{Object, ObjectSection};
 use tracing::{debug, warn};
 
 use crate::elf_reader::{DynamicTable, va_to_file_offset};
@@ -444,19 +443,35 @@ struct RelaEntry {
 
 /// The executable's two dynamic relocation tables, decoded.
 ///
-/// Entries are read out of the `.rela.*` section bytes rather than taken from a
-/// parsed relocation list because every caller needs an entry's *file offset*,
-/// which a parsed relocation does not carry. A missing section is an empty
-/// table.
+/// Entries are read out of the raw table bytes rather than taken from a parsed
+/// relocation list because every caller needs an entry's *file offset*, which a
+/// parsed relocation does not carry. A table the image does not declare is an
+/// empty one.
+///
+/// The tables are located through `PT_DYNAMIC` — `DT_JMPREL`/`DT_PLTRELSZ` and
+/// `DT_RELA`/`DT_RELASZ` — and not through the `.rela.plt`/`.rela.dyn` section
+/// headers that normally also describe them. Those tags are what the loader
+/// reads, so they are the authority on which bytes are a relocation table, and
+/// they are already what the writer's `read_existing_rela_dyn` rebuilds
+/// `.rela.dyn` from: a disagreement between the two views is the patcher
+/// neutralizing entries in a table the writer never reads.
+///
+/// Looking them up by section name also made a section-header-less executable
+/// look like one that imports nothing at all — two empty tables, no symbol to
+/// merge out of any library, "No mergeable imported symbols found" and status 0
+/// with the binary untouched, even when `-m` named a library that had to be
+/// merged. Such an executable is now refused by `validate_executable`, for the
+/// reasons it is actually unmergeable, before any of this runs.
 ///
 /// Read once, by the caller that drives the merge, and shared: four stages want
 /// something out of these two tables, and each one used to decode them again
 /// from scratch — three through this type and a fourth (the trampoline GOT map,
 /// now [`RelaTables::got_slot_vas`]) through its own copy of the walk.
 pub struct RelaTables {
-    /// `.rela.plt`, which holds nothing but JUMP_SLOTs.
+    /// `DT_JMPREL`, normally `.rela.plt`, which holds nothing but JUMP_SLOTs.
     jump_slot: Vec<RelaEntry>,
-    /// `.rela.dyn`, which mixes GLOB_DAT with RELATIVE, COPY and TLS entries.
+    /// `DT_RELA`, normally `.rela.dyn`, which mixes GLOB_DAT with RELATIVE,
+    /// COPY and TLS entries.
     dynamic: Vec<RelaEntry>,
     /// Names of the `.dynsym` symbols some other object has to define: the
     /// undefined ones that are not weak, so the loader fails the executable
@@ -466,6 +481,7 @@ pub struct RelaTables {
 
 impl RelaTables {
     pub fn read(elf: &ElfFile64<'_>) -> Result<Self> {
+        use goblin::elf::dynamic::{DT_JMPREL, DT_PLTREL, DT_PLTRELSZ, DT_RELA, DT_RELASZ};
         use goblin::elf::section_header::SHN_UNDEF;
         use goblin::elf::sym::STB_WEAK;
 
@@ -498,9 +514,25 @@ impl RelaTables {
             .map(str::to_owned)
             .collect();
 
+        let dynamic =
+            DynamicTable::parse(elf.data()).context("reading the executable's .dynamic")?;
+
+        // `DT_JMPREL`'s entries are `Elf64_Rela`s only if `DT_PLTREL` says so.
+        // The x86-64 ABI mandates `DT_RELA`, and everything below reads the
+        // table as 24-byte entries, so a `DT_REL` table is a file this cannot
+        // decode rather than one to decode as if the tag had agreed.
+        if let Some(pltrel) = dynamic.value_of(DT_PLTREL)
+            && pltrel != DT_RELA
+        {
+            bail!(
+                "DT_PLTREL is {pltrel}, but x86-64 relocation tables are DT_RELA ({DT_RELA}); \
+                 refusing to read DT_JMPREL as one"
+            );
+        }
+
         Ok(Self {
-            jump_slot: read_rela_section(elf, ".rela.plt", &names)?,
-            dynamic: read_rela_section(elf, ".rela.dyn", &names)?,
+            jump_slot: read_rela_table(elf, &dynamic, "DT_JMPREL", DT_JMPREL, DT_PLTRELSZ, &names)?,
+            dynamic: read_rela_table(elf, &dynamic, "DT_RELA", DT_RELA, DT_RELASZ, &names)?,
             strong_undefined,
         })
     }
@@ -582,20 +614,39 @@ impl RelaTables {
     }
 }
 
-/// Decode the named `.rela.*` section, naming each entry's symbol out of
-/// `dynsym_names` (indexed by `.dynsym` index).
-fn read_rela_section(
+/// Decode the `Elf64_Rela` table `addr_tag` points at, sized by `size_tag`,
+/// naming each entry's symbol out of `dynsym_names` (indexed by `.dynsym`
+/// index). `what` names the tag pair in any error.
+///
+/// A table the image declares neither tag for is an empty one: the loader
+/// processes no relocations it was not pointed at either.
+fn read_rela_table(
     elf: &ElfFile64<'_>,
-    section_name: &str,
+    dynamic: &DynamicTable,
+    what: &str,
+    addr_tag: u64,
+    size_tag: u64,
     dynsym_names: &[&str],
 ) -> Result<Vec<RelaEntry>> {
-    let Some(section) = elf.section_by_name(section_name) else {
+    let (Some(vaddr), Some(size)) = (dynamic.value_of(addr_tag), dynamic.value_of(size_tag)) else {
         return Ok(Vec::new());
     };
-    let sh_offset = section.file_range().map(|(off, _)| off).unwrap_or(0);
-    let data = section
-        .data()
-        .with_context(|| format!("{section_name} data"))?;
+    let bytes = elf.data();
+    let sh_offset = va_to_file_offset(elf, vaddr)
+        .with_context(|| format!("{what} is {vaddr:#x}, which is in no PT_LOAD segment"))?;
+    // The length is the file's own claim about itself, so it is checked before
+    // anything is read from it rather than trusted to a slice.
+    let end = sh_offset
+        .checked_add(size)
+        .filter(|end| *end <= bytes.len() as u64)
+        .with_context(|| {
+            format!(
+                "{what} covers {size} bytes from file offset {sh_offset:#x}, past the end of \
+                 this {} byte file",
+                bytes.len()
+            )
+        })?;
+    let data = &bytes[sh_offset as usize..end as usize];
 
     let mut entries = Vec::new();
     for (i, entry) in data.chunks_exact(RELA_ENTRY_SIZE as usize).enumerate() {
@@ -958,6 +1009,148 @@ mod library_dynamic_tests {
                 "{what}: {err} should name the file"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rela_table_tests {
+    use super::*;
+    use crate::elf_reader::SectionTable;
+
+    /// The committed `test/` executables are the ones solder actually patches.
+    const TEST_BINARIES: [&str; 3] = ["grep", "bash", "md5sum"];
+
+    fn read_test_binary(name: &str) -> Vec<u8> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test/").to_string() + name;
+        std::fs::read(&path).expect("test binary")
+    }
+
+    fn tables(bytes: &[u8]) -> RelaTables {
+        let elf = ElfFile64::<object::Endianness>::parse(bytes).expect("parse the test binary");
+        RelaTables::read(&elf).expect("read the .rela tables")
+    }
+
+    /// An entry reduced to everything anything downstream reads off it.
+    fn entries(table: &[RelaEntry]) -> Vec<(u64, u64, u32, &str)> {
+        table
+            .iter()
+            .map(|e| (e.r_info_offset, e.target_vaddr, e.r_type, e.symbol.as_str()))
+            .collect()
+    }
+
+    /// `DT_JMPREL`/`DT_PLTRELSZ` and `DT_RELA`/`DT_RELASZ` have to name exactly
+    /// the bytes `.rela.plt` and `.rela.dyn` do. The patcher neutralizes an
+    /// entry by writing at the `r_info_offset` that comes out of these tables,
+    /// and the writer rebuilds `.rela.dyn` from the region `DT_RELA` names, so
+    /// the two views disagreeing means one stage editing a table the next one
+    /// never read.
+    #[test]
+    fn pt_dynamic_and_the_section_headers_name_the_same_tables() {
+        use goblin::elf::dynamic::{DT_JMPREL, DT_PLTRELSZ, DT_RELA, DT_RELASZ};
+
+        for name in TEST_BINARIES {
+            let bytes = read_test_binary(name);
+            let elf = ElfFile64::<object::Endianness>::parse(&*bytes).expect("parse");
+            let dynamic = DynamicTable::parse(&bytes).expect("parse .dynamic");
+            let sections = SectionTable::parse(&bytes)
+                .expect("read the section headers")
+                .expect("the fixture has section headers");
+
+            for (section, addr_tag, size_tag) in [
+                (".rela.plt", DT_JMPREL, DT_PLTRELSZ),
+                (".rela.dyn", DT_RELA, DT_RELASZ),
+            ] {
+                let header = sections
+                    .by_name(section)
+                    .unwrap_or_else(|| panic!("{name} has no {section}"));
+                let va = dynamic
+                    .value_of(addr_tag)
+                    .unwrap_or_else(|| panic!("{name} has no dynamic tag for {section}"));
+                let offset = va_to_file_offset(&elf, va)
+                    .unwrap_or_else(|| panic!("{name}: {section} is in no PT_LOAD"));
+                let size = dynamic
+                    .value_of(size_tag)
+                    .expect("a size beside the address");
+                assert_eq!(
+                    (offset, size),
+                    (header.offset, header.size),
+                    "{name}: {section}"
+                );
+            }
+        }
+    }
+
+    /// The regression this read exists to rule out: the tables used to be found
+    /// with `section_by_name`, so an executable whose section header table had
+    /// been stripped yielded two *empty* ones. Every import then looked like it
+    /// was not there — the merge found no symbol to take out of any library and
+    /// finished with "No mergeable imported symbols found" and status 0, having
+    /// changed nothing, even when `-m` named a library it had to merge.
+    ///
+    /// These are the loader's tables, and the loader has never read a section
+    /// header.
+    #[test]
+    fn the_tables_survive_a_stripped_section_header_table() {
+        for name in TEST_BINARIES {
+            let whole = read_test_binary(name);
+            let mut stripped = whole.clone();
+            stripped[0x28..0x30].fill(0); // e_shoff
+            stripped[0x3c..0x40].fill(0); // e_shnum, e_shstrndx
+            assert!(
+                SectionTable::parse(&stripped)
+                    .expect("read the stripped section headers")
+                    .is_none(),
+                "{name}: the copy should have no usable section header table"
+            );
+
+            let before = tables(&whole);
+            let after = tables(&stripped);
+
+            assert!(
+                !before.jump_slot.is_empty() && !before.dynamic.is_empty(),
+                "{name}: the fixture should carry both relocation tables"
+            );
+            assert_eq!(
+                entries(&before.jump_slot),
+                entries(&after.jump_slot),
+                "{name}: .rela.plt"
+            );
+            assert_eq!(
+                entries(&before.dynamic),
+                entries(&after.dynamic),
+                "{name}: .rela.dyn"
+            );
+            assert_eq!(
+                before.strong_undefined, after.strong_undefined,
+                "{name}: the symbols the loader has to find"
+            );
+        }
+    }
+
+    /// Only `DT_RELA` tables are 24 bytes an entry. Reading a `DT_REL` one as
+    /// if it were would walk off the stride and hand the patcher offsets into
+    /// the middle of entries, so the tag is checked rather than assumed.
+    #[test]
+    fn a_rel_rather_than_rela_plt_table_is_refused() {
+        use goblin::elf::dynamic::{DT_PLTREL, DT_REL};
+
+        let mut bytes = read_test_binary("grep");
+        let at = {
+            let dynamic = DynamicTable::parse(&bytes).expect("parse .dynamic");
+            dynamic.value_offset(
+                dynamic
+                    .index_of(DT_PLTREL)
+                    .expect("test/grep has DT_PLTREL"),
+            )
+        };
+        bytes[at..at + 8].copy_from_slice(&DT_REL.to_le_bytes());
+
+        let elf = ElfFile64::<object::Endianness>::parse(&*bytes).expect("parse");
+        let Err(e) = RelaTables::read(&elf) else {
+            panic!("a DT_REL jump-slot table must be refused");
+        };
+        let err = format!("{e:#}");
+        assert!(err.contains("DT_PLTREL"), "{err}");
     }
 }
 
