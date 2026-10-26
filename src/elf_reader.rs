@@ -223,6 +223,7 @@ pub fn interpreter<'a>(elf: &'a ElfFile64<'a>) -> Option<&'a str> {
 /// - ET_EXEC or ET_DYN (PIE)
 /// - EM_X86_64
 /// - Has PT_DYNAMIC (dynamically linked)
+/// - Has a section header table the merge can read and keep in sync
 ///
 /// Returns `true` if the executable is PIE (ET_DYN), `false` if non-PIE (ET_EXEC).
 pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<bool> {
@@ -263,6 +264,30 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<bool> {
     if !has_dynamic {
         bail!(
             "{}: statically linked binary — nothing to merge",
+            path.display()
+        );
+    }
+
+    // The loader never reads section headers, but the merge does, in places
+    // where nothing else carries the fact it needs: `.dynsym` and
+    // `.gnu.version` have no length anywhere in `.dynamic` (there is no
+    // `DT_SYMSZ` and no `DT_VERSYMSZ`), and `.gnu.version_r` has no extent
+    // either, which is the only thing bounding the Verneed list the merge has
+    // to unlink a merged library's version requirements from. Leaving a
+    // requirement on a library no longer in `DT_NEEDED` is what makes ld.so
+    // abort on `_dl_check_map_versions`, so a merge that cannot do that
+    // surgery is a merge that cannot run.
+    //
+    // This used to be discovered by accident and misreported: the import scan
+    // found `.rela.plt`/`.rela.dyn` through the section table too, so a
+    // stripped executable yielded no imports at all and `solder` finished with
+    // "No mergeable imported symbols found" and status 0, having changed
+    // nothing — even when `-m` named the library it had been told to merge.
+    if SectionTable::parse(elf.data())?.is_none() {
+        bail!(
+            "{}: no usable section header table. The merge needs it for the \
+             .dynsym/.gnu.version lengths and to unlink .gnu.version_r entries, none of \
+             which .dynamic records; merge a copy that still has its section headers",
             path.display()
         );
     }
@@ -867,6 +892,58 @@ mod merge_library_tests {
             let err = rejection(&bytes);
             assert!(err.contains("ELF"), "{err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod executable_tests {
+    use super::*;
+
+    const GREP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep");
+
+    fn validate(bytes: &[u8]) -> Result<bool> {
+        let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(bytes)
+            .expect("parse the fixture");
+        validate_executable(&elf, Path::new(GREP))
+    }
+
+    #[test]
+    fn the_executables_solder_merges_into_are_accepted() {
+        for name in ["grep", "bash", "md5sum"] {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test/").to_string() + name;
+            let bytes = std::fs::read(&path).expect("test binary");
+            assert!(
+                validate(&bytes).unwrap_or_else(|e| panic!("{name} should be mergeable: {e:#}")),
+                "{name} is a PIE executable"
+            );
+        }
+    }
+
+    /// An executable with no section header table is not something the merge
+    /// can finish — `.dynsym`/`.gnu.version` have no length in `.dynamic` and
+    /// the Verneed list has no extent — and the refusal has to come from here,
+    /// before any work is done.
+    ///
+    /// It used to be noticed much later and reported as something else
+    /// entirely: `RelaTables::read` looked `.rela.plt` and `.rela.dyn` up by
+    /// section name, so a stripped executable produced two empty relocation
+    /// tables, the import scan found nothing to merge out of any library, and
+    /// `solder` exited 0 saying "No mergeable imported symbols found" having
+    /// left the binary untouched — the same answer it gives for an executable
+    /// that genuinely imports nothing.
+    #[test]
+    fn an_executable_without_a_section_header_table_is_refused() {
+        let mut bytes = std::fs::read(GREP).expect("read test/grep");
+        // e_shoff, e_shnum and e_shstrndx: what `sstrip` and friends clear.
+        bytes[0x28..0x30].fill(0);
+        bytes[0x3c..0x40].fill(0);
+
+        let err = format!(
+            "{:#}",
+            validate(&bytes).expect_err("a section-header-less executable must be refused")
+        );
+        assert!(err.contains("section header"), "{err}");
+        assert!(err.contains("/test/grep"), "{err}");
     }
 }
 

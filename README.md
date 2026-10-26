@@ -369,6 +369,14 @@ dynamic, or relink against a soname.
 ## Limitations
 
 - x86_64 only
+- The executable has to still have its section header table. The loader never
+  reads one, but the merge does, for the two things nothing else records:
+  `.dynsym` and `.gnu.version` have no length anywhere in `.dynamic` — there is
+  no `DT_SYMSZ` and no `DT_VERSYMSZ` — and `.gnu.version_r` has no extent
+  either, which is what bounds the Verneed list a merged library's version
+  requirements have to be unlinked from. `strip` keeps the table; `sstrip` and
+  friends do not, and `solder` refuses such an input rather than merging part
+  of the way into it
 - We can't merge `dlopen` libraries
 - Extracted code may not contain relocations that need the library's own GOT
   (`R_X86_64_GOTPCREL` and friends); `solder` refuses the merge rather than
