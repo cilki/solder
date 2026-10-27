@@ -344,7 +344,7 @@ impl ExtractionState {
             lib = %path.display(),
             symbols = idx.by_name.len(),
             fdes = idx.fdes.fde_count(),
-            packed_relative_relocs = idx.relr.len(),
+            packed_relative_relocs = idx.packed_relative_relocs,
             "Indexed library"
         );
         self.lib_index_cache[lib.0 as usize] = Some(Rc::clone(&idx));
@@ -1181,15 +1181,22 @@ struct LibIndex {
     /// Exact function bounds from `.eh_frame`, which cover code the symbol
     /// tables say nothing about (see `resolve_owning_unit`).
     fdes: crate::eh_frame::FdeTable,
-    /// The relative relocations the library packs into `DT_RELR`, decoded (see
-    /// [`crate::elf_reader::packed_relative_relocs`]).
+    /// How many of `dyn_relocs` came out of the library's `DT_RELR` table
+    /// rather than `.rela.dyn`/`.rela.plt`.
+    packed_relative_relocs: usize,
+    /// Every dynamic relocation of the library, decoded once: the explicit
+    /// `.rela.dyn`/`.rela.plt` entries followed by the ones its `DT_RELR`
+    /// table packs (see [`decode_dynamic_relocs`]).
     ///
-    /// `object`'s `dynamic_relocations` walks `SHT_REL`/`SHT_RELA` sections and
-    /// skips `SHT_RELR`, so a `-z pack-relative-relocs` build's relative
-    /// relocations reach extraction only through here. Decoding them is a read
-    /// of the whole table and of one word per entry, so it is done once with
-    /// the rest of the per-library lookups rather than per extracted unit.
-    relr: Vec<crate::elf_reader::RelrReloc>,
+    /// Extraction asks which relocations land in one unit's or one data
+    /// copy's range many times over, and answering that by re-walking the
+    /// tables cost a full decode of every entry per question: `libcrypto.so.3`
+    /// carries tens of thousands of them, so each data unit extracted out of
+    /// it paid half a millisecond to find the handful in its own bytes.
+    dyn_relocs: Vec<DynReloc>,
+    /// `(slot address, position in dyn_relocs)` for each of them, sorted, so a
+    /// range query is a binary search (see [`LibIndex::dyn_relocs_in`]).
+    dyn_relocs_by_offset: Vec<(u64, u32)>,
 }
 
 impl LibIndex {
@@ -1242,9 +1249,14 @@ impl LibIndex {
         // stubs, and `.rela.dyn`, whose GLOB_DATs name the `.plt.got`-style
         // ones. The first entry naming a slot wins; nothing legitimately
         // relocates one slot twice.
+        let relr = crate::elf_reader::packed_relative_relocs(elf, path)?;
+        let dyn_relocs = decode_dynamic_relocs(elf, &relr);
+
         let mut got_to_name: FastMap<u64, String> = FastMap::default();
-        for (got_vaddr, reloc) in elf.dynamic_relocations().into_iter().flatten() {
-            let object::RelocationTarget::Symbol(si) = reloc.target() else {
+        // Only the explicit entries can name a symbol; the packed ones are all
+        // relative.
+        for reloc in &dyn_relocs {
+            let Some(si) = reloc.symbol else {
                 continue;
             };
             let Some(name) = dynamic_symbol_by_index(elf, si).and_then(|sym| sym.name().ok())
@@ -1253,10 +1265,20 @@ impl LibIndex {
             };
             if !name.is_empty() {
                 got_to_name
-                    .entry(got_vaddr)
+                    .entry(reloc.offset)
                     .or_insert_with(|| name.to_owned());
             }
         }
+
+        // Sorting the positions along with the addresses keeps entries that
+        // name the same slot in table order, which is what the first-writer
+        // rules of the callers rest on.
+        let mut dyn_relocs_by_offset: Vec<(u64, u32)> = dyn_relocs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.offset, i as u32))
+            .collect();
+        dyn_relocs_by_offset.sort_unstable();
 
         let fdes = elf
             .section_by_name(".eh_frame")
@@ -1272,8 +1294,31 @@ impl LibIndex {
             plt_spans,
             got_to_name,
             fdes,
-            relr: crate::elf_reader::packed_relative_relocs(elf, path)?,
+            packed_relative_relocs: relr.len(),
+            dyn_relocs,
+            dyn_relocs_by_offset,
         })
+    }
+
+    /// The dynamic relocations whose slot lies in `range`, in the order the
+    /// library's tables list them — the order a walk of every entry filtered
+    /// down to `range` would visit them in.
+    fn dyn_relocs_in(&self, range: std::ops::Range<u64>) -> impl Iterator<Item = &DynReloc> {
+        let start = self
+            .dyn_relocs_by_offset
+            .partition_point(|&(off, _)| off < range.start);
+        let end = self
+            .dyn_relocs_by_offset
+            .partition_point(|&(off, _)| off < range.end)
+            .max(start);
+        let mut positions: Vec<u32> = self.dyn_relocs_by_offset[start..end]
+            .iter()
+            .map(|&(_, i)| i)
+            .collect();
+        positions.sort_unstable();
+        positions
+            .into_iter()
+            .map(move |i| &self.dyn_relocs[i as usize])
     }
 
     /// The PLT section covering `addr`, as `(section address, section index)`.
@@ -1358,16 +1403,22 @@ struct DynReloc {
     symbol: Option<object::SymbolIndex>,
 }
 
-/// Every dynamic relocation of `lib`: its explicit `.rela.dyn`/`.rela.plt`
-/// entries followed by the ones its `DT_RELR` table packs.
+/// Every dynamic relocation of `elf`: its explicit `.rela.dyn`/`.rela.plt`
+/// entries followed by `relr`, the ones its `DT_RELR` table packs.
+///
+/// `object`'s `dynamic_relocations` walks `SHT_REL`/`SHT_RELA` sections and
+/// skips `SHT_RELR`, so a `-z pack-relative-relocs` build's relative
+/// relocations reach extraction only through the second half.
 ///
 /// The explicit entries come first so that a slot named by both — which no
 /// linker emits, the two forms being alternatives — keeps the resolution the
 /// explicit entry gives it, matching the first-writer-wins rule
 /// [`collect_dynamic_range_relocs`] already applies within `.rela.dyn`.
-fn dynamic_relocs<'a>(lib: Lib<'a, '_>) -> impl Iterator<Item = DynReloc> + 'a {
-    let explicit = lib
-        .elf
+fn decode_dynamic_relocs(
+    elf: &object::read::elf::ElfFile64<'_>,
+    relr: &[crate::elf_reader::RelrReloc],
+) -> Vec<DynReloc> {
+    let explicit = elf
         .dynamic_relocations()
         .into_iter()
         .flatten()
@@ -1384,7 +1435,7 @@ fn dynamic_relocs<'a>(lib: Lib<'a, '_>) -> impl Iterator<Item = DynReloc> + 'a {
             },
         });
 
-    let packed = lib.index.relr.iter().map(|entry| DynReloc {
+    let packed = relr.iter().map(|entry| DynReloc {
         offset: entry.vaddr,
         // Exactly what `object` reports for an `R_X86_64_RELATIVE` of
         // `.rela.dyn`: a kind and an encoding it does not name, of a width it
@@ -1401,7 +1452,7 @@ fn dynamic_relocs<'a>(lib: Lib<'a, '_>) -> impl Iterator<Item = DynReloc> + 'a {
         symbol: None,
     });
 
-    explicit.chain(packed)
+    explicit.chain(packed).collect()
 }
 
 /// Find a symbol by name using the precomputed library index, falling back to
@@ -2125,11 +2176,8 @@ fn collect_dynamic_range_relocs(
         .iter()
         .map(|r| r.offset_within_unit)
         .collect();
-    for reloc in dynamic_relocs(lib) {
+    for &reloc in lib.index.dyn_relocs_in(range) {
         let roff = reloc.offset;
-        if !range.contains(&roff) {
-            continue;
-        }
         let offset_within_unit = roff - unit_base;
         if occupied.contains(&offset_within_unit) {
             continue;
@@ -2916,22 +2964,6 @@ fn extract_init_fini_arrays(lib: Lib<'_, '_>) -> Result<InitFiniArrays> {
     let lib_path = lib.path;
     let mut result = InitFiniArrays::default();
 
-    // Function addresses for init/fini slots, recovered from the library's
-    // dynamic relocations: R_X86_64_RELATIVE — spelled out in .rela.dyn or
-    // packed into DT_RELR — carries the address in its addend; a symbol-based
-    // relocation (e.g. R_X86_64_64) resolves to symbol address + addend.
-    let mut reloc_targets: HashMap<u64, u64> = HashMap::new();
-    for reloc in dynamic_relocs(lib) {
-        let func_vaddr = match reloc.symbol {
-            Some(si) => match dynamic_symbol_by_index(lib.elf, si) {
-                Some(sym) if !sym.is_undefined() => sym.address().wrapping_add(reloc.addend as u64),
-                _ => continue,
-            },
-            None => reloc.addend as u64,
-        };
-        reloc_targets.insert(reloc.offset, func_vaddr);
-    }
-
     for section in lib.elf.sections() {
         let sname = section.name().unwrap_or("");
         let is_init = sname == ".init_array";
@@ -2941,6 +2973,29 @@ fn extract_init_fini_arrays(lib: Lib<'_, '_>) -> Result<InitFiniArrays> {
         }
 
         let sec_addr = section.address();
+
+        // Function addresses for the array's slots, recovered from the
+        // library's dynamic relocations: R_X86_64_RELATIVE — spelled out in
+        // .rela.dyn or packed into DT_RELR — carries the address in its
+        // addend; a symbol-based relocation (e.g. R_X86_64_64) resolves to
+        // symbol address + addend. A later entry for a slot overrides an
+        // earlier one.
+        let mut reloc_targets: HashMap<u64, u64> = HashMap::new();
+        for reloc in lib
+            .index
+            .dyn_relocs_in(sec_addr..sec_addr.saturating_add(section.size()))
+        {
+            let func_vaddr = match reloc.symbol {
+                Some(si) => match dynamic_symbol_by_index(lib.elf, si) {
+                    Some(sym) if !sym.is_undefined() => {
+                        sym.address().wrapping_add(reloc.addend as u64)
+                    }
+                    _ => continue,
+                },
+                None => reloc.addend as u64,
+            };
+            reloc_targets.insert(reloc.offset, func_vaddr);
+        }
         let section_data = section
             .data()
             .with_context(|| format!("{}: {} section data", lib_path.display(), sname))?;
