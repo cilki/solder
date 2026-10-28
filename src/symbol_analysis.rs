@@ -65,20 +65,21 @@ fn search_dirs<'a>(values: impl Iterator<Item = &'a str>, origin: &Path) -> Vec<
         .collect()
 }
 
-pub fn parse_dynamic(elf: &ElfFile64<'_>, exe_path: &Path) -> Result<DynamicInfo> {
+/// Read `DT_NEEDED`, `DT_RPATH` and `DT_RUNPATH` out of the object at `path`,
+/// the executable or one of its libraries.
+pub fn parse_dynamic(elf: &ElfFile64<'_>, path: &Path) -> Result<DynamicInfo> {
     use goblin::elf::dynamic::{DT_NEEDED, DT_RPATH, DT_RUNPATH};
 
     let bytes = elf.data();
-    let dynamic = DynamicTable::parse(bytes).context("reading .dynamic of the executable")?;
+    let dynamic = DynamicTable::parse(bytes)
+        .with_context(|| format!("reading .dynamic of {}", path.display()))?;
 
     // `$ORIGIN` is the directory holding the object with symlinks resolved,
     // which is how ld.so computes it. Canonicalizing also turns the usual
     // `solder ./myapp` invocation into an absolute directory, so the resulting
     // search path does not depend on the working directory.
-    let exe_real = exe_path
-        .canonicalize()
-        .unwrap_or_else(|_| exe_path.to_path_buf());
-    let origin = exe_real.parent().unwrap_or(Path::new("."));
+    let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let origin = real.parent().unwrap_or(Path::new("."));
 
     let search_list = |tag: u64| -> Vec<PathBuf> {
         search_dirs(
@@ -672,32 +673,61 @@ pub struct LibraryDynamic {
 /// the merge extracts code through, and the inherited-`DT_NEEDED` decision —
 /// assumes the file's code can run in the executable. See
 /// [`validate_merge_library`](crate::elf_reader::validate_merge_library).
+///
+/// Only `.dynsym` and `.dynamic` are read, both straight out of the mapping.
+/// This used to be a full `goblin::elf::Elf::parse`, which pre-splits the whole
+/// of `.dynstr` into a table of strings and walks every dynamic relocation to
+/// size `.dynsym` — for `libcrypto.so.3`, 6k strings and 28k relocations, none
+/// of which this needs, on every library the merge reads.
 pub fn read_library_dynamic(lib_path: &Path) -> Result<LibraryDynamic> {
+    use object::read::elf::Sym;
+
     let mapped =
         MappedElf::open(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
     let bytes = mapped.bytes();
     crate::elf_reader::validate_merge_library(bytes, lib_path)?;
-    let elf = goblin::elf::Elf::parse(bytes)
-        .with_context(|| format!("parsing {}", lib_path.display()))?;
+    let elf = mapped.parse()?;
+    let endian = elf.endian();
 
-    // `$ORIGIN` in this library's search path is this library's own directory,
-    // symlinks resolved — the same rule `parse_dynamic` applies to the
-    // executable, applied to the object that recorded these entries.
-    let real = lib_path
-        .canonicalize()
-        .unwrap_or_else(|_| lib_path.to_path_buf());
-    let origin = real.parent().unwrap_or(Path::new("."));
-
-    Ok(LibraryDynamic {
-        defined: elf
-            .dynsyms
+    // `object` finds `.dynsym` through the section headers. A library without
+    // them is still loadable — ld.so never reads them — so for that one the
+    // table has to be sized from the hash tables, which is how goblin does it.
+    let symbols = elf.elf_dynamic_symbol_table();
+    let defined: HashSet<String> = if symbols.is_empty() {
+        let elf = goblin::elf::Elf::parse(bytes)
+            .with_context(|| format!("parsing {}", lib_path.display()))?;
+        elf.dynsyms
             .iter()
             .filter(|sym| sym.st_shndx != goblin::elf::section_header::SHN_UNDEF as usize)
             .filter_map(|sym| elf.dynstrtab.get_at(sym.st_name).map(str::to_owned))
-            .collect(),
-        needed: elf.libraries.iter().map(|s| (*s).to_owned()).collect(),
-        rpath: search_dirs(elf.rpaths.iter().copied(), origin),
-        runpath: search_dirs(elf.runpaths.iter().copied(), origin),
+            .collect()
+    } else {
+        let strings = symbols.strings();
+        symbols
+            .symbols()
+            .iter()
+            .filter(|sym| !sym.is_undefined(endian))
+            .filter_map(|sym| sym.name(endian, strings).ok())
+            .filter_map(|name| std::str::from_utf8(name).ok())
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // `$ORIGIN` in this library's search path is this library's own
+    // directory, symlinks resolved — the same rule applied to the executable,
+    // so the same reader serves both.
+    let DynamicInfo {
+        needed,
+        rpath,
+        runpath,
+        ..
+    } = parse_dynamic(&elf, lib_path)?;
+
+    Ok(LibraryDynamic {
+        defined,
+        needed,
+        rpath,
+        runpath,
     })
 }
 
@@ -970,6 +1000,27 @@ mod library_dynamic_tests {
             "{:?}",
             lib.needed
         );
+    }
+
+    /// ld.so never reads section headers, so a library stripped of them still
+    /// loads and still exports everything its `.dynsym` holds. `object` only
+    /// finds that table through the headers; the hash tables are what size it
+    /// without them, and the exports read either way have to be the same.
+    #[test]
+    fn a_library_without_section_headers_yields_the_same_exports() {
+        let with_headers = read_library_dynamic(Path::new(PCRE2)).expect("read libpcre2-8.so.0");
+
+        let mut bytes = std::fs::read(PCRE2).expect("read libpcre2-8.so.0");
+        bytes[0x28..0x30].fill(0); // e_shoff
+        bytes[0x3c..0x40].fill(0); // e_shnum, e_shstrndx
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("libpcre2-8.so.0");
+        std::fs::write(&path, &bytes).expect("write the stripped library");
+
+        let without = read_library_dynamic(&path).expect("read the stripped library");
+        assert!(without.defined.contains("pcre2_compile_8"), "exports");
+        assert_eq!(without.defined, with_headers.defined);
+        assert_eq!(without.needed, with_headers.needed);
     }
 
     /// A library solder cannot take code from has to stop the merge here, where
