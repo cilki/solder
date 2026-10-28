@@ -1184,9 +1184,12 @@ struct LibIndex {
     /// How many of `dyn_relocs` came out of the library's `DT_RELR` table
     /// rather than `.rela.dyn`/`.rela.plt`.
     packed_relative_relocs: usize,
-    /// Every dynamic relocation of the library, decoded once: the explicit
-    /// `.rela.dyn`/`.rela.plt` entries followed by the ones its `DT_RELR`
-    /// table packs (see [`decode_dynamic_relocs`]).
+    /// Every dynamic relocation of the library, decoded once (see
+    /// [`decode_dynamic_relocs`]) and sorted by slot address, so a range
+    /// query is a binary search (see [`LibIndex::dyn_relocs_in`]). The sort is
+    /// stable, so entries that name the same slot stay in table order — the
+    /// explicit `.rela.dyn`/`.rela.plt` ones ahead of the `DT_RELR` ones —
+    /// which is all the first-writer rules of the callers rest on.
     ///
     /// Extraction asks which relocations land in one unit's or one data
     /// copy's range many times over, and answering that by re-walking the
@@ -1194,9 +1197,6 @@ struct LibIndex {
     /// carries tens of thousands of them, so each data unit extracted out of
     /// it paid half a millisecond to find the handful in its own bytes.
     dyn_relocs: Vec<DynReloc>,
-    /// `(slot address, position in dyn_relocs)` for each of them, sorted, so a
-    /// range query is a binary search (see [`LibIndex::dyn_relocs_in`]).
-    dyn_relocs_by_offset: Vec<(u64, u32)>,
 }
 
 impl LibIndex {
@@ -1250,7 +1250,8 @@ impl LibIndex {
         // ones. The first entry naming a slot wins; nothing legitimately
         // relocates one slot twice.
         let relr = crate::elf_reader::packed_relative_relocs(elf, path)?;
-        let dyn_relocs = decode_dynamic_relocs(elf, &relr);
+        let mut dyn_relocs = decode_dynamic_relocs(elf, &relr);
+        dyn_relocs.sort_by_key(|r| r.offset);
 
         let mut got_to_name: FastMap<u64, String> = FastMap::default();
         // Only the explicit entries can name a symbol; the packed ones are all
@@ -1270,16 +1271,6 @@ impl LibIndex {
             }
         }
 
-        // Sorting the positions along with the addresses keeps entries that
-        // name the same slot in table order, which is what the first-writer
-        // rules of the callers rest on.
-        let mut dyn_relocs_by_offset: Vec<(u64, u32)> = dyn_relocs
-            .iter()
-            .enumerate()
-            .map(|(i, r)| (r.offset, i as u32))
-            .collect();
-        dyn_relocs_by_offset.sort_unstable();
-
         let fdes = elf
             .section_by_name(".eh_frame")
             .and_then(|s| s.data().ok().map(|d| (d, s.address())))
@@ -1296,29 +1287,19 @@ impl LibIndex {
             fdes,
             packed_relative_relocs: relr.len(),
             dyn_relocs,
-            dyn_relocs_by_offset,
         })
     }
 
-    /// The dynamic relocations whose slot lies in `range`, in the order the
-    /// library's tables list them — the order a walk of every entry filtered
-    /// down to `range` would visit them in.
-    fn dyn_relocs_in(&self, range: std::ops::Range<u64>) -> impl Iterator<Item = &DynReloc> {
-        let start = self
-            .dyn_relocs_by_offset
-            .partition_point(|&(off, _)| off < range.start);
+    /// The dynamic relocations whose slot lies in `range`, by slot address;
+    /// entries naming the same slot come in the order the library's tables
+    /// list them.
+    fn dyn_relocs_in(&self, range: std::ops::Range<u64>) -> &[DynReloc] {
+        let start = self.dyn_relocs.partition_point(|r| r.offset < range.start);
         let end = self
-            .dyn_relocs_by_offset
-            .partition_point(|&(off, _)| off < range.end)
+            .dyn_relocs
+            .partition_point(|r| r.offset < range.end)
             .max(start);
-        let mut positions: Vec<u32> = self.dyn_relocs_by_offset[start..end]
-            .iter()
-            .map(|&(_, i)| i)
-            .collect();
-        positions.sort_unstable();
-        positions
-            .into_iter()
-            .map(move |i| &self.dyn_relocs[i as usize])
+        &self.dyn_relocs[start..end]
     }
 
     /// The PLT section covering `addr`, as `(section address, section index)`.
