@@ -452,9 +452,26 @@ pub fn extract_units(
     // Interning the defining library of every symbol the merged libraries
     // export up front is what keeps the lookup on the hot path a `LibId`
     // comparison rather than a path hash.
+    //
+    // The interning itself would hash a path per export, though — 6k of them
+    // for libcrypto.so.3 — when there are only as many distinct paths as
+    // merged libraries. A handful of byte comparisons against the ones already
+    // seen is cheaper than one `Path` hash, which walks the path component by
+    // component.
+    let mut seen: Vec<(&Path, LibId)> = Vec::new();
     let cross_lib_syms = merged_lib_syms
         .iter()
-        .map(|(sym, path)| (sym.clone(), state.lib_id(path)))
+        .map(|(sym, path)| {
+            let id = match seen.iter().find(|(p, _)| p.as_os_str() == path.as_os_str()) {
+                Some(&(_, id)) => id,
+                None => {
+                    let id = state.lib_id(path);
+                    seen.push((path, id));
+                    id
+                }
+            };
+            (sym.clone(), id)
+        })
         .collect();
     state.cross_lib_syms = cross_lib_syms;
 
