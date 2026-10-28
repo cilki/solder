@@ -299,32 +299,26 @@ fn plan_init_fini_arrays(
     // at their original addresses.
     let read_exe_entries = |kind: InitFiniKind| -> Result<Vec<u64>> {
         let (array_tag, size_tag) = kind.dynamic_tags();
-        let mut entries = Vec::new();
         let Some(va) = exe_dynamic.value_of(array_tag) else {
-            return Ok(entries);
+            return Ok(Vec::new());
         };
         let array_size = exe_dynamic.value_of(size_tag).unwrap_or(0);
         if array_size == 0 {
-            return Ok(entries);
+            return Ok(Vec::new());
         }
-        let file_offset = crate::elf_reader::va_to_file_offset(exe_elf, va)
-            .context("exe init/fini array VA not in any PT_LOAD segment")?;
-        for i in 0..(array_size / 8) as usize {
-            let entry_offset = file_offset as usize + i * 8;
-            if entry_offset + 8 > exe_bytes.len() {
-                break;
-            }
-            let func_va = u64::from_le_bytes(
-                exe_bytes[entry_offset..entry_offset + 8]
-                    .try_into()
-                    .expect("8 bytes"),
-            );
+        let (_, array) = crate::elf_reader::dynamic_table_bytes(
+            exe_elf,
+            exe_bytes,
+            &format!("the executable's {}", kind.section()),
+            va,
+            array_size,
+        )?;
+        Ok(array
+            .chunks_exact(8)
+            .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
             // Skip sentinel values
-            if func_va != 0 && func_va != u64::MAX {
-                entries.push(func_va);
-            }
-        }
-        Ok(entries)
+            .filter(|&func_va| func_va != 0 && func_va != u64::MAX)
+            .collect())
     };
 
     // Resolve merged library entries to their assigned VAs, grouped by

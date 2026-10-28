@@ -157,6 +157,40 @@ pub fn va_to_file_offset(elf: &ElfFile64<'_>, va: u64) -> Option<u64> {
         .map(|seg| va - seg.vaddr + seg.offset)
 }
 
+/// The `size` bytes of `bytes` holding a table `.dynamic` places at `va`,
+/// together with the file offset they start at. `what` names the table in
+/// errors.
+///
+/// Every table the loader is pointed at through a pair of `.dynamic` tags —
+/// an address and a size — is located this way. Both values are the file's
+/// own claims about itself, so neither is trusted: the address has to lie in
+/// a `PT_LOAD`'s file contents and the whole length has to fit in the file,
+/// checked without letting `offset + size` wrap. `bytes` is passed separately
+/// from `elf` so a caller holding a patched copy of the image (same layout,
+/// different contents) can slice that instead.
+pub fn dynamic_table_bytes<'b>(
+    elf: &ElfFile64<'_>,
+    bytes: &'b [u8],
+    what: &str,
+    va: u64,
+    size: u64,
+) -> Result<(usize, &'b [u8])> {
+    let offset = va_to_file_offset(elf, va).with_context(|| {
+        format!("{what} is at {va:#x}, which no loaded segment's file contents cover")
+    })?;
+    usize::try_from(offset)
+        .ok()
+        .zip(usize::try_from(size).ok())
+        .and_then(|(at, len)| Some((at, bytes.get(at..at.checked_add(len)?)?)))
+        .with_context(|| {
+            format!(
+                "{what} covers {size} bytes from file offset {offset:#x}, past the end of this \
+                 {}-byte file",
+                bytes.len()
+            )
+        })
+}
+
 /// `p_vaddr - p_offset` of the `PT_LOAD` that starts the image — the one
 /// mapping the ELF header, and in a linker's output the one holding the
 /// program header table.
@@ -477,25 +511,13 @@ pub fn packed_relative_relocs(elf: &ElfFile64<'_>, path: &Path) -> Result<Vec<Re
             path.display()
         );
     }
-    let table_offset = va_to_file_offset(elf, table_va).with_context(|| {
-        format!(
-            "{}: DT_RELR names a table at {table_va:#x}, which no loaded segment's file \
-             contents cover",
-            path.display()
-        )
-    })?;
-    let table = usize::try_from(table_offset)
-        .ok()
-        .and_then(|at| at.checked_add(size as usize).map(|end| at..end))
-        .and_then(|range| bytes.get(range))
-        .with_context(|| {
-            format!(
-                "{}: the {size}-byte DT_RELR table at {table_va:#x} runs past the end of this \
-                 {}-byte file",
-                path.display(),
-                bytes.len()
-            )
-        })?;
+    let (_, table) = dynamic_table_bytes(
+        elf,
+        bytes,
+        &format!("{}'s DT_RELR table", path.display()),
+        table_va,
+        size,
+    )?;
 
     let mut relocs = Vec::with_capacity(table.len());
     // Where the next bitmap word starts counting from. `None` until an address
@@ -1247,6 +1269,32 @@ mod merge_library_tests {
         let decoded = packed_relative_relocs(&parse(&bytes), Path::new(TEST_LIBS[0]))
             .expect("an empty DT_RELR table withholds nothing");
         assert_eq!(decoded, Vec::new());
+    }
+
+    /// A size tag is the file's own claim, so one large enough to wrap
+    /// `offset + size` has to come back as an error rather than a slice the
+    /// wrapped bound let through — the writer used to add the two unchecked.
+    #[test]
+    fn a_dynamic_table_whose_size_wraps_the_file_offset_is_refused() {
+        let bytes = read_test_lib(TEST_LIBS[0]);
+        let elf = parse(&bytes);
+        let strtab = DynamicTable::parse(&bytes)
+            .expect(".dynamic")
+            .value_of(goblin::elf::dynamic::DT_STRTAB)
+            .expect("DT_STRTAB");
+
+        let (_, whole) = dynamic_table_bytes(&elf, &bytes, ".dynstr", strtab, 1)
+            .expect("a one-byte .dynstr prefix is in the file");
+        assert_eq!(whole.len(), 1);
+
+        for size in [u64::MAX, u64::MAX - strtab, bytes.len() as u64] {
+            let err = format!(
+                "{:#}",
+                dynamic_table_bytes(&elf, &bytes, ".dynstr", strtab, size)
+                    .expect_err("a table running past the file must be refused")
+            );
+            assert!(err.contains("past the end"), "{size:#x}: {err}");
+        }
     }
 }
 

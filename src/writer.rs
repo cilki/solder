@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::elf_reader::{
     DynamicTable, SH_ADDR, SH_ADDRALIGN, SH_ENTSIZE, SH_FLAGS, SH_NAME, SH_OFFSET, SH_SIZE,
-    SH_TYPE, SHDR_SIZE, SectionTable, VER_NDX_GLOBAL, va_to_file_offset,
+    SH_TYPE, SHDR_SIZE, SectionTable, VER_NDX_GLOBAL, dynamic_table_bytes,
 };
 use crate::layout::align_up;
 use crate::types::{ARRAY_ENTRY_SIZE, InitFiniKind, MergePlan, RelativeReloc};
@@ -955,16 +955,13 @@ fn read_dynsym_tables(
         .context("executable missing DT_STRTAB")?;
     let strsz = dynamic
         .value_of(DT_STRSZ)
-        .context("executable missing DT_STRSZ")? as usize;
+        .context("executable missing DT_STRSZ")?;
     let symtab_va = dynamic
         .value_of(DT_SYMTAB)
         .context("executable missing DT_SYMTAB")?;
     let versym_va = dynamic
         .value_of(DT_VERSYM)
         .context("executable missing DT_VERSYM")?;
-
-    let strtab_off =
-        va_to_file_offset(exe, strtab_va).context("DT_STRTAB not in any PT_LOAD")? as usize;
 
     // The .dynsym and .gnu.version sizes have to come from their section
     // headers — DT_SYMENT only gives the per-entry width, and there is no
@@ -973,34 +970,26 @@ fn read_dynsym_tables(
         "executable has no usable section header table, which is the only place the \
                   .dynsym and .gnu.version sizes are recorded",
     )?;
-    let size_of = |name: &str| -> Result<usize> {
+    let size_of = |name: &str| -> Result<u64> {
         Ok(sections
             .by_name(name)
             .with_context(|| format!("{name} section header not found"))?
-            .size as usize)
+            .size)
     };
-    let dynsym_size = size_of(".dynsym")?;
-    let versym_size = size_of(".gnu.version")?;
-
-    let symtab_off =
-        va_to_file_offset(exe, symtab_va).context("DT_SYMTAB not in any PT_LOAD")? as usize;
-    let versym_off =
-        va_to_file_offset(exe, versym_va).context("DT_VERSYM not in any PT_LOAD")? as usize;
-
-    if strtab_off + strsz > patched_exe.len() {
-        bail!(".dynstr extends past end of file");
-    }
-    if symtab_off + dynsym_size > patched_exe.len() {
-        bail!(".dynsym extends past end of file");
-    }
-    if versym_off + versym_size > patched_exe.len() {
-        bail!(".gnu.version extends past end of file");
-    }
+    let table = |what: &str, va: u64, size: u64| -> Result<Vec<u8>> {
+        Ok(dynamic_table_bytes(exe, patched_exe, what, va, size)?
+            .1
+            .to_vec())
+    };
 
     Ok((
-        patched_exe[strtab_off..strtab_off + strsz].to_vec(),
-        patched_exe[symtab_off..symtab_off + dynsym_size].to_vec(),
-        patched_exe[versym_off..versym_off + versym_size].to_vec(),
+        table(".dynstr (DT_STRTAB)", strtab_va, strsz)?,
+        table(".dynsym (DT_SYMTAB)", symtab_va, size_of(".dynsym")?)?,
+        table(
+            ".gnu.version (DT_VERSYM)",
+            versym_va,
+            size_of(".gnu.version")?,
+        )?,
     ))
 }
 
@@ -1018,26 +1007,21 @@ fn read_existing_rela_dyn(
         .context("executable missing DT_RELA")?;
     let relasz = dynamic
         .value_of(DT_RELASZ)
-        .context("executable missing DT_RELASZ")? as usize;
+        .context("executable missing DT_RELASZ")?;
     let relacount = dynamic.value_of(DT_RELACOUNT).unwrap_or(0);
 
-    let rela_off = va_to_file_offset(exe, rela_va).context("DT_RELA not in any PT_LOAD")? as usize;
-    if rela_off + relasz > patched_exe.len() {
-        bail!(".rela.dyn extends past end of file");
-    }
-
-    let relative_end = rela_off + (relacount as usize) * RELA_ENTRY_SIZE;
-    if relative_end > rela_off + relasz {
-        bail!(
-            "DT_RELACOUNT ({relacount}) implies more bytes than DT_RELASZ ({relasz}) — \
-             corrupted .rela.dyn"
-        );
-    }
-    Ok((
-        patched_exe[rela_off..relative_end].to_vec(),
-        patched_exe[relative_end..rela_off + relasz].to_vec(),
-        relacount,
-    ))
+    let (_, rela) = dynamic_table_bytes(exe, patched_exe, ".rela.dyn (DT_RELA)", rela_va, relasz)?;
+    let (relative, rest) = usize::try_from(relacount)
+        .ok()
+        .and_then(|count| count.checked_mul(RELA_ENTRY_SIZE))
+        .and_then(|len| rela.split_at_checked(len))
+        .with_context(|| {
+            format!(
+                "DT_RELACOUNT ({relacount}) implies more bytes than DT_RELASZ ({relasz}) — \
+                 corrupted .rela.dyn"
+            )
+        })?;
+    Ok((relative.to_vec(), rest.to_vec(), relacount))
 }
 
 fn pad_to(buf: &mut Vec<u8>, alignment: usize) {

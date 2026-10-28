@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use object::read::elf::ElfFile64;
 use tracing::{debug, warn};
 
-use crate::elf_reader::{DynamicTable, MappedElf, va_to_file_offset};
+use crate::elf_reader::{DynamicTable, MappedElf, dynamic_table_bytes, va_to_file_offset};
 use crate::lib_discovery::{
     LdsoCache, NotFound, expand_dynamic_tokens, is_excluded, resolve_library, soname_base,
 };
@@ -631,22 +631,8 @@ fn read_rela_table(
     let (Some(vaddr), Some(size)) = (dynamic.value_of(addr_tag), dynamic.value_of(size_tag)) else {
         return Ok(Vec::new());
     };
-    let bytes = elf.data();
-    let sh_offset = va_to_file_offset(elf, vaddr)
-        .with_context(|| format!("{what} is {vaddr:#x}, which is in no PT_LOAD segment"))?;
-    // The length is the file's own claim about itself, so it is checked before
-    // anything is read from it rather than trusted to a slice.
-    let end = sh_offset
-        .checked_add(size)
-        .filter(|end| *end <= bytes.len() as u64)
-        .with_context(|| {
-            format!(
-                "{what} covers {size} bytes from file offset {sh_offset:#x}, past the end of \
-                 this {} byte file",
-                bytes.len()
-            )
-        })?;
-    let data = &bytes[sh_offset as usize..end as usize];
+    let (sh_offset, data) = dynamic_table_bytes(elf, elf.data(), what, vaddr, size)?;
+    let sh_offset = sh_offset as u64;
 
     let mut entries = Vec::new();
     for (i, entry) in data.chunks_exact(RELA_ENTRY_SIZE as usize).enumerate() {
