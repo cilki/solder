@@ -127,6 +127,10 @@ pub fn expand_dynamic_tokens(entry: &str, origin: &Path) -> Option<PathBuf> {
 ///   5. Default paths: /lib64, /usr/lib64, /lib, /usr/lib,
 ///      /lib/x86_64-linux-gnu, /usr/lib/x86_64-linux-gnu
 ///
+/// A file of the right name built for another machine — the 32-bit half of a
+/// multilib tree, a foreign multiarch directory — is passed over and the search
+/// goes on, as ld.so does (see [`is_foreign_object`]).
+///
 /// An entry none of those provide fails with [`NotFound`]; an entry that could
 /// not be looked up at all fails with something else.
 pub fn resolve_library(
@@ -141,58 +145,83 @@ pub fn resolve_library(
         return resolve_path_entry(soname, origin);
     }
 
-    // 1. RPATH
-    for dir in rpath {
-        let candidate = dir.join(soname);
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
+    let llp = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let llp = llp
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(|dir| Path::new(dir).join(soname));
 
-    // 2. LD_LIBRARY_PATH
-    if let Ok(llp) = std::env::var("LD_LIBRARY_PATH") {
-        for dir in llp.split(':').filter(|s| !s.is_empty()) {
-            let candidate = Path::new(dir).join(soname);
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    // 3. RUNPATH
-    for dir in runpath {
-        let candidate = dir.join(soname);
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-
-    // 4. ld.so.cache
-    if let Some(path) = ldso_cache.lookup(soname)
-        && path.exists()
-    {
-        return Ok(path.to_owned());
-    }
-
-    // 5. Default paths
-    for dir in &[
+    let defaults = [
         "/lib64",
         "/usr/lib64",
         "/lib",
         "/usr/lib",
         "/lib/x86_64-linux-gnu",
         "/usr/lib/x86_64-linux-gnu",
-    ] {
-        let candidate = Path::new(dir).join(soname);
-        if candidate.exists() {
-            return Ok(candidate);
+    ]
+    .into_iter()
+    .map(|dir| Path::new(dir).join(soname));
+
+    // 1. RPATH, 2. LD_LIBRARY_PATH, 3. RUNPATH, 4. ld.so.cache, 5. default paths.
+    let candidates = rpath
+        .iter()
+        .map(|dir| dir.join(soname))
+        .chain(llp)
+        .chain(runpath.iter().map(|dir| dir.join(soname)))
+        .chain(ldso_cache.lookup(soname).map(Path::to_owned))
+        .chain(defaults);
+
+    let mut skipped: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
         }
+        if is_foreign_object(&candidate) {
+            skipped.push(candidate);
+            continue;
+        }
+        return Ok(candidate);
     }
 
-    Err(NotFound(format!(
-        "cannot find shared library '{soname}' — try -L to add a search path"
-    ))
-    .into())
+    let mut message = format!("cannot find shared library '{soname}'");
+    if !skipped.is_empty() {
+        let skipped: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
+        message.push_str(&format!(
+            " built for x86-64 (passed over {}, built for another architecture, as ld.so would)",
+            skipped.join(", ")
+        ));
+    }
+    message.push_str(" — try -L to add a search path");
+    Err(NotFound(message).into())
+}
+
+/// Whether `path` is an ELF object ld.so would pass over while searching for a
+/// dependency of an x86-64 executable, rather than load or fail on.
+///
+/// glibc's `open_verify` skips a candidate whose `EI_CLASS` is not the
+/// loader's own, or whose `e_machine` is not the host's, and keeps searching
+/// the next directory: that is what lets `/usr/lib/libfoo.so.1` be the i686
+/// build on a multilib system while the x86-64 executable loads
+/// `/usr/lib64/libfoo.so.1`. Anything else wrong with the file — no ELF magic,
+/// the wrong byte order — ends the load with an error instead, so those files
+/// are not skipped here either: they are handed back as the resolution, for
+/// the reader to refuse with a message naming them.
+fn is_foreign_object(path: &Path) -> bool {
+    use object::elf::{ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64};
+    use std::io::Read;
+
+    const EI_CLASS: usize = 4;
+    const EI_DATA: usize = 5;
+    // `e_ident` (16 bytes), then `e_type` and `e_machine`.
+    let mut header = [0u8; 20];
+    let read = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut header));
+    if read.is_err() || header[..4] != ELFMAG {
+        return false;
+    }
+    if header[EI_CLASS] != ELFCLASS64.0 {
+        return true;
+    }
+    header[EI_DATA] == ELFDATA2LSB.0 && u16::from_le_bytes([header[18], header[19]]) != EM_X86_64.0
 }
 
 /// Resolve a `DT_NEEDED` entry that names a path instead of a soname.
@@ -687,6 +716,113 @@ mod resolution_tests {
         )
         .expect_err("relative entry");
         assert!(!err.is::<NotFound>(), "{err:#}");
+    }
+
+    /// `test/libs/libpcre2-8.so.0`, a real x86-64 library, with `edit` applied
+    /// to its bytes, written as `libpcre2-8.so.0` into a new directory `dir`
+    /// under `root`.
+    fn place_pcre(root: &Path, dir: &str, edit: impl FnOnce(&mut [u8])) -> PathBuf {
+        let mut bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/libs/libpcre2-8.so.0"
+        ))
+        .expect("read the fixture library");
+        edit(&mut bytes);
+        let dir = root.join(dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("libpcre2-8.so.0");
+        std::fs::write(&path, bytes).expect("write the library");
+        path
+    }
+
+    /// `e_machine` set to `EM_AARCH64`.
+    fn aarch64(bytes: &mut [u8]) {
+        bytes[0x12..0x14].copy_from_slice(&0xb7u16.to_le_bytes());
+    }
+
+    /// `EI_CLASS` set to `ELFCLASS32`, as the i686 half of a multilib tree is.
+    fn elfclass32(bytes: &mut [u8]) {
+        bytes[4] = 1;
+    }
+
+    /// The multilib layout: the first directory on the search path holds a
+    /// build of the soname for another machine, a later one the x86-64 build.
+    /// ld.so passes over the first and loads the second; solder used to take
+    /// the first file that existed and then refuse the merge because of it.
+    #[test]
+    fn a_library_built_for_another_machine_is_passed_over() {
+        for (what, edit) in [
+            ("aarch64", aarch64 as fn(&mut [u8])),
+            ("ELFCLASS32", elfclass32),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let foreign = place_pcre(root.path(), "foreign", edit);
+            let native = place_pcre(root.path(), "native", |_| {});
+            let resolved = resolve_library(
+                "libpcre2-8.so.0",
+                &[
+                    foreign.parent().unwrap().to_owned(),
+                    native.parent().unwrap().to_owned(),
+                ],
+                &[],
+                &empty_cache(),
+                root.path(),
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e:#}"));
+            assert_eq!(resolved, native, "{what}");
+        }
+    }
+
+    /// With nothing but foreign builds on the path the soname is not found —
+    /// a dependency this machine does not have, as far as ld.so is concerned —
+    /// and the message says which files were passed over and why.
+    #[test]
+    fn only_foreign_builds_is_not_found_and_names_them() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let foreign = place_pcre(root.path(), "foreign", aarch64);
+        let err = resolve_library(
+            "libpcre2-8.so.0",
+            &[foreign.parent().unwrap().to_owned()],
+            &[],
+            &empty_cache(),
+            root.path(),
+        )
+        .expect_err("only an aarch64 build is there");
+        assert!(err.is::<NotFound>(), "{err:#}");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&foreign.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("another architecture"), "{message}");
+    }
+
+    /// ld.so fails the load on a file with no ELF magic or the wrong byte
+    /// order rather than searching on, so those are still what the search
+    /// resolves to — for the reader to refuse by name — and a native build
+    /// further down the path does not paper over them.
+    #[test]
+    fn a_broken_candidate_is_not_passed_over() {
+        for (what, edit) in [
+            ("no ELF magic", (|b: &mut [u8]| b[0] = 0) as fn(&mut [u8])),
+            ("big-endian", |b: &mut [u8]| b[5] = 2),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let broken = place_pcre(root.path(), "broken", edit);
+            let native = place_pcre(root.path(), "native", |_| {});
+            let resolved = resolve_library(
+                "libpcre2-8.so.0",
+                &[
+                    broken.parent().unwrap().to_owned(),
+                    native.parent().unwrap().to_owned(),
+                ],
+                &[],
+                &empty_cache(),
+                root.path(),
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e:#}"));
+            assert_eq!(resolved, broken, "{what}");
+        }
     }
 
     #[test]
