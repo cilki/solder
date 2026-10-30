@@ -6,11 +6,11 @@ use object::read::elf::ElfFile64;
 use tracing::{debug, warn};
 
 use crate::arch::Arch;
-use crate::elf_reader::{DynamicTable, MappedElf, dynamic_table_bytes, va_to_file_offset};
+use crate::elf_reader::{DynamicTable, MappedElf, dynamic_table_bytes};
 use crate::lib_discovery::{
     LdsoCache, NotFound, expand_dynamic_tokens, is_excluded, resolve_library, soname_base,
 };
-use crate::types::{ImportKind, ImportedSymbol};
+use crate::types::ImportedSymbol;
 
 /// Parse the dynamic section of an ELF to extract DT_NEEDED, DT_RPATH, and DT_RUNPATH.
 pub struct DynamicInfo {
@@ -345,7 +345,6 @@ fn validate_merge_filter(needed: &[String], filter: &[String]) -> Result<()> {
 }
 
 pub fn collect_imports(
-    elf: &ElfFile64<'_>,
     rela: &RelaTables,
     search: &LibrarySearch<'_>,
     merge_filter: Option<&[String]>,
@@ -415,7 +414,7 @@ pub fn collect_imports(
     let mut imports: Vec<ImportedSymbol> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    for (entry, kind) in rela.imports() {
+    for entry in rela.imports() {
         // A symbol no mergeable library provides is external (glibc etc.).
         let Some(source_library) = sym_to_lib.get(&entry.symbol) else {
             continue;
@@ -426,13 +425,7 @@ pub fn collect_imports(
         imports.push(ImportedSymbol {
             name: entry.symbol.clone(),
             source_library: source_library.clone(),
-            got_file_offset: va_to_file_offset(elf, entry.target_vaddr).with_context(|| {
-                format!(
-                    "GOT VA 0x{:x} not in any PT_LOAD segment",
-                    entry.target_vaddr
-                )
-            })?,
-            kind,
+            got_vaddr: entry.target_vaddr,
         });
     }
 
@@ -571,7 +564,7 @@ impl RelaTables {
     /// weak one resolves to zero instead of failing the load — and not merged.
     pub fn loader_resolved_imports(&self, merged: &HashSet<String>) -> BTreeSet<String> {
         self.imports()
-            .map(|(entry, _)| entry.symbol.as_str())
+            .map(|entry| entry.symbol.as_str())
             .filter(|name| self.strong_undefined.contains(*name) && !merged.contains(*name))
             .map(str::to_owned)
             .collect()
@@ -583,16 +576,11 @@ impl RelaTables {
     }
 
     /// Every entry that can name a symbol imported from a shared library: all
-    /// of `.rela.plt` plus the GLOB_DATs of `.rela.dyn`, each paired with the
-    /// kind of import it represents.
-    fn imports(&self) -> impl Iterator<Item = (&RelaEntry, ImportKind)> {
+    /// of `.rela.plt` plus the GLOB_DATs of `.rela.dyn`.
+    fn imports(&self) -> impl Iterator<Item = &RelaEntry> {
         self.jump_slot
             .iter()
-            .map(|e| (e, ImportKind::JumpSlot))
-            .chain(
-                self.dynamic_of_type(self.arch.reloc.glob_dat)
-                    .map(|e| (e, ImportKind::GlobDat)),
-            )
+            .chain(self.dynamic_of_type(self.arch.reloc.glob_dat))
     }
 
     /// Symbol name → the virtual address of the GOT slot ld.so resolves it
@@ -610,7 +598,7 @@ impl RelaTables {
     /// jumping through one would land wherever those bytes happen to lead.
     pub fn got_slot_vas(&self) -> HashMap<String, u64> {
         let mut map: HashMap<String, u64> = HashMap::new();
-        for (entry, _) in self.imports() {
+        for entry in self.imports() {
             map.entry(entry.symbol.clone())
                 .or_insert(entry.target_vaddr);
         }
@@ -943,8 +931,8 @@ pub fn find_jump_slot_reloc_offsets(
     imported_names: &HashSet<String>,
 ) -> Vec<u64> {
     rela.imports()
-        .filter(|(entry, _)| imported_names.contains(&entry.symbol))
-        .map(|(entry, _)| entry.r_info_offset)
+        .filter(|entry| imported_names.contains(&entry.symbol))
+        .map(|entry| entry.r_info_offset)
         .collect()
 }
 
@@ -1073,7 +1061,7 @@ mod library_dynamic_tests {
 #[cfg(test)]
 mod rela_table_tests {
     use super::*;
-    use crate::elf_reader::SectionTable;
+    use crate::elf_reader::{SectionTable, va_to_file_offset};
 
     /// The committed `test/` executables are the ones solder actually patches.
     const TEST_BINARIES: [&str; 3] = ["grep", "bash", "md5sum"];
@@ -1280,7 +1268,7 @@ mod unresolvable_dependency_tests {
         let cache = LdsoCache::load(&crate::arch::X86_64);
 
         let search = LibrarySearch::new(&dyn_info, &libs, &cache, &crate::arch::X86_64);
-        let info = collect_imports(&exe, &rela, &search, None)
+        let info = collect_imports(&rela, &search, None)
             .expect("an unresolvable dependency must not fail a merge nobody asked for");
         assert_eq!(
             info.merged_libs
@@ -1314,7 +1302,7 @@ mod unresolvable_dependency_tests {
 
         let filter = [ABSENT.to_string()];
         let search = LibrarySearch::new(&dyn_info, &libs, &cache, &crate::arch::X86_64);
-        let Err(err) = collect_imports(&exe, &rela, &search, Some(&filter)) else {
+        let Err(err) = collect_imports(&rela, &search, Some(&filter)) else {
             panic!("a library named with -m has to be merged or refused");
         };
         let msg = format!("{err:#}");
@@ -1704,7 +1692,7 @@ mod library_search_tests {
 #[cfg(test)]
 mod absorbed_library_tests {
     use super::{ImportInfo, MergedLibrary};
-    use crate::types::{ImportKind, ImportedSymbol};
+    use crate::types::ImportedSymbol;
     use std::path::PathBuf;
 
     fn lib(soname: &str) -> MergedLibrary {
@@ -1721,8 +1709,7 @@ mod absorbed_library_tests {
         ImportedSymbol {
             name: name.to_owned(),
             source_library: PathBuf::from("/usr/lib").join(soname),
-            got_file_offset: 0,
-            kind: ImportKind::JumpSlot,
+            got_vaddr: 0,
         }
     }
 
@@ -1902,7 +1889,7 @@ mod unprovided_import_tests {
             &cache,
             &crate::arch::X86_64,
         );
-        let info = collect_imports(&exe, &rela, &search, None).expect("collect imports");
+        let info = collect_imports(&rela, &search, None).expect("collect imports");
 
         let merged: HashSet<String> = info.imports.iter().map(|i| i.name.clone()).collect();
         rela.loader_resolved_imports(&merged)

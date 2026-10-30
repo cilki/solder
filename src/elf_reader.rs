@@ -957,14 +957,6 @@ pub fn cstr_at(strings: &[u8], offset: usize) -> Option<&str> {
     std::str::from_utf8(&rest[..end]).ok()
 }
 
-/// Convert a file offset to a virtual address in a parsed ELF.
-/// Returns None if the offset is not covered by any PT_LOAD segment.
-pub fn file_offset_to_va(elf: &ElfFile64<'_>, offset: u64) -> Option<u64> {
-    pt_loads(elf)
-        .find(|seg| (seg.offset..seg.offset + seg.filesz).contains(&offset))
-        .map(|seg| offset - seg.offset + seg.vaddr)
-}
-
 #[cfg(test)]
 mod section_lookup_tests {
     use super::*;

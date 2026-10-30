@@ -112,7 +112,7 @@ fn run() -> Result<()> {
     // come out of these two tables.
     let rela = RelaTables::read(&exe_elf, arch).context("reading the executable's .rela tables")?;
 
-    let import_info = collect_imports(&exe_elf, &rela, &search, merge_filter)?;
+    let import_info = collect_imports(&rela, &search, merge_filter)?;
     let imports = &import_info.imports;
     let merged_lib_syms = &import_info.merged_lib_syms;
 
@@ -123,7 +123,6 @@ fn run() -> Result<()> {
 
     for imp in imports {
         info!(
-            kind=?imp.kind,
             name=imp.name,
             source=%imp.source_library.display(),
             "Imported symbol to merge"
@@ -659,8 +658,8 @@ fn render_merge_plan(
 mod dry_run_report_tests {
     use super::{render_merge_plan, write_report};
     use crate::types::{
-        AssignedUnit, DataSectionCopy, ExtractedUnit, ImportKind, ImportedSymbol, InitFiniPlan,
-        MergePlan, MergedArray, SectionKind, UnboundedEnd, UnitId,
+        AssignedUnit, DataSectionCopy, ExtractedUnit, ImportedSymbol, InitFiniPlan, MergePlan,
+        MergedArray, SectionKind, UnboundedEnd, UnitId,
     };
     use std::io::{self, ErrorKind, Write};
     use std::path::{Path, PathBuf};
@@ -706,8 +705,7 @@ mod dry_run_report_tests {
         ImportedSymbol {
             name: name.to_owned(),
             source_library: PathBuf::from(lib),
-            got_file_offset: 0,
-            kind: ImportKind::JumpSlot,
+            got_vaddr: 0,
         }
     }
 
