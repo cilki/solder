@@ -1,6 +1,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use object::Endianness;
+use object::elf::{FileHeader64, GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_ISA_1_NEEDED};
+use object::read::elf::{ElfFile64, NoteIterator, ProgramHeader};
 use tracing::warn;
 
 use crate::elf_reader::{
@@ -171,15 +174,6 @@ fn ensure_bind_now(bytes: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-/// `NT_GNU_PROPERTY_TYPE_0`: the note type whose descriptor is the GNU
-/// property array.
-const NT_GNU_PROPERTY_TYPE_0: u32 = 5;
-/// `GNU_PROPERTY_X86_FEATURE_1_AND`: the CET features *every* object making up
-/// the process has to support before the loader turns them on.
-const GNU_PROPERTY_X86_FEATURE_1_AND: u32 = 0xc000_0002;
-/// `GNU_PROPERTY_X86_ISA_1_NEEDED`: the x86-64 ISA levels the code needs, which
-/// `ld.so` refuses to run on a CPU that lacks.
-const GNU_PROPERTY_X86_ISA_1_NEEDED: u32 = 0xc000_8002;
 /// The `GNU_PROPERTY_X86_FEATURE_1_*` bits, for naming the ones being dropped.
 const X86_FEATURE_1_BITS: [(u32, &str); 4] = [
     (1 << 0, "IBT"),
@@ -187,8 +181,74 @@ const X86_FEATURE_1_BITS: [(u32, &str); 4] = [
     (1 << 2, "LAM_U48"),
     (1 << 3, "LAM_U57"),
 ];
-/// A GNU property's `pr_data` is padded to this in an ELF64 object.
-const PROPERTY_ALIGN: usize = 8;
+
+/// The two GNU properties the merge re-derives, each as the file offset of its
+/// 4-byte value together with the value, when the object carries it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct X86Properties {
+    /// `GNU_PROPERTY_X86_FEATURE_1_AND`: the CET features *every* object making
+    /// up the process has to support before the loader turns them on.
+    features: Option<(usize, u32)>,
+    /// `GNU_PROPERTY_X86_ISA_1_NEEDED`: the x86-64 ISA levels the code needs,
+    /// which `ld.so` refuses to run on a CPU that lacks.
+    isa: Option<(usize, u32)>,
+}
+
+impl X86Properties {
+    /// Read both properties out of the object's `PT_NOTE` segments in one walk.
+    ///
+    /// Only `PT_NOTE` segments are searched: those are the notes the loader
+    /// itself reads, and a property note outside one would not reach it.
+    fn read(bytes: &[u8]) -> Result<Self> {
+        let elf = ElfFile64::<Endianness>::parse(bytes)
+            .context("parsing the ELF header for GNU property notes")?;
+        let endian = elf.endian();
+        let mut found = Self::default();
+        for ph in elf.elf_program_headers() {
+            // A segment that is not in the file, or whose `p_align` is neither
+            // 4 nor 8 (binutils reads no other), has no notes to offer.
+            if let Ok(Some(notes)) = ph.notes(endian, bytes) {
+                found.scan(bytes, endian, notes);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Fill in whichever property is still missing from the notes in `notes`,
+    /// whose data lies within `file`. The first occurrence of each wins.
+    ///
+    /// A malformed note or property ends the walk of its segment or note rather
+    /// than failing the merge: an unreadable property is one we cannot say
+    /// anything about, and the rest of the output does not depend on it.
+    fn scan(
+        &mut self,
+        file: &[u8],
+        endian: Endianness,
+        notes: NoteIterator<'_, FileHeader64<Endianness>>,
+    ) {
+        for note in notes.map_while(Result::ok) {
+            let Some(properties) = note.gnu_properties(endian) else {
+                continue;
+            };
+            for property in properties.map_while(Result::ok) {
+                let slot = match property.pr_type() {
+                    GNU_PROPERTY_X86_FEATURE_1_AND => &mut self.features,
+                    GNU_PROPERTY_X86_ISA_1_NEEDED => &mut self.isa,
+                    _ => continue,
+                };
+                let data = property.pr_data();
+                if slot.is_none()
+                    && data.len() == 4
+                    && let Ok(value) = property.data_u32(endian)
+                {
+                    // `data` borrows from `file`, so this is its file offset.
+                    let at = data.as_ptr() as usize - file.as_ptr() as usize;
+                    *slot = Some((at, value));
+                }
+            }
+        }
+    }
+}
 
 /// Re-derive the `.note.gnu.property` entries that describe the program as a
 /// whole, now that code from the merged libraries is part of it.
@@ -215,10 +275,10 @@ const PROPERTY_ALIGN: usize = 8;
 /// without growing the note — there is nothing to grow into between the notes
 /// and the rest of the first mapping — so that case is reported instead.
 fn update_gnu_properties(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
-    let exe_features = find_property(bytes, GNU_PROPERTY_X86_FEATURE_1_AND)
-        .context("reading the executable's .note.gnu.property")?;
-    let exe_isa = find_property(bytes, GNU_PROPERTY_X86_ISA_1_NEEDED)
-        .context("reading the executable's .note.gnu.property")?;
+    let X86Properties {
+        features: exe_features,
+        isa: exe_isa,
+    } = X86Properties::read(bytes).context("reading the executable's .note.gnu.property")?;
     if exe_features.is_none() && exe_isa.is_none() {
         return Ok(());
     }
@@ -236,13 +296,10 @@ fn update_gnu_properties(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     for lib in libs {
         let mapped = MappedElf::open(lib)
             .with_context(|| format!("reading {} for its GNU property note", lib.display()))?;
-        let data = mapped.bytes();
-        let lib_features = find_property(data, GNU_PROPERTY_X86_FEATURE_1_AND)
-            .with_context(|| format!("reading .note.gnu.property of {}", lib.display()))?
-            .map_or(0, |(_, mask)| mask);
-        let lib_isa = find_property(data, GNU_PROPERTY_X86_ISA_1_NEEDED)
-            .with_context(|| format!("reading .note.gnu.property of {}", lib.display()))?
-            .map_or(0, |(_, mask)| mask);
+        let lib_props = X86Properties::read(mapped.bytes())
+            .with_context(|| format!("reading .note.gnu.property of {}", lib.display()))?;
+        let lib_features = lib_props.features.map_or(0, |(_, mask)| mask);
+        let lib_isa = lib_props.isa.map_or(0, |(_, mask)| mask);
 
         if features & !lib_features != 0 {
             warn!(
@@ -293,90 +350,6 @@ fn feature_names(mask: u32) -> String {
         names.push(format!("0x{:x}", mask & !known));
     }
     names.join(", ")
-}
-
-/// File offset of `pr_type`'s 4-byte value in `bytes`, and the value, if the
-/// object carries that property.
-///
-/// Only `PT_NOTE` segments are searched: those are the notes the loader itself
-/// reads, and a property note outside one would not reach it.
-fn find_property(bytes: &[u8], pr_type: u32) -> Result<Option<(usize, u32)>> {
-    let elf = goblin::elf::Elf::parse(bytes).context("goblin parse for GNU property notes")?;
-    for ph in &elf.program_headers {
-        if ph.p_type != goblin::elf::program_header::PT_NOTE {
-            continue;
-        }
-        let start = ph.p_offset as usize;
-        let Some(notes) = bytes.get(start..start.saturating_add(ph.p_filesz as usize)) else {
-            continue;
-        };
-        if let Some((at, value)) = find_property_in_notes(notes, ph.p_align as usize, pr_type) {
-            return Ok(Some((start + at, value)));
-        }
-    }
-    Ok(None)
-}
-
-/// Walk a note array, returning the offset *relative to `notes`* of the 4-byte
-/// value of property `pr_type`, together with that value.
-///
-/// `align` is the containing segment's `p_align`, which is what decides where
-/// each note's descriptor starts and where the next note begins — a GNU
-/// property note is 8-aligned where the build-id and ABI-tag notes beside it
-/// are 4-aligned. A malformed note ends the walk rather than failing the merge:
-/// an unreadable property is one we cannot say anything about, and the rest of
-/// the output does not depend on it.
-fn find_property_in_notes(notes: &[u8], align: usize, pr_type: u32) -> Option<(usize, u32)> {
-    let align = align.max(4);
-    let mut pos = 0usize;
-
-    while pos + 12 <= notes.len() {
-        let namesz = u32_at(notes, pos)? as usize;
-        let descsz = u32_at(notes, pos + 4)? as usize;
-        let n_type = u32_at(notes, pos + 8)?;
-        let name = notes.get(pos + 12..(pos + 12).checked_add(namesz)?)?;
-
-        // The name starts right after the 12-byte header and the descriptor
-        // starts after it, both padded out to `align`.
-        let desc_at =
-            pos.checked_add((12usize.checked_add(namesz)?).checked_next_multiple_of(align)?)?;
-        let next = desc_at.checked_add(descsz.checked_next_multiple_of(align)?)?;
-
-        if n_type == NT_GNU_PROPERTY_TYPE_0 && name == b"GNU\0" {
-            let props = notes.get(desc_at..desc_at.checked_add(descsz)?)?;
-            if let Some((at, value)) = find_in_property_array(props, pr_type) {
-                return Some((desc_at + at, value));
-            }
-        }
-
-        pos = next;
-    }
-
-    None
-}
-
-/// Walk one `NT_GNU_PROPERTY_TYPE_0` descriptor — a sequence of
-/// `(pr_type: u32, pr_datasz: u32, pr_data, padding to 8)` — for `pr_type`.
-fn find_in_property_array(props: &[u8], pr_type: u32) -> Option<(usize, u32)> {
-    let mut at = 0usize;
-    while at + 8 <= props.len() {
-        let this_type = u32_at(props, at)?;
-        let datasz = u32_at(props, at + 4)? as usize;
-        let data_at = at + 8;
-        if data_at.checked_add(datasz)? > props.len() {
-            return None;
-        }
-        if this_type == pr_type && datasz == 4 {
-            return Some((data_at, u32_at(props, data_at)?));
-        }
-        at = data_at.checked_add(datasz.checked_next_multiple_of(PROPERTY_ALIGN)?)?;
-    }
-    None
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
-    let field = bytes.get(at..at.checked_add(4)?)?;
-    Some(u32::from_le_bytes(field.try_into().expect("4 bytes")))
 }
 
 /// `sizeof (Elf64_Verneed)`, one entry of the `.gnu.version_r` list:
@@ -1128,6 +1101,24 @@ mod gnu_property_tests {
 
     const IBT: u32 = 1 << 0;
     const SHSTK: u32 = 1 << 1;
+    /// `NT_GNU_PROPERTY_TYPE_0`, the note type whose descriptor is the GNU
+    /// property array.
+    const NT_GNU_PROPERTY_TYPE_0: u32 = object::elf::NT_GNU_PROPERTY_TYPE_0.0;
+    const FEATURE_1_AND: u32 = GNU_PROPERTY_X86_FEATURE_1_AND.0;
+    const ISA_1_NEEDED: u32 = GNU_PROPERTY_X86_ISA_1_NEEDED.0;
+
+    /// The properties in a bare note array laid out with `align`.
+    fn in_notes(notes: &[u8], align: u64) -> X86Properties {
+        let mut found = X86Properties::default();
+        let iter = NoteIterator::new(Endianness::Little, align, notes).expect("valid alignment");
+        found.scan(notes, Endianness::Little, iter);
+        found
+    }
+
+    /// The properties of a whole ELF image.
+    fn read(bytes: &[u8]) -> X86Properties {
+        X86Properties::read(bytes).expect("parse ELF")
+    }
 
     /// One note: `namesz`/`descsz`/`n_type`, the name `GNU\0`, then `desc`
     /// padded out to `align`.
@@ -1150,7 +1141,7 @@ mod gnu_property_tests {
         out.extend_from_slice(&pr_type.to_le_bytes());
         out.extend_from_slice(&4u32.to_le_bytes());
         out.extend_from_slice(&value.to_le_bytes());
-        out.resize(out.len().next_multiple_of(PROPERTY_ALIGN), 0);
+        out.resize(out.len().next_multiple_of(8), 0);
         out
     }
 
@@ -1160,24 +1151,22 @@ mod gnu_property_tests {
     #[test]
     fn a_property_is_found_behind_other_notes_and_properties() {
         const NT_GNU_BUILD_ID: u32 = 3;
-        let mut desc = property(GNU_PROPERTY_X86_ISA_1_NEEDED, 0x4);
-        desc.extend_from_slice(&property(GNU_PROPERTY_X86_FEATURE_1_AND, IBT | SHSTK));
+        let mut desc = property(ISA_1_NEEDED, 0x4);
+        desc.extend_from_slice(&property(FEATURE_1_AND, IBT | SHSTK));
 
         let mut notes = note(NT_GNU_BUILD_ID, &[0xab; 20], 4);
         let property_note_at = notes.len();
         notes.extend_from_slice(&note(NT_GNU_PROPERTY_TYPE_0, &desc, 4));
 
-        let (at, value) = find_property_in_notes(&notes, 4, GNU_PROPERTY_X86_FEATURE_1_AND)
-            .expect("the CET property is in there");
         // Second property of the note: 16 bytes of note header and name, then
         // the ISA property — 8 bytes of `pr_type`/`pr_datasz`, a `u32` and the
         // padding out to 8 — then 8 bytes into the feature property.
-        assert_eq!(at, property_note_at + 16 + 16 + 8);
-        assert_eq!(value, IBT | SHSTK);
-
         assert_eq!(
-            find_property_in_notes(&notes, 4, GNU_PROPERTY_X86_ISA_1_NEEDED),
-            Some((property_note_at + 16 + 8, 0x4))
+            in_notes(&notes, 4),
+            X86Properties {
+                features: Some((property_note_at + 16 + 16 + 8, IBT | SHSTK)),
+                isa: Some((property_note_at + 16 + 8, 0x4)),
+            }
         );
     }
 
@@ -1186,13 +1175,14 @@ mod gnu_property_tests {
     /// over on it.
     #[test]
     fn a_truncated_note_ends_the_walk() {
-        let desc = property(GNU_PROPERTY_X86_FEATURE_1_AND, IBT);
+        let desc = property(FEATURE_1_AND, IBT);
         let whole = note(NT_GNU_PROPERTY_TYPE_0, &desc, 8);
+        assert_eq!(in_notes(&whole, 8).features, Some((16 + 8, IBT)));
         for cut in 1..whole.len() {
             let truncated = &whole[..whole.len() - cut];
             assert_eq!(
-                find_property_in_notes(truncated, 8, GNU_PROPERTY_X86_FEATURE_1_AND),
-                None,
+                in_notes(truncated, 8),
+                X86Properties::default(),
                 "a note cut {cut} bytes short should not be read"
             );
         }
@@ -1200,10 +1190,7 @@ mod gnu_property_tests {
         // A nonsense namesz must not be trusted to stay in bounds either.
         let mut bogus = whole.clone();
         bogus[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(
-            find_property_in_notes(&bogus, 8, GNU_PROPERTY_X86_FEATURE_1_AND),
-            None
-        );
+        assert_eq!(in_notes(&bogus, 8), X86Properties::default());
     }
 
     /// Anchor the segment walk against a real binary: `test/grep` carries a
@@ -1213,17 +1200,15 @@ mod gnu_property_tests {
     fn a_real_executables_property_is_located_in_its_note_segment() {
         let bytes = std::fs::read(GREP).expect("read test/grep");
         assert_eq!(
-            find_property(&bytes, GNU_PROPERTY_X86_ISA_1_NEEDED).expect("parse test/grep"),
-            Some((0x350, 1))
+            read(&bytes),
+            X86Properties {
+                features: None,
+                isa: Some((0x350, 1)),
+            }
         );
         assert_eq!(
-            find_property(&bytes, GNU_PROPERTY_X86_FEATURE_1_AND).expect("parse test/grep"),
-            None
-        );
-        assert_eq!(
-            find_property(&std::fs::read(PCRE2).expect("read libpcre2"), 0xc000_0002)
-                .expect("parse libpcre2"),
-            None
+            read(&std::fs::read(PCRE2).expect("read libpcre2")),
+            X86Properties::default()
         );
     }
 
@@ -1265,12 +1250,10 @@ mod gnu_property_tests {
     /// with `-fcf-protection=full` ships.
     fn grep_claiming_cet() -> (Vec<u8>, usize) {
         let mut bytes = std::fs::read(GREP).expect("read test/grep");
-        let (at, _) = find_property(&bytes, GNU_PROPERTY_X86_ISA_1_NEEDED)
-            .expect("parse test/grep")
-            .expect("test/grep has an ISA property");
+        let (at, _) = read(&bytes).isa.expect("test/grep has an ISA property");
         // Same shape, so the note keeps its size: only pr_type and the value
         // change.
-        bytes[at - 8..at - 4].copy_from_slice(&GNU_PROPERTY_X86_FEATURE_1_AND.to_le_bytes());
+        bytes[at - 8..at - 4].copy_from_slice(&FEATURE_1_AND.to_le_bytes());
         bytes[at..at + 4].copy_from_slice(&(IBT | SHSTK).to_le_bytes());
         (bytes, at)
     }
@@ -1284,7 +1267,7 @@ mod gnu_property_tests {
         let (mut bytes, at) = grep_claiming_cet();
         update_gnu_properties(&mut bytes, &plan_merging(PCRE2)).expect("update properties");
         assert_eq!(
-            find_property(&bytes, GNU_PROPERTY_X86_FEATURE_1_AND).expect("reparse"),
+            read(&bytes).features,
             Some((at, 0)),
             "the executable still claims CET features the merged code does not have"
         );
@@ -1298,10 +1281,7 @@ mod gnu_property_tests {
         let (lib, _) = grep_claiming_cet();
         let lib_path = tempfile::NamedTempFile::new().expect("tempfile");
         let mut lib_bytes = lib;
-        let lib_at = find_property(&lib_bytes, GNU_PROPERTY_X86_FEATURE_1_AND)
-            .expect("parse")
-            .expect("property")
-            .0;
+        let lib_at = read(&lib_bytes).features.expect("property").0;
         lib_bytes[lib_at..lib_at + 4].copy_from_slice(&SHSTK.to_le_bytes());
         std::fs::write(lib_path.path(), &lib_bytes).expect("write library");
 
@@ -1310,10 +1290,7 @@ mod gnu_property_tests {
             &plan_merging(lib_path.path().to_str().expect("utf-8 path")),
         )
         .expect("update properties");
-        assert_eq!(
-            find_property(&bytes, GNU_PROPERTY_X86_FEATURE_1_AND).expect("reparse"),
-            Some((at, SHSTK))
-        );
+        assert_eq!(read(&bytes).features, Some((at, SHSTK)));
     }
 
     /// The ISA levels the merged code needs are the union, not the
@@ -1324,9 +1301,7 @@ mod gnu_property_tests {
     fn the_isa_levels_of_merged_code_are_folded_in() {
         const V4: u32 = 1 << 3;
         let mut bytes = std::fs::read(GREP).expect("read test/grep");
-        let (at, baseline) = find_property(&bytes, GNU_PROPERTY_X86_ISA_1_NEEDED)
-            .expect("parse test/grep")
-            .expect("test/grep has an ISA property");
+        let (at, baseline) = read(&bytes).isa.expect("test/grep has an ISA property");
 
         let mut lib_bytes = bytes.clone();
         lib_bytes[at..at + 4].copy_from_slice(&V4.to_le_bytes());
@@ -1338,10 +1313,7 @@ mod gnu_property_tests {
             &plan_merging(lib_path.path().to_str().expect("utf-8 path")),
         )
         .expect("update properties");
-        assert_eq!(
-            find_property(&bytes, GNU_PROPERTY_X86_ISA_1_NEEDED).expect("reparse"),
-            Some((at, baseline | V4))
-        );
+        assert_eq!(read(&bytes).isa, Some((at, baseline | V4)));
     }
 
     /// An executable with no property note of its own is left alone: there is
