@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tracing::{debug, trace};
 
-use crate::elf_reader::file_offset_to_va;
-use crate::elf_reader::merged_load_address;
+use crate::elf_reader::{merged_load_address, va_to_file_offset};
 use crate::types::{
     AssignedUnit, ExtractedUnit, GotPatch, InitFiniArrays, InitFiniKind, InitFiniPlan, MergePlan,
     MergedArray, NewExternalSym, RelocTarget, SectionKind, TrampolineStub,
@@ -168,15 +167,15 @@ pub fn plan_layout(
                     imp.source_library.display()
                 )
             })?;
-        let got_vaddr = file_offset_to_va(exe_elf, imp.got_file_offset).with_context(|| {
+        let got_file_offset = va_to_file_offset(exe_elf, imp.got_vaddr).with_context(|| {
             format!(
-                "GOT file offset 0x{:x} for '{}' is not in any PT_LOAD segment",
-                imp.got_file_offset, imp.name
+                "GOT slot 0x{:x} for '{}' is not in any PT_LOAD segment's file contents",
+                imp.got_vaddr, imp.name
             )
         })?;
         got_patches.push(GotPatch {
-            got_file_offset: imp.got_file_offset,
-            got_vaddr,
+            got_file_offset,
+            got_vaddr: imp.got_vaddr,
             value: *vaddr,
         });
     }

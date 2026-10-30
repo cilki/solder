@@ -199,24 +199,15 @@ pub struct GotSlotImport {
     pub weak: bool,
 }
 
-/// How a symbol is imported into the executable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImportKind {
-    /// Via PLT stub — R_X86_64_JUMP_SLOT relocation
-    JumpSlot,
-    /// Direct GOT reference — R_X86_64_GLOB_DAT relocation
-    GlobDat,
-}
-
 /// A symbol that the executable imports from a shared library.
 #[derive(Debug, Clone)]
 pub struct ImportedSymbol {
     pub name: String,
     /// Resolved path to the library that defines this symbol.
     pub source_library: PathBuf,
-    /// File offset of the 8-byte GOT slot for this symbol.
-    pub got_file_offset: u64,
-    pub kind: ImportKind,
+    /// Virtual address of the 8-byte GOT slot for this symbol: the
+    /// `r_offset` of the JUMP_SLOT or GLOB_DAT relocation that imports it.
+    pub got_vaddr: u64,
 }
 
 /// Which kind of section a unit came from.
