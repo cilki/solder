@@ -28,7 +28,7 @@ pub enum Unliftable {
 }
 
 /// The dynamic relocation types the merge itself reads or writes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DynRelocTypes {
     /// `*slot = B + A`: rebasing a pointer by the load address.
     pub relative: u32,
@@ -41,7 +41,7 @@ pub struct DynRelocTypes {
 }
 
 /// One target architecture.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Arch {
     /// How messages name the architecture ("x86-64").
     pub name: &'static str,
@@ -59,6 +59,10 @@ pub struct Arch {
     pub lib_token: &'static str,
     /// The loader's built-in search directories, searched after the cache.
     pub default_lib_dirs: &'static [&'static str],
+    /// The largest page size a kernel for this architecture runs with. An
+    /// executable's `p_align` past it is a request for huge-page alignment
+    /// rather than a page size; see `elf_reader::page_size`.
+    pub max_page_size: u64,
 }
 
 impl Arch {
@@ -121,6 +125,9 @@ pub static X86_64: Arch = {
             "/lib/x86_64-linux-gnu",
             "/usr/lib/x86_64-linux-gnu",
         ],
+        // x86-64 pages are 4 KiB. A 2 MiB `p_align`, which binutils used as
+        // the default `max-page-size` before 2.31, is for huge pages.
+        max_page_size: 0x1000,
     }
 };
 

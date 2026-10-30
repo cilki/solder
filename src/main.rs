@@ -684,6 +684,7 @@ mod dry_run_report_tests {
         MergePlan {
             arch: &crate::arch::X86_64,
             is_pie: true,
+            page_size: crate::elf_reader::MIN_PAGE_SIZE,
             load_address: 0x4_3000,
             exec_size: 0x1000,
             rodata_end: 0x3000,

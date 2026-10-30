@@ -439,6 +439,10 @@ pub struct MergePlan {
     pub arch: &'static crate::arch::Arch,
     /// Whether the executable is PIE (ET_DYN).
     pub is_pie: bool,
+    /// Page size every boundary between the merged region's mappings is
+    /// aligned to, and the `p_align` of each: the executable's
+    /// `elf_reader::page_size`.
+    pub page_size: u64,
     /// Base virtual address of the new PT_LOAD segments.
     pub load_address: u64,
     /// Size of the leading executable run of the merged segment — the code

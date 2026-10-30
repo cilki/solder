@@ -61,6 +61,8 @@ pub struct Load {
     pub filesz: u64,
     /// Bytes the segment occupies in memory, `filesz` plus any zero-fill.
     pub memsz: u64,
+    /// `p_align`: the largest page size the linker laid the segment out for.
+    pub align: u64,
 }
 
 /// Every `PT_LOAD` segment of a parsed ELF, in program-header order.
@@ -81,7 +83,42 @@ pub fn pt_loads<'a>(elf: &'a ElfFile64<'a>) -> impl Iterator<Item = Load> + 'a {
             offset: seg.p_offset(endian),
             filesz: seg.p_filesz(endian),
             memsz: seg.p_memsz(endian),
+            align: seg.p_align(endian),
         })
+}
+
+/// The smallest page size of any kernel solder targets, and so the least the
+/// merged region's mappings are ever aligned to.
+pub const MIN_PAGE_SIZE: u64 = 0x1000;
+
+/// Page size the merged region's mappings have to be aligned to for this
+/// executable.
+///
+/// The merge splits its region into separately-protected mappings (code,
+/// constants, loader-written data, rebuilt tables), and that split only holds
+/// if no two of them share a page at runtime. The runtime page size is not
+/// in the file, but the linker recorded the largest one it laid the executable
+/// out for as the `PT_LOAD`s' `p_align` — `-z max-page-size`, 64 KiB on
+/// distribution aarch64 toolchains so the same binary loads under a 4K, 16K
+/// or 64K kernel. Aligning to anything smaller would let a 64K kernel map the
+/// merged code and the data after it as one page, with one set of
+/// permissions.
+///
+/// That promise is capped at the architecture's largest page size
+/// (`Arch::max_page_size`): x86-64 binaries from older binutils carry a 2 MiB
+/// `p_align` for huge pages, and an x86-64 kernel's pages are 4 KiB whatever
+/// the file says, so honouring it would only pad the file by megabytes. A
+/// `p_align` that is not a power of two is no page size at all and is ignored,
+/// as the kernel ignores it.
+pub fn page_size(elf: &ElfFile64<'_>, arch: &Arch) -> u64 {
+    page_size_for(pt_loads(elf).map(|seg| seg.align), arch.max_page_size)
+}
+
+fn page_size_for(aligns: impl Iterator<Item = u64>, max_page_size: u64) -> u64 {
+    aligns
+        .filter(|align| align.is_power_of_two())
+        .map(|align| align.min(max_page_size))
+        .fold(MIN_PAGE_SIZE, u64::max)
 }
 
 /// The virtual addresses `PT_GNU_RELRO` covers, when the object has one.
@@ -201,7 +238,9 @@ pub fn dynamic_table_bytes<'b>(
 /// to it, so this is not an image-wide constant. It is specifically the
 /// difference that holds for the program header table, which is what makes it
 /// the one the merged region has to reproduce (see `merged_load_address`).
-pub fn image_base_delta(elf: &ElfFile64<'_>) -> u64 {
+///
+/// `page_size` is the executable's [`page_size`].
+pub fn image_base_delta(elf: &ElfFile64<'_>, page_size: u64) -> u64 {
     pt_loads(elf)
         .min_by_key(|seg| seg.vaddr)
         .map(|seg| {
@@ -209,7 +248,7 @@ pub fn image_base_delta(elf: &ElfFile64<'_>) -> u64 {
                 // Mappings are congruent modulo the page size, so the
                 // difference is a whole number of pages; truncate anything
                 // else rather than carry it into the merged region's address.
-                & !0xfff
+                & !(page_size - 1)
         })
         .unwrap_or(0)
 }
@@ -234,15 +273,17 @@ pub fn image_base_delta(elf: &ElfFile64<'_>) -> u64 {
 /// affected, the memory image outrunning the file by the size of it. Matching
 /// the executable's own difference costs that many zero bytes of unmapped
 /// padding in the file and nothing at runtime.
-pub fn merged_load_address(elf: &ElfFile64<'_>) -> u64 {
+///
+/// The address is a multiple of `page_size`, the executable's [`page_size`],
+/// so the first merged mapping starts on a page of its own.
+pub fn merged_load_address(elf: &ElfFile64<'_>, page_size: u64) -> u64 {
     let image_end = pt_loads(elf)
         .map(|seg| seg.vaddr.saturating_add(seg.memsz))
         .max()
         .unwrap_or(0);
     // The address the end of the file maps to if the image's difference holds.
-    let past_file_end = (elf.data().len() as u64).saturating_add(image_base_delta(elf));
-    // Page-align upward (4 KiB pages)
-    (image_end.max(past_file_end) + 0xfff) & !0xfff
+    let past_file_end = (elf.data().len() as u64).saturating_add(image_base_delta(elf, page_size));
+    crate::layout::align_up(image_end.max(past_file_end), page_size)
 }
 
 /// The dynamic loader the executable names in `PT_INTERP`.
@@ -1527,6 +1568,80 @@ mod executable_tests {
         );
         assert!(err.contains("section header"), "{err}");
         assert!(err.contains("/test/grep"), "{err}");
+    }
+}
+
+/// Rewrite the `p_align` of every `PT_LOAD` in a little-endian ELF64 image, to
+/// stand in for an executable linked with a different `-z max-page-size`.
+#[cfg(test)]
+pub(crate) fn set_load_alignment(bytes: &mut [u8], align: u64) {
+    fn word(bytes: &[u8], at: usize, len: usize) -> usize {
+        let mut buf = [0u8; 8];
+        buf[..len].copy_from_slice(&bytes[at..at + len]);
+        u64::from_le_bytes(buf) as usize
+    }
+    let phoff = word(bytes, 0x20, 8);
+    let phentsize = word(bytes, 0x36, 2);
+    let phnum = word(bytes, 0x38, 2);
+    for i in 0..phnum {
+        let at = phoff + i * phentsize;
+        if word(bytes, at, 4) == object::elf::PT_LOAD.0 as usize {
+            bytes[at + 48..at + 56].copy_from_slice(&align.to_le_bytes());
+        }
+    }
+}
+
+#[cfg(test)]
+mod page_size_tests {
+    use super::*;
+
+    const GREP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test/grep");
+
+    /// The fixtures were linked for 4 KiB pages, and that is what they get.
+    #[test]
+    fn a_4k_executable_gets_4k_pages() {
+        let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
+        let elf = mapped.parse().expect("parse test/grep");
+        assert_eq!(page_size(&elf, &crate::arch::X86_64), 0x1000);
+    }
+
+    /// An executable linked with `-z max-page-size=0x10000`, as distribution
+    /// aarch64 toolchains do, has to have its merged mappings 64 KiB apart, or
+    /// a 64K kernel maps the merged code and the data after it as one page.
+    #[test]
+    fn the_executables_p_align_is_the_page_size() {
+        assert_eq!(
+            page_size_for([0x10000, 0x10000].into_iter(), 0x10000),
+            0x10000
+        );
+        // The largest one counts: no mapping may share a page under any of
+        // the page sizes the linker allowed for.
+        assert_eq!(page_size_for([0x1000, 0x4000].into_iter(), 0x10000), 0x4000);
+    }
+
+    /// A 2 MiB `p_align` on x86-64 asks for huge-page alignment, not 2 MiB
+    /// pages; honouring it would pad the file by megabytes for nothing.
+    #[test]
+    fn a_p_align_past_the_architectures_largest_page_is_capped() {
+        let mut bytes = std::fs::read(GREP).expect("read test/grep");
+        set_load_alignment(&mut bytes, 0x20_0000);
+        let elf = ElfFile64::<object::Endianness>::parse(&*bytes).expect("parse");
+        assert_eq!(page_size(&elf, &crate::arch::X86_64), 0x1000);
+        assert_eq!(page_size_for([0x20_0000].into_iter(), 0x10000), 0x10000);
+    }
+
+    /// Anything that is not a power of two, or is below the smallest page —
+    /// including the 0 and 1 that mean "no constraint" — leaves the floor.
+    #[test]
+    fn a_p_align_that_is_no_page_size_is_ignored() {
+        for align in [0, 1, 0x800, 0x3000, 0x10001] {
+            assert_eq!(
+                page_size_for([align].into_iter(), 0x10000),
+                MIN_PAGE_SIZE,
+                "{align:#x}"
+            );
+        }
+        assert_eq!(page_size_for(std::iter::empty(), 0x10000), MIN_PAGE_SIZE);
     }
 }
 

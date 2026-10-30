@@ -128,7 +128,7 @@ pub fn write_output(
     // merged region, and tools read its difference as the whole image's (see
     // `merged_load_address`). Everything between the end of the executable and
     // here is unmapped zero padding.
-    let base_delta = crate::elf_reader::image_base_delta(&exe);
+    let base_delta = crate::elf_reader::image_base_delta(&exe, plan.page_size);
     let seg_file_offset = plan
         .load_address
         .checked_sub(base_delta)
@@ -250,7 +250,7 @@ pub fn write_output(
         write_u64_le(&mut out, dst + 24, plan.load_address + start); // p_paddr = p_vaddr
         write_u64_le(&mut out, dst + 32, size);
         write_u64_le(&mut out, dst + 40, size);
-        write_u64_le(&mut out, dst + 48, crate::layout::PAGE_SIZE);
+        write_u64_le(&mut out, dst + 48, plan.page_size);
         written += phdr_entry_size;
     }
 
@@ -546,7 +546,7 @@ fn rewrite_section_headers(
         write_u64_le(&mut shdr, SH_ADDR, plan.load_address + region.range.start);
         write_u64_le(&mut shdr, SH_OFFSET, seg_file_offset + region.range.start);
         write_u64_le(&mut shdr, SH_SIZE, region.size());
-        write_u64_le(&mut shdr, SH_ADDRALIGN, crate::layout::PAGE_SIZE);
+        write_u64_le(&mut shdr, SH_ADDRALIGN, plan.page_size);
         shdrs.extend_from_slice(&shdr);
         added += 1;
     }
@@ -1132,6 +1132,7 @@ mod runtime_write_tests {
         MergePlan {
             arch: &crate::arch::X86_64,
             is_pie: true,
+            page_size: crate::elf_reader::MIN_PAGE_SIZE,
             load_address: LOAD,
             exec_size: EXEC_END - LOAD,
             rodata_end: RODATA_END - LOAD,
@@ -1279,7 +1280,26 @@ mod section_header_tests {
         lib_order: &[PathBuf],
     ) -> MergePlan {
         let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
-        let exe = mapped.parse().expect("parse test/grep");
+        merge_into(
+            mapped.bytes(),
+            &crate::arch::X86_64,
+            dest,
+            init_fini,
+            lib_order,
+        )
+    }
+
+    /// Merge a code, a read-only and a data unit into the executable `exe`,
+    /// writing the result to `dest`.
+    fn merge_into(
+        exe: &[u8],
+        arch: &'static crate::arch::Arch,
+        dest: &Path,
+        init_fini: InitFiniArrays,
+        lib_order: &[PathBuf],
+    ) -> MergePlan {
+        let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(exe)
+            .expect("parse the executable");
         let units = vec![
             unit(
                 0,
@@ -1291,14 +1311,13 @@ mod section_header_tests {
             unit(1, "ro_a", SectionKind::ReadOnlyData, 32, &[]),
             unit(2, "data_a", SectionKind::Data, 48, &[]),
         ];
-        let rela = crate::symbol_analysis::RelaTables::read(&exe, &crate::arch::X86_64)
-            .expect("test/grep .rela tables");
+        let rela = crate::symbol_analysis::RelaTables::read(&elf, arch).expect("the .rela tables");
         let mut plan = plan_layout(
             units,
-            &exe,
+            &elf,
             &[],
             &rela.got_slot_vas(),
-            &crate::arch::X86_64,
+            arch,
             true,
             init_fini,
             lib_order,
@@ -1307,7 +1326,7 @@ mod section_header_tests {
         .expect("plan layout");
 
         let seg = build_merged_segment(&mut plan).expect("build merged segment");
-        write_output(mapped.bytes(), &plan, &seg, dest).expect("write output");
+        write_output(exe, &plan, &seg, dest).expect("write output");
         plan
     }
 
@@ -1598,11 +1617,14 @@ mod section_header_tests {
 
         // The input and the output agree on it: the merge appends mappings
         // rather than touching the one that starts the image.
-        let expected = crate::elf_reader::image_base_delta(&out);
+        let expected = crate::elf_reader::image_base_delta(&out, plan.page_size);
         let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
         assert_eq!(
             expected,
-            crate::elf_reader::image_base_delta(&mapped.parse().expect("parse test/grep")),
+            crate::elf_reader::image_base_delta(
+                &mapped.parse().expect("parse test/grep"),
+                plan.page_size
+            ),
             "the merge moved the mapping that starts the image"
         );
 
@@ -1632,6 +1654,76 @@ mod section_header_tests {
                 expected,
                 "a merged mapping at {vaddr:#x} maps file offset {:#x}",
                 seg.p_offset(endian)
+            );
+        }
+    }
+
+    /// An executable linked for 64 KiB pages gets its merged mappings 64 KiB
+    /// apart. At the 4 KiB the layout used to hard-code, a 64K kernel mapped
+    /// the merged code, the constants after it and the data the loader writes
+    /// as one page with one set of permissions — and since the mappings also
+    /// overlapped in that page, whichever came last decided what the others
+    /// got.
+    #[test]
+    fn the_merged_mappings_are_aligned_to_the_executables_page_size() {
+        use object::read::elf::ProgramHeader;
+        const PAGE: u64 = 0x10000;
+
+        // An architecture whose kernels run 64 KiB pages, and an executable
+        // linked to load on one.
+        let arch: &'static crate::arch::Arch = Box::leak(Box::new(crate::arch::Arch {
+            max_page_size: PAGE,
+            ..crate::arch::X86_64.clone()
+        }));
+        let mut exe = std::fs::read(GREP).expect("read test/grep");
+        crate::elf_reader::set_load_alignment(&mut exe, PAGE);
+
+        let out = tempfile::NamedTempFile::new().expect("temp output");
+        let plan = merge_into(&exe, arch, out.path(), InitFiniArrays::default(), &[]);
+        assert_eq!(plan.page_size, PAGE);
+        for boundary in [
+            plan.load_address,
+            plan.exec_size,
+            plan.rodata_end,
+            plan.writable_end,
+        ] {
+            assert_eq!(boundary % PAGE, 0, "{boundary:#x} is not on a 64 KiB page");
+        }
+
+        let bytes = std::fs::read(out.path()).expect("read the merged output back");
+        let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes)
+            .expect("parse the merged output");
+        let endian = elf.endian();
+        let merged: Vec<_> = elf
+            .elf_program_headers()
+            .iter()
+            .filter(|seg| {
+                seg.p_type(endian) == object::elf::PT_LOAD
+                    && seg.p_vaddr(endian) >= plan.load_address
+            })
+            .collect();
+        assert_eq!(merged.len(), 4, "code, constants, data and tables");
+        for seg in &merged {
+            let (vaddr, offset) = (seg.p_vaddr(endian), seg.p_offset(endian));
+            assert_eq!(seg.p_align(endian), PAGE);
+            assert_eq!(
+                vaddr % PAGE,
+                0,
+                "a merged mapping starts mid-page at {vaddr:#x}"
+            );
+            assert_eq!(
+                vaddr % PAGE,
+                offset % PAGE,
+                "the mapping at {vaddr:#x} is not congruent with file offset {offset:#x}"
+            );
+        }
+        // No two mappings share a page: each ends at or before the page the
+        // next one starts on.
+        for pair in merged.windows(2) {
+            let end = pair[0].p_vaddr(endian) + pair[0].p_memsz(endian);
+            assert!(
+                end <= pair[1].p_vaddr(endian),
+                "{end:#x} runs into the next mapping"
             );
         }
     }

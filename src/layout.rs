@@ -29,7 +29,8 @@ pub fn plan_layout(
     lib_order: &[PathBuf],
     got_slot_fixups: Vec<crate::types::GotSlotFixup>,
 ) -> Result<MergePlan> {
-    let load_address = merged_load_address(exe_elf);
+    let page_size = crate::elf_reader::page_size(exe_elf, arch);
+    let load_address = merged_load_address(exe_elf, page_size);
 
     // Separate units by section kind.
     let mut text: Vec<ExtractedUnit> = Vec::new();
@@ -101,7 +102,7 @@ pub fn plan_layout(
     // End of the executable run. Padding to a page boundary is what lets the
     // writer map the code read-execute and everything after it read-write,
     // instead of one read-write-execute mapping covering the lot.
-    offset = align_up(offset, PAGE_SIZE);
+    offset = align_up(offset, page_size);
     let exec_size = offset;
 
     // Read-only data that nothing writes to at runtime gets a mapping of its
@@ -124,7 +125,7 @@ pub fn plan_layout(
     units.extend(assign_addresses(load_address, &mut offset, const_rodata));
 
     // End of the read-only run, for the same page-boundary reason.
-    offset = align_up(offset, PAGE_SIZE);
+    offset = align_up(offset, page_size);
     let rodata_end = offset;
 
     units.extend(assign_addresses(load_address, &mut offset, rebased_rodata));
@@ -192,7 +193,7 @@ pub fn plan_layout(
 
     // End of the writable run; the writer appends the rebuilt read-only
     // tables and the new program header table after this point.
-    offset = align_up(offset, PAGE_SIZE);
+    offset = align_up(offset, page_size);
     let writable_end = offset;
 
     // Resolve copied-GOT-slot fixups now that every unit has an assigned VA.
@@ -220,6 +221,7 @@ pub fn plan_layout(
     Ok(MergePlan {
         arch,
         is_pie,
+        page_size,
         load_address,
         exec_size,
         rodata_end,
@@ -266,9 +268,6 @@ fn assign_addresses(
         })
         .collect()
 }
-
-/// Page size the merged segment's mappings are aligned to.
-pub const PAGE_SIZE: u64 = 0x1000;
 
 pub fn align_up(value: u64, align: u64) -> u64 {
     if align == 0 {
@@ -620,14 +619,18 @@ mod tests {
 
         let plan = plan_for(units, true);
 
-        assert_eq!(plan.exec_size % PAGE_SIZE, 0, "exec run not page-aligned");
         assert_eq!(
-            plan.rodata_end % PAGE_SIZE,
+            plan.exec_size % plan.page_size,
+            0,
+            "exec run not page-aligned"
+        );
+        assert_eq!(
+            plan.rodata_end % plan.page_size,
             0,
             "read-only run not page-aligned"
         );
         assert_eq!(
-            plan.writable_end % PAGE_SIZE,
+            plan.writable_end % plan.page_size,
             0,
             "writable run not page-aligned"
         );
