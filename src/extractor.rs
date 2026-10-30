@@ -7,6 +7,7 @@ use iced_x86::Instruction;
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
+use crate::arch::{Arch, Unliftable};
 use crate::elf_reader::MappedElf;
 use crate::types::{
     DATA_BLOB_ALIGNMENT, DataSectionCopy, ExtractedReloc, ExtractedUnit, GotSlotFixup,
@@ -136,6 +137,8 @@ struct DataBlobInfo {
 
 /// State threaded through the BFS.
 struct ExtractionState {
+    /// The executable's architecture, which every merged library shares.
+    arch: &'static Arch,
     /// The id reserved for each unit the closure has reached, whether or not it
     /// has been extracted yet (see [`ExtractionState::reserve`]).
     reserved: FastMap<UnitKey, UnitId>,
@@ -339,7 +342,7 @@ impl ExtractionState {
             return Ok(Rc::clone(idx));
         }
         let path = self.lib_path(lib);
-        let idx = Rc::new(LibIndex::build(elf, &path)?);
+        let idx = Rc::new(LibIndex::build(elf, &path, self.arch)?);
         debug!(
             lib = %path.display(),
             symbols = idx.by_name.len(),
@@ -409,6 +412,7 @@ pub fn extract_units(
     exe_elf: &object::read::elf::ElfFile64<'_>,
     merged_lib_syms: &HashMap<String, PathBuf>,
     exe_copy_relocated: &HashSet<String>,
+    arch: &'static Arch,
 ) -> Result<Extraction> {
     // Collect symbol names from the executable's .dynsym that merged library code
     // can reference. This includes both defined symbols (callable directly) and
@@ -426,6 +430,7 @@ pub fn extract_units(
         .collect();
 
     let mut state = ExtractionState {
+        arch,
         reserved: FastMap::default(),
         worklist: VecDeque::new(),
         units: Vec::new(),
@@ -587,16 +592,9 @@ fn elf_r_type(reloc: &object::Relocation) -> Option<u32> {
     }
 }
 
-/// The x86-64 name of a dynamic relocation type solder cannot lift, and what
+/// `arch`'s name for a dynamic relocation type solder cannot lift, and what
 /// the loader was supposed to put in its slot.
-fn describe_unliftable_reloc(r_type: u32) -> (String, &'static str) {
-    use object::elf::{
-        R_X86_64_COPY, R_X86_64_DTPMOD64, R_X86_64_DTPOFF32, R_X86_64_DTPOFF64,
-        R_X86_64_GOTPC32_TLSDESC, R_X86_64_GOTTPOFF, R_X86_64_IRELATIVE, R_X86_64_SIZE32,
-        R_X86_64_SIZE64, R_X86_64_TLSDESC, R_X86_64_TLSDESC_CALL, R_X86_64_TLSGD, R_X86_64_TLSLD,
-        R_X86_64_TPOFF32, R_X86_64_TPOFF64,
-    };
-
+fn describe_unliftable_reloc(arch: &Arch, r_type: u32) -> (String, &'static str) {
     const TLS: &str = ": the slot holds a module id or an offset from the thread \
                        pointer, not an address. Merging a library that uses \
                        thread-local storage needs its PT_TLS block merged into the \
@@ -609,28 +607,18 @@ fn describe_unliftable_reloc(r_type: u32) -> (String, &'static str) {
     const COPY: &str = ": a copy relocation only appears in an executable, never in a \
                          shared library";
 
-    let named: &[(u32, &str, &str)] = &[
-        (R_X86_64_DTPMOD64.0, "R_X86_64_DTPMOD64", TLS),
-        (R_X86_64_DTPOFF64.0, "R_X86_64_DTPOFF64", TLS),
-        (R_X86_64_TPOFF64.0, "R_X86_64_TPOFF64", TLS),
-        (R_X86_64_TLSGD.0, "R_X86_64_TLSGD", TLS),
-        (R_X86_64_TLSLD.0, "R_X86_64_TLSLD", TLS),
-        (R_X86_64_DTPOFF32.0, "R_X86_64_DTPOFF32", TLS),
-        (R_X86_64_GOTTPOFF.0, "R_X86_64_GOTTPOFF", TLS),
-        (R_X86_64_TPOFF32.0, "R_X86_64_TPOFF32", TLS),
-        (R_X86_64_GOTPC32_TLSDESC.0, "R_X86_64_GOTPC32_TLSDESC", TLS),
-        (R_X86_64_TLSDESC_CALL.0, "R_X86_64_TLSDESC_CALL", TLS),
-        (R_X86_64_TLSDESC.0, "R_X86_64_TLSDESC", TLS),
-        (R_X86_64_IRELATIVE.0, "R_X86_64_IRELATIVE", IFUNC),
-        (R_X86_64_SIZE32.0, "R_X86_64_SIZE32", SIZE),
-        (R_X86_64_SIZE64.0, "R_X86_64_SIZE64", SIZE),
-        (R_X86_64_COPY.0, "R_X86_64_COPY", COPY),
-    ];
-
-    named
+    arch.unliftable_relocs
         .iter()
         .find(|(t, ..)| *t == r_type)
-        .map(|(_, name, note)| ((*name).to_string(), *note))
+        .map(|&(_, name, why)| {
+            let note = match why {
+                Unliftable::Tls => TLS,
+                Unliftable::Ifunc => IFUNC,
+                Unliftable::Size => SIZE,
+                Unliftable::Copy => COPY,
+            };
+            (name.to_string(), note)
+        })
         .unwrap_or_else(|| (format!("relocation type {r_type}"), ""))
 }
 
@@ -667,15 +655,15 @@ fn describe_unliftable_reloc(r_type: u32) -> (String, &'static str) {
 /// needs ld.so to run the resolver. Failing the merge keeps the problem at
 /// merge time instead of turning it into a wild access in the merged binary.
 ///
-/// `ctx` names the symbol or section being extracted.
+/// `ctx` names the symbol or section being extracted, and `arch` is what
+/// `r_type` is numbered by.
 fn reject_unliftable_dynamic_reloc(
+    arch: &Arch,
     kind: object::RelocationKind,
     r_type: Option<u32>,
     ctx: &str,
     lib: &Path,
 ) -> Result<()> {
-    use object::elf::{R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE};
-
     // Anything the `object` crate does name carries a real kind and width, and
     // `apply_one_reloc` either implements that form or rejects it by name.
     if kind != object::RelocationKind::Unknown {
@@ -685,17 +673,12 @@ fn reject_unliftable_dynamic_reloc(
     let Some(r_type) = r_type else {
         return Ok(());
     };
-    if [
-        R_X86_64_GLOB_DAT.0,
-        R_X86_64_JUMP_SLOT.0,
-        R_X86_64_RELATIVE.0,
-    ]
-    .contains(&r_type)
-    {
+    let slots = &arch.reloc;
+    if [slots.glob_dat, slots.jump_slot, slots.relative].contains(&r_type) {
         return Ok(());
     }
 
-    let (name, note) = describe_unliftable_reloc(r_type);
+    let (name, note) = describe_unliftable_reloc(arch, r_type);
     bail!(
         "'{}' in {}: {} is not a 64-bit pointer slot, so the merged copy cannot \
          reproduce it{}",
@@ -1217,7 +1200,7 @@ struct LibIndex {
 }
 
 impl LibIndex {
-    fn build(elf: &object::read::elf::ElfFile64<'_>, path: &Path) -> Result<Self> {
+    fn build(elf: &object::read::elf::ElfFile64<'_>, path: &Path, arch: &Arch) -> Result<Self> {
         let mut by_name: FastMap<String, SymInfo> = FastMap::default();
         let mut addr_to_name: FastMap<u64, String> = FastMap::default();
         let mut addrs_by_section: Vec<(u64, usize)> = Vec::new();
@@ -1267,7 +1250,7 @@ impl LibIndex {
         // ones. The first entry naming a slot wins; nothing legitimately
         // relocates one slot twice.
         let relr = crate::elf_reader::packed_relative_relocs(elf, path)?;
-        let mut dyn_relocs = decode_dynamic_relocs(elf, &relr);
+        let mut dyn_relocs = decode_dynamic_relocs(elf, &relr, arch);
         dyn_relocs.sort_by_key(|r| r.offset);
 
         let mut got_to_name: FastMap<u64, String> = FastMap::default();
@@ -1415,6 +1398,7 @@ struct DynReloc {
 fn decode_dynamic_relocs(
     elf: &object::read::elf::ElfFile64<'_>,
     relr: &[crate::elf_reader::RelrReloc],
+    arch: &Arch,
 ) -> Vec<DynReloc> {
     let explicit = elf
         .dynamic_relocations()
@@ -1435,7 +1419,7 @@ fn decode_dynamic_relocs(
 
     let packed = relr.iter().map(|entry| DynReloc {
         offset: entry.vaddr,
-        // Exactly what `object` reports for an `R_X86_64_RELATIVE` of
+        // Exactly what `object` reports for an `R_*_RELATIVE` of
         // `.rela.dyn`: a kind and an encoding it does not name, of a width it
         // does not state, which the loop below widens to the 64-bit slot it
         // is. Reporting them the same way is what makes the extracted
@@ -1444,7 +1428,7 @@ fn decode_dynamic_relocs(
         // two to that.
         kind: object::RelocationKind::Unknown,
         encoding: object::RelocationEncoding::Unknown,
-        r_type: Some(object::elf::R_X86_64_RELATIVE.0),
+        r_type: Some(arch.reloc.relative),
         size: 0,
         addend: entry.addend as i64,
         symbol: None,
@@ -2185,7 +2169,7 @@ fn collect_dynamic_range_relocs(
         let kind = reloc.kind;
         let encoding = reloc.encoding;
         reject_got_reloc(kind, encoding, ctx, lib.path)?;
-        reject_unliftable_dynamic_reloc(kind, reloc.r_type, ctx, lib.path)?;
+        reject_unliftable_dynamic_reloc(state.arch, kind, reloc.r_type, ctx, lib.path)?;
 
         // Resolve the relocation target symbol. Dynamic relocation symbol
         // indices refer to .dynsym, not .symtab.
@@ -3061,6 +3045,7 @@ mod tests {
 
     fn test_state() -> ExtractionState {
         ExtractionState {
+            arch: &crate::arch::X86_64,
             reserved: FastMap::default(),
             worklist: VecDeque::new(),
             units: Vec::new(),
@@ -3605,7 +3590,8 @@ mod tests {
             let path = test_lib(name);
             let bytes = std::fs::read(&path).expect("read the library");
             let elf = parse_lib(&bytes);
-            let index = LibIndex::build(&elf, &path).expect("index the library");
+            let index =
+                LibIndex::build(&elf, &path, &crate::arch::X86_64).expect("index the library");
             let lib = Lib {
                 // Nothing under test here reaches an `ExtractionState`, so the
                 // id this handle carries is never used to key anything.

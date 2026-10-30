@@ -434,6 +434,9 @@ pub struct GotPatch {
 /// The complete merge plan produced after layout, ready for relocation application and output.
 #[derive(Debug)]
 pub struct MergePlan {
+    /// The executable's architecture, which numbers the relocations the writer
+    /// adds to it.
+    pub arch: &'static crate::arch::Arch,
     /// Whether the executable is PIE (ET_DYN).
     pub is_pie: bool,
     /// Base virtual address of the new PT_LOAD segments.

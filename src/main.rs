@@ -1,3 +1,4 @@
+mod arch;
 mod dep_graph;
 mod eh_frame;
 mod elf_reader;
@@ -85,31 +86,31 @@ fn run() -> Result<()> {
         MappedElf::open(&cli.input).with_context(|| format!("opening {}", cli.input.display()))?;
     let exe_elf = exe_mapped.parse()?;
 
-    let is_pie = elf_reader::validate_executable(&exe_elf, &cli.input)?;
+    let (arch, is_pie) = elf_reader::validate_executable(&exe_elf, &cli.input)?;
 
     if is_pie {
         info!("Input is a PIE executable (ET_DYN)");
     }
 
     // ── Step 1: parse dynamic section + collect imports ──────────────────────
-    let dyn_info = parse_dynamic(&exe_elf, &cli.input)?;
+    let dyn_info = parse_dynamic(&exe_elf, &cli.input, arch)?;
 
     if dyn_info.needed.is_empty() {
         anyhow::bail!("executable has no DT_NEEDED entries — nothing to merge");
     }
 
-    let ldso_cache = LdsoCache::load();
+    let ldso_cache = LdsoCache::load(arch);
 
     // Every `DT_NEEDED` lookup the merge makes goes through this: the search
     // path ld.so uses for the executable, with solder's own `-L` and
     // `$SYSROOT/lib` directories folded in.
-    let search = LibrarySearch::new(&dyn_info, &library_path, &ldso_cache);
+    let search = LibrarySearch::new(&dyn_info, &library_path, &ldso_cache, arch);
 
     // The executable's `.rela.plt` and `.rela.dyn`, decoded once: which symbols
     // it imports and through which GOT slot, which JUMP_SLOT and COPY entries
     // the patcher has to neutralize, and which slots a trampoline can reuse all
     // come out of these two tables.
-    let rela = RelaTables::read(&exe_elf).context("reading the executable's .rela tables")?;
+    let rela = RelaTables::read(&exe_elf, arch).context("reading the executable's .rela tables")?;
 
     let import_info = collect_imports(&exe_elf, &rela, &search, merge_filter)?;
     let imports = &import_info.imports;
@@ -140,7 +141,7 @@ fn run() -> Result<()> {
         init_fini,
         got_slot_fixups,
         data_section_copies,
-    } = extractor::extract_units(imports, &exe_elf, merged_lib_syms, &copy_relocated)?;
+    } = extractor::extract_units(imports, &exe_elf, merged_lib_syms, &copy_relocated, arch)?;
 
     for u in &units {
         info!(
@@ -231,6 +232,7 @@ fn run() -> Result<()> {
         &exe_elf,
         imports,
         &rela.got_slot_vas(),
+        arch,
         is_pie,
         init_fini,
         &lib_order,
@@ -380,7 +382,7 @@ fn run() -> Result<()> {
     if plan.is_pie {
         info!(
             count = plan.relative_relocs.len(),
-            "Added R_X86_64_RELATIVE relocations for PIE"
+            "Added RELATIVE relocations for PIE"
         );
     }
 
@@ -680,6 +682,7 @@ mod dry_run_report_tests {
     /// the three sizes the report derives from it are all distinguishable.
     fn plan() -> MergePlan {
         MergePlan {
+            arch: &crate::arch::X86_64,
             is_pie: true,
             load_address: 0x4_3000,
             exec_size: 0x1000,

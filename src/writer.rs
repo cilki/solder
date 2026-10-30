@@ -663,9 +663,6 @@ fn symbol_name<'s>(dynsym: &[u8], dynstr: &'s [u8], index: usize) -> Option<&'s 
     crate::elf_reader::cstr_at(dynstr, st_name as usize).filter(|name| !name.is_empty())
 }
 
-/// R_X86_64_RELATIVE relocation type
-const R_X86_64_RELATIVE: u32 = 8;
-
 /// Size of an Elf64_Rela entry
 const RELA_ENTRY_SIZE: usize = 24;
 
@@ -729,8 +726,6 @@ impl ExtensionInfo {
     }
 }
 
-/// R_X86_64_GLOB_DAT relocation type.
-const R_X86_64_GLOB_DAT: u32 = 6;
 /// Size of an Elf64_Sym entry.
 const SYM_ENTRY_SIZE: usize = 24;
 /// STB_GLOBAL | STT_FUNC — for the new undefined function symbols we inject.
@@ -888,7 +883,7 @@ fn build_extended_segment(
         for reloc in &plan.relative_relocs {
             let mut entry = [0u8; RELA_ENTRY_SIZE];
             entry[0..8].copy_from_slice(&reloc.vaddr.to_le_bytes());
-            entry[8..16].copy_from_slice(&(R_X86_64_RELATIVE as u64).to_le_bytes());
+            entry[8..16].copy_from_slice(&u64::from(plan.arch.reloc.relative).to_le_bytes());
             entry[16..24].copy_from_slice(&reloc.addend.to_le_bytes());
             new_relative.extend_from_slice(&entry);
         }
@@ -909,7 +904,7 @@ fn build_extended_segment(
         for (got_vaddr, name) in glob_dat_slots {
             let sym_idx = sym_index_of(name)
                 .with_context(|| format!("no .dynsym index for GLOB_DAT symbol '{name}'"))?;
-            let r_info: u64 = ((sym_idx as u64) << 32) | (R_X86_64_GLOB_DAT as u64);
+            let r_info: u64 = ((sym_idx as u64) << 32) | u64::from(plan.arch.reloc.glob_dat);
             let mut entry = [0u8; RELA_ENTRY_SIZE];
             entry[0..8].copy_from_slice(&got_vaddr.to_le_bytes());
             entry[8..16].copy_from_slice(&r_info.to_le_bytes());
@@ -1135,6 +1130,7 @@ mod runtime_write_tests {
     /// read-execute, read-only and read-write, one page each.
     fn plan() -> MergePlan {
         MergePlan {
+            arch: &crate::arch::X86_64,
             is_pie: true,
             load_address: LOAD,
             exec_size: EXEC_END - LOAD,
@@ -1295,12 +1291,14 @@ mod section_header_tests {
             unit(1, "ro_a", SectionKind::ReadOnlyData, 32, &[]),
             unit(2, "data_a", SectionKind::Data, 48, &[]),
         ];
-        let rela = crate::symbol_analysis::RelaTables::read(&exe).expect("test/grep .rela tables");
+        let rela = crate::symbol_analysis::RelaTables::read(&exe, &crate::arch::X86_64)
+            .expect("test/grep .rela tables");
         let mut plan = plan_layout(
             units,
             &exe,
             &[],
             &rela.got_slot_vas(),
+            &crate::arch::X86_64,
             true,
             init_fini,
             lib_order,

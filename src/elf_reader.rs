@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use memmap2::Mmap;
 use object::read::elf::ElfFile64;
 
+use crate::arch::Arch;
+
 /// A memory-mapped ELF file. Everything that reads it borrows from `&self`,
 /// so the mapping outlives every view handed out of it.
 ///
@@ -266,12 +268,13 @@ pub fn interpreter<'a>(elf: &'a ElfFile64<'a>) -> Option<&'a str> {
 /// Validate that the input ELF is a supported target:
 /// - 64-bit ELF
 /// - ET_EXEC or ET_DYN (PIE)
-/// - EM_X86_64
+/// - built for an architecture in [`arch::SUPPORTED`](crate::arch::SUPPORTED)
 /// - Has PT_DYNAMIC (dynamically linked)
 /// - Has a section header table the merge can read and keep in sync
 ///
-/// Returns `true` if the executable is PIE (ET_DYN), `false` if non-PIE (ET_EXEC).
-pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<bool> {
+/// Returns the executable's architecture, which every library merged into it
+/// has to share, and whether it is PIE (ET_DYN) rather than non-PIE (ET_EXEC).
+pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<(&'static Arch, bool)> {
     use object::elf::{ET_DYN, ET_EXEC};
     use object::read::elf::{FileHeader, ProgramHeader};
 
@@ -280,13 +283,13 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<bool> {
     let e_type = header.e_type(endian);
     let e_machine = header.e_machine(endian);
 
-    if e_machine != object::elf::EM_X86_64 {
+    let Some(arch) = Arch::of_machine(e_machine.0) else {
         bail!(
             "{}: unsupported architecture e_machine=0x{:04x} (only EM_X86_64 is supported)",
             path.display(),
-            e_machine
+            e_machine.0
         );
-    }
+    };
 
     let is_pie = if e_type == ET_DYN {
         true // PIE executable
@@ -337,11 +340,12 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<bool> {
         );
     }
 
-    Ok(is_pie)
+    Ok((arch, is_pie))
 }
 
 /// Validate that `bytes` is a shared library the merge can take code from: a
-/// little-endian, 64-bit, x86-64 `ET_DYN` object.
+/// little-endian, 64-bit `ET_DYN` object built for `arch`, the executable's
+/// architecture.
 ///
 /// [`validate_executable`] checks the file solder writes to. Nothing checked
 /// the files it copies machine code *out of*, and a search path that names a
@@ -365,8 +369,8 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<bool> {
 /// The header is read out of the raw bytes rather than through a parser
 /// because the point is to reject the files a 64-bit little-endian reader
 /// cannot describe in the first place.
-pub fn validate_merge_library(bytes: &[u8], path: &Path) -> Result<()> {
-    use object::elf::{ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64, ET_DYN};
+pub fn validate_merge_library(bytes: &[u8], path: &Path, arch: &Arch) -> Result<()> {
+    use object::elf::{ELFCLASS64, ELFDATA2LSB, ELFMAG, ET_DYN};
 
     /// `EI_CLASS`: whether the object is 32- or 64-bit.
     const EI_CLASS: usize = 4;
@@ -382,10 +386,13 @@ pub fn validate_merge_library(bytes: &[u8], path: &Path) -> Result<()> {
         );
     }
 
-    let hint = "solder copies a library's machine code into the executable, so only an \
-                x86-64 shared object can be merged into one — check that the search path \
-                (-L, DT_RPATH/DT_RUNPATH, SYSROOT, LD_LIBRARY_PATH) names the x86-64 build \
-                of this soname";
+    let hint = format!(
+        "solder copies a library's machine code into the executable, so only an \
+         {0} shared object can be merged into one — check that the search path \
+         (-L, DT_RPATH/DT_RUNPATH, SYSROOT, LD_LIBRARY_PATH) names the {0} build \
+         of this soname",
+        arch.name
+    );
 
     if bytes[EI_CLASS] != ELFCLASS64.0 {
         bail!(
@@ -405,12 +412,13 @@ pub fn validate_merge_library(bytes: &[u8], path: &Path) -> Result<()> {
     let e_type = read_u16(bytes, 0x10)?;
     let e_machine = read_u16(bytes, 0x12)?;
 
-    if e_machine != EM_X86_64.0 {
+    if e_machine != arch.e_machine {
         bail!(
-            "{}: unsupported architecture e_machine=0x{e_machine:04x} (only EM_X86_64, \
+            "{}: unsupported architecture e_machine=0x{e_machine:04x} (only {}, \
              0x{:04x}, is supported); {hint}",
             path.display(),
-            EM_X86_64.0
+            arch.name,
+            arch.e_machine
         );
     }
     if e_type != ET_DYN.0 {
@@ -1030,14 +1038,15 @@ mod merge_library_tests {
         let path = Path::new("/sysroot/lib/libpcre2-8.so.0");
         format!(
             "{:#}",
-            validate_merge_library(bytes, path).expect_err("a foreign library must be refused")
+            validate_merge_library(bytes, path, &crate::arch::X86_64)
+                .expect_err("a foreign library must be refused")
         )
     }
 
     #[test]
     fn the_libraries_solder_merges_are_accepted() {
         for name in TEST_LIBS {
-            validate_merge_library(&read_test_lib(name), Path::new(name))
+            validate_merge_library(&read_test_lib(name), Path::new(name), &crate::arch::X86_64)
                 .unwrap_or_else(|e| panic!("{name} should be mergeable: {e:#}"));
         }
     }
@@ -1478,7 +1487,7 @@ mod executable_tests {
     fn validate(bytes: &[u8]) -> Result<bool> {
         let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(bytes)
             .expect("parse the fixture");
-        validate_executable(&elf, Path::new(GREP))
+        validate_executable(&elf, Path::new(GREP)).map(|(_, is_pie)| is_pie)
     }
 
     #[test]

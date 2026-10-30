@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::arch::Arch;
+
 /// Library names (or prefixes) that must never be merged — they are part of
 /// glibc / the kernel ABI and must remain as dynamic dependencies.
 const NEVER_MERGE_PREFIXES: &[&str] = &[
@@ -66,13 +68,14 @@ pub fn is_excluded(needed: &str) -> bool {
 /// `$TOKEN` and `${TOKEN}` spellings.
 ///
 /// `origin` is the directory holding the object the entry came from, with
-/// symlinks resolved — what `$ORIGIN` means to the loader.
+/// symlinks resolved — what `$ORIGIN` means to the loader. `arch` is the
+/// architecture of the executable, which decides what `$LIB` means.
 ///
 /// Returns `None` for an entry carrying a token that cannot be resolved here.
 /// The loader skips such an entry as well, and searching a directory named
 /// literally `$PLATFORM` would only mask the fact that solder and the loader
 /// are looking in different places.
-pub fn expand_dynamic_tokens(entry: &str, origin: &Path) -> Option<PathBuf> {
+pub fn expand_dynamic_tokens(entry: &str, origin: &Path, arch: &Arch) -> Option<PathBuf> {
     let mut out = String::with_capacity(entry.len());
     let mut rest = entry;
 
@@ -94,9 +97,8 @@ pub fn expand_dynamic_tokens(entry: &str, origin: &Path) -> Option<PathBuf> {
 
         match token {
             "ORIGIN" => out.push_str(origin.to_str()?),
-            // ld.so(8): `lib` or `lib64` according to the architecture, and
-            // solder only ever merges x86-64 objects.
-            "LIB" => out.push_str("lib64"),
+            // ld.so(8): `lib` or `lib64` according to the architecture.
+            "LIB" => out.push_str(arch.lib_token),
             // `$PLATFORM` names whatever the loader makes of the CPU it finds
             // itself on (on x86-64: `haswell`, `xeon_phi`, or nothing at all),
             // so the directory it would pick is not knowable from here.
@@ -124,10 +126,11 @@ pub fn expand_dynamic_tokens(entry: &str, origin: &Path) -> Option<PathBuf> {
 ///   2. `LD_LIBRARY_PATH` directories (from the solder process environment)
 ///   3. Caller-supplied `runpath` entries
 ///   4. `/etc/ld.so.cache`
-///   5. Default paths: /lib64, /usr/lib64, /lib, /usr/lib,
-///      /lib/x86_64-linux-gnu, /usr/lib/x86_64-linux-gnu
+///   5. The architecture's default paths ([`Arch::default_lib_dirs`]; on
+///      x86-64: /lib64, /usr/lib64, /lib, /usr/lib, /lib/x86_64-linux-gnu,
+///      /usr/lib/x86_64-linux-gnu)
 ///
-/// A file of the right name built for another machine — the 32-bit half of a
+/// A file of the right name built for a machine other than `arch` — the 32-bit half of a
 /// multilib tree, a foreign multiarch directory — is passed over and the search
 /// goes on, as ld.so does (see [`is_foreign_object`]).
 ///
@@ -139,10 +142,11 @@ pub fn resolve_library(
     runpath: &[PathBuf],
     ldso_cache: &LdsoCache,
     origin: &Path,
+    arch: &Arch,
 ) -> Result<PathBuf> {
     // 0. Not a soname at all, but a path.
     if soname.contains('/') {
-        return resolve_path_entry(soname, origin);
+        return resolve_path_entry(soname, origin, arch);
     }
 
     let llp = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
@@ -151,16 +155,10 @@ pub fn resolve_library(
         .filter(|s| !s.is_empty())
         .map(|dir| Path::new(dir).join(soname));
 
-    let defaults = [
-        "/lib64",
-        "/usr/lib64",
-        "/lib",
-        "/usr/lib",
-        "/lib/x86_64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu",
-    ]
-    .into_iter()
-    .map(|dir| Path::new(dir).join(soname));
+    let defaults = arch
+        .default_lib_dirs
+        .iter()
+        .map(|dir| Path::new(dir).join(soname));
 
     // 1. RPATH, 2. LD_LIBRARY_PATH, 3. RUNPATH, 4. ld.so.cache, 5. default paths.
     let candidates = rpath
@@ -176,7 +174,7 @@ pub fn resolve_library(
         if !candidate.exists() {
             continue;
         }
-        if is_foreign_object(&candidate) {
+        if is_foreign_object(&candidate, arch) {
             skipped.push(candidate);
             continue;
         }
@@ -187,7 +185,8 @@ pub fn resolve_library(
     if !skipped.is_empty() {
         let skipped: Vec<String> = skipped.iter().map(|p| p.display().to_string()).collect();
         message.push_str(&format!(
-            " built for x86-64 (passed over {}, built for another architecture, as ld.so would)",
+            " built for {} (passed over {}, built for another architecture, as ld.so would)",
+            arch.name,
             skipped.join(", ")
         ));
     }
@@ -196,7 +195,7 @@ pub fn resolve_library(
 }
 
 /// Whether `path` is an ELF object ld.so would pass over while searching for a
-/// dependency of an x86-64 executable, rather than load or fail on.
+/// dependency of an executable built for `arch`, rather than load or fail on.
 ///
 /// glibc's `open_verify` skips a candidate whose `EI_CLASS` is not the
 /// loader's own, or whose `e_machine` is not the host's, and keeps searching
@@ -206,8 +205,8 @@ pub fn resolve_library(
 /// the wrong byte order — ends the load with an error instead, so those files
 /// are not skipped here either: they are handed back as the resolution, for
 /// the reader to refuse with a message naming them.
-fn is_foreign_object(path: &Path) -> bool {
-    use object::elf::{ELFCLASS64, ELFDATA2LSB, ELFMAG, EM_X86_64};
+fn is_foreign_object(path: &Path, arch: &Arch) -> bool {
+    use object::elf::{ELFCLASS64, ELFDATA2LSB, ELFMAG};
     use std::io::Read;
 
     const EI_CLASS: usize = 4;
@@ -221,7 +220,8 @@ fn is_foreign_object(path: &Path) -> bool {
     if header[EI_CLASS] != ELFCLASS64.0 {
         return true;
     }
-    header[EI_DATA] == ELFDATA2LSB.0 && u16::from_le_bytes([header[18], header[19]]) != EM_X86_64.0
+    header[EI_DATA] == ELFDATA2LSB.0
+        && u16::from_le_bytes([header[18], header[19]]) != arch.e_machine
 }
 
 /// Resolve a `DT_NEEDED` entry that names a path instead of a soname.
@@ -240,8 +240,8 @@ fn is_foreign_object(path: &Path) -> bool {
 ///   * even when it stays inside, `<searchdir>/<entry>` is a different file
 ///     from the one ld.so will open, so the merge pulls in code the executable
 ///     never runs.
-fn resolve_path_entry(needed: &str, origin: &Path) -> Result<PathBuf> {
-    let path = expand_dynamic_tokens(needed, origin).with_context(|| {
+fn resolve_path_entry(needed: &str, origin: &Path, arch: &Arch) -> Result<PathBuf> {
+    let path = expand_dynamic_tokens(needed, origin, arch).with_context(|| {
         format!("DT_NEEDED '{needed}' names a path whose tokens cannot be expanded here")
     })?;
 
@@ -286,11 +286,6 @@ const OLD_ENTRY_SIZE: usize = 12;
 /// an index into the cache's `glibc-hwcaps` subdirectory list rather than a
 /// hwcap bitmask.
 const DL_CACHE_HWCAP_EXTENSION: u64 = 1 << 62;
-/// `_DL_CACHE_DEFAULT_ID` from glibc's `sysdeps/x86_64/dl-cache.h`:
-/// `FLAG_X8664_LIB64 | FLAG_ELF_LIBC6`. On x86-64 `_dl_cache_check_flags`
-/// accepts this value and nothing else, so an entry with any other `flags` is
-/// one the dynamic linker would never load.
-const FLAG_X8664_LIBC6: u32 = 0x0303;
 
 /// Parser for the glibc `ld.so.cache` binary format, after the structures in
 /// glibc's `sysdeps/generic/dl-cache.h`.
@@ -303,28 +298,33 @@ const FLAG_X8664_LIBC6: u32 = 0x0303;
 ///     `struct cache_file` (magic `ld.so-1.7.0`) with 12-byte entries,
 ///     followed by an 8-byte-aligned `struct cache_file_new` repeating the
 ///     same libraries, hidden where the old format's string table starts.
+///
+/// Only the entries for one architecture are kept: the ones whose `flags` are
+/// that architecture's [`Arch::ldso_cache_flags`], which is the only value its
+/// loader's `_dl_cache_check_flags` accepts.
 pub struct LdsoCache {
     map: HashMap<String, PathBuf>,
 }
 
 impl LdsoCache {
-    /// Load from the default path `/etc/ld.so.cache`, or return an empty cache
-    /// if the file is absent or cannot be parsed (non-fatal — fallback to
-    /// filesystem search still works).
-    pub fn load() -> Self {
-        Self::load_from(Path::new("/etc/ld.so.cache")).unwrap_or_else(|_| Self {
+    /// Load `arch`'s entries from the default path `/etc/ld.so.cache`, or
+    /// return an empty cache if the file is absent or cannot be parsed
+    /// (non-fatal — fallback to filesystem search still works).
+    pub fn load(arch: &Arch) -> Self {
+        Self::load_from(Path::new("/etc/ld.so.cache"), arch).unwrap_or_else(|_| Self {
             map: HashMap::new(),
         })
     }
 
-    pub fn load_from(path: &Path) -> Result<Self> {
+    pub fn load_from(path: &Path, arch: &Arch) -> Result<Self> {
         let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&data).with_context(|| format!("parsing {}", path.display()))
+        Self::parse(&data, arch).with_context(|| format!("parsing {}", path.display()))
     }
 
-    fn parse(data: &[u8]) -> Result<Self> {
+    fn parse(data: &[u8], arch: &Arch) -> Result<Self> {
+        let flags = arch.ldso_cache_flags;
         if data.starts_with(MAGIC_NEW) {
-            return Self::parse_new(data, 0);
+            return Self::parse_new(data, 0, flags);
         }
         if !data.starts_with(MAGIC_OLD) {
             bail!("unrecognized ld.so.cache format");
@@ -343,18 +343,19 @@ impl LdsoCache {
         let strings_start = OLD_HEADER_SIZE + nlibs * OLD_ENTRY_SIZE;
         let embedded = strings_start.next_multiple_of(8);
         if data.len() > embedded + NEW_HEADER_SIZE && data[embedded..].starts_with(MAGIC_NEW) {
-            return Self::parse_new(data, embedded);
+            return Self::parse_new(data, embedded, flags);
         }
 
-        Self::parse_old(data, nlibs, strings_start)
+        Self::parse_old(data, nlibs, strings_start, flags)
     }
 
-    /// Parse the `struct cache_file_new` whose header starts at `base`.
+    /// Parse the `struct cache_file_new` whose header starts at `base`, keeping
+    /// the entries whose flags are `wanted`.
     ///
     /// String table indices in this format are relative to `base` rather than
     /// to the start of the string table — glibc reads them off
     /// `cache_data = (const char *) cache_new`.
-    fn parse_new(data: &[u8], base: usize) -> Result<Self> {
+    fn parse_new(data: &[u8], base: usize, wanted: u32) -> Result<Self> {
         if data.len() < base + NEW_HEADER_SIZE {
             bail!("ld.so.cache is truncated inside its header");
         }
@@ -385,16 +386,16 @@ impl LdsoCache {
 
             // Skip the entries ld.so itself would pass over on this machine:
             //
-            //   * anything but an x86-64 libc6 library. A multilib cache also
-            //     lists the i386 and x32 builds of the same soname, and
-            //     merging a 32-bit library into a 64-bit executable is not a
-            //     thing.
+            //   * anything but a libc6 library of the executable's
+            //     architecture. A multilib x86-64 cache also lists the i386
+            //     and x32 builds of the same soname, and merging a 32-bit
+            //     library into a 64-bit executable is not a thing.
             //   * a `glibc-hwcaps` entry, whose path is only loadable on a CPU
             //     with capabilities we cannot evaluate from here. `ldconfig`
             //     sorts these ahead of the baseline entry for the same soname,
             //     so after skipping them the first entry left is the one ld.so
             //     falls back to.
-            if flags != FLAG_X8664_LIBC6 || hwcap & DL_CACHE_HWCAP_EXTENSION != 0 {
+            if flags != wanted || hwcap & DL_CACHE_HWCAP_EXTENSION != 0 {
                 continue;
             }
 
@@ -409,11 +410,11 @@ impl LdsoCache {
 
     /// Parse the `nlibs` `struct file_entry`s of the original format, whose
     /// string table indices are relative to the end of the entry array.
-    fn parse_old(data: &[u8], nlibs: usize, strings_start: usize) -> Result<Self> {
+    fn parse_old(data: &[u8], nlibs: usize, strings_start: usize, wanted: u32) -> Result<Self> {
         let mut map = HashMap::with_capacity(nlibs);
         for i in 0..nlibs {
             let entry = OLD_HEADER_SIZE + i * OLD_ENTRY_SIZE;
-            if read_u32(data, entry)? != FLAG_X8664_LIBC6 {
+            if read_u32(data, entry)? != wanted {
                 continue;
             }
             let soname = read_cstr(data, strings_start + read_u32(data, entry + 4)? as usize)?;
@@ -460,6 +461,7 @@ fn read_cstr(data: &[u8], offset: usize) -> Result<&str> {
 #[cfg(test)]
 mod resolution_tests {
     use super::*;
+    use crate::arch::X86_64;
 
     /// A cache with nothing in it, so resolution depends only on the paths.
     fn empty_cache() -> LdsoCache {
@@ -471,7 +473,7 @@ mod resolution_tests {
     #[test]
     fn origin_expands_to_the_directory_holding_the_object() {
         assert_eq!(
-            expand_dynamic_tokens("$ORIGIN/../lib", Path::new("/opt/app/bin")),
+            expand_dynamic_tokens("$ORIGIN/../lib", Path::new("/opt/app/bin"), &X86_64),
             Some(PathBuf::from("/opt/app/bin/../lib"))
         );
     }
@@ -479,7 +481,7 @@ mod resolution_tests {
     #[test]
     fn braced_tokens_are_expanded_too() {
         assert_eq!(
-            expand_dynamic_tokens("${ORIGIN}/libs", Path::new("/opt/app")),
+            expand_dynamic_tokens("${ORIGIN}/libs", Path::new("/opt/app"), &X86_64),
             Some(PathBuf::from("/opt/app/libs"))
         );
     }
@@ -487,7 +489,11 @@ mod resolution_tests {
     #[test]
     fn several_tokens_in_one_entry_are_all_expanded() {
         assert_eq!(
-            expand_dynamic_tokens("$ORIGIN/../$LIB/plugins", Path::new("/opt/app/bin")),
+            expand_dynamic_tokens(
+                "$ORIGIN/../$LIB/plugins",
+                Path::new("/opt/app/bin"),
+                &X86_64
+            ),
             Some(PathBuf::from("/opt/app/bin/../lib64/plugins"))
         );
     }
@@ -495,7 +501,7 @@ mod resolution_tests {
     #[test]
     fn lib_expands_to_the_x86_64_library_directory() {
         assert_eq!(
-            expand_dynamic_tokens("/usr/$LIB", Path::new("/opt/app")),
+            expand_dynamic_tokens("/usr/$LIB", Path::new("/opt/app"), &X86_64),
             Some(PathBuf::from("/usr/lib64"))
         );
     }
@@ -503,7 +509,7 @@ mod resolution_tests {
     #[test]
     fn an_entry_without_tokens_is_left_alone() {
         assert_eq!(
-            expand_dynamic_tokens("/usr/local/lib", Path::new("/opt/app")),
+            expand_dynamic_tokens("/usr/local/lib", Path::new("/opt/app"), &X86_64),
             Some(PathBuf::from("/usr/local/lib"))
         );
     }
@@ -515,7 +521,7 @@ mod resolution_tests {
         // a directory is worse than leaving the entry out of the search.
         for entry in ["/usr/lib/$PLATFORM", "${ORIGIN/lib", "$ORIGIN$"] {
             assert_eq!(
-                expand_dynamic_tokens(entry, Path::new("/opt/app")),
+                expand_dynamic_tokens(entry, Path::new("/opt/app"), &X86_64),
                 None,
                 "{entry} should not have expanded"
             );
@@ -540,15 +546,24 @@ mod resolution_tests {
                 &[PathBuf::from(raw)],
                 &[],
                 &empty_cache(),
-                origin
+                origin,
+                &X86_64
             )
             .is_err(),
             "an unexpanded $ORIGIN entry cannot name a real directory"
         );
 
-        let expanded = expand_dynamic_tokens(raw, origin).expect("expands");
+        let expanded = expand_dynamic_tokens(raw, origin, &X86_64).expect("expands");
         assert_eq!(
-            resolve_library("libfoo.so.1", &[expanded], &[], &empty_cache(), origin).ok(),
+            resolve_library(
+                "libfoo.so.1",
+                &[expanded],
+                &[],
+                &empty_cache(),
+                origin,
+                &X86_64
+            )
+            .ok(),
             Some(libs.join("libfoo.so.1"))
         );
     }
@@ -610,6 +625,7 @@ mod resolution_tests {
             &[],
             &empty_cache(),
             root.path(),
+            &X86_64,
         );
         assert_ne!(
             resolved.as_deref().ok(),
@@ -634,7 +650,8 @@ mod resolution_tests {
                 &[],
                 &[],
                 &empty_cache(),
-                root.path()
+                root.path(),
+                &X86_64
             )
             .ok(),
             Some(wanted)
@@ -653,7 +670,8 @@ mod resolution_tests {
                 &[],
                 &[],
                 &empty_cache(),
-                &origin
+                &origin,
+                &X86_64
             )
             .ok(),
             Some(origin.join("lib/sub/libfoo.so.1"))
@@ -672,6 +690,7 @@ mod resolution_tests {
                 &[],
                 &empty_cache(),
                 &root.path().join("sysroot/lib"),
+                &X86_64,
             )
             .expect_err("the library is not there")
         );
@@ -698,6 +717,7 @@ mod resolution_tests {
                 &[],
                 &empty_cache(),
                 &root.path().join("sysroot/lib"),
+                &X86_64,
             )
             .expect_err("the library is not there");
             assert!(err.is::<NotFound>(), "{absent}: {err:#}");
@@ -713,6 +733,7 @@ mod resolution_tests {
             &[],
             &empty_cache(),
             root.path(),
+            &X86_64,
         )
         .expect_err("relative entry");
         assert!(!err.is::<NotFound>(), "{err:#}");
@@ -767,6 +788,7 @@ mod resolution_tests {
                 &[],
                 &empty_cache(),
                 root.path(),
+                &X86_64,
             )
             .unwrap_or_else(|e| panic!("{what}: {e:#}"));
             assert_eq!(resolved, native, "{what}");
@@ -786,6 +808,7 @@ mod resolution_tests {
             &[],
             &empty_cache(),
             root.path(),
+            &X86_64,
         )
         .expect_err("only an aarch64 build is there");
         assert!(err.is::<NotFound>(), "{err:#}");
@@ -819,6 +842,7 @@ mod resolution_tests {
                 &[],
                 &empty_cache(),
                 root.path(),
+                &X86_64,
             )
             .unwrap_or_else(|e| panic!("{what}: {e:#}"));
             assert_eq!(resolved, broken, "{what}");
@@ -856,11 +880,12 @@ mod resolution_tests {
 #[cfg(test)]
 mod ldso_cache_tests {
     use super::*;
+    use crate::arch::X86_64;
 
     /// `(flags, hwcap, soname, path)` for one cache entry.
     type Entry<'a> = (u32, u64, &'a str, &'a str);
 
-    const X8664: u32 = FLAG_X8664_LIBC6;
+    const X8664: u32 = X86_64.ldso_cache_flags;
     /// `FLAG_ELF_LIBC6` with no architecture bits — a 32-bit i386 library.
     const I386: u32 = 0x0003;
 
@@ -921,7 +946,7 @@ mod ldso_cache_tests {
     #[test]
     fn a_new_format_cache_resolves_a_soname() {
         let data = new_format(&[(X8664, 0, "libz.so.1", "/usr/lib64/libz.so.1")]);
-        let cache = LdsoCache::parse(&data).expect("new-format cache");
+        let cache = LdsoCache::parse(&data, &X86_64).expect("new-format cache");
         assert_eq!(
             cache.lookup("libz.so.1"),
             Some(Path::new("/usr/lib64/libz.so.1"))
@@ -931,7 +956,7 @@ mod ldso_cache_tests {
     #[test]
     fn the_new_cache_embedded_in_the_legacy_layout_is_used() {
         let data = combined(&[(X8664, 0, "libz.so.1", "/usr/lib64/libz.so.1")]);
-        let cache = LdsoCache::parse(&data).expect("combined cache");
+        let cache = LdsoCache::parse(&data, &X86_64).expect("combined cache");
         assert_eq!(
             cache.lookup("libz.so.1"),
             Some(Path::new("/usr/lib64/libz.so.1"))
@@ -957,7 +982,7 @@ mod ldso_cache_tests {
         out.extend_from_slice(path.as_bytes());
         out.push(0);
 
-        let cache = LdsoCache::parse(&out).expect("old-format cache");
+        let cache = LdsoCache::parse(&out, &X86_64).expect("old-format cache");
         assert_eq!(cache.lookup(soname), Some(Path::new(path)));
     }
 
@@ -972,7 +997,7 @@ mod ldso_cache_tests {
             ),
             (X8664, 0, "libfoo.so.1", "/usr/lib64/libfoo.so.1"),
         ]);
-        let cache = LdsoCache::parse(&data).expect("cache with hwcaps entries");
+        let cache = LdsoCache::parse(&data, &X86_64).expect("cache with hwcaps entries");
         assert_eq!(
             cache.lookup("libfoo.so.1"),
             Some(Path::new("/usr/lib64/libfoo.so.1")),
@@ -986,7 +1011,7 @@ mod ldso_cache_tests {
             (I386, 0, "libbar.so.1", "/usr/lib/libbar.so.1"),
             (X8664, 0, "libbar.so.1", "/usr/lib64/libbar.so.1"),
         ]);
-        let cache = LdsoCache::parse(&data).expect("multilib cache");
+        let cache = LdsoCache::parse(&data, &X86_64).expect("multilib cache");
         assert_eq!(
             cache.lookup("libbar.so.1"),
             Some(Path::new("/usr/lib64/libbar.so.1")),
@@ -996,8 +1021,8 @@ mod ldso_cache_tests {
 
     #[test]
     fn a_cache_without_a_known_magic_is_rejected() {
-        assert!(LdsoCache::parse(b"not a cache at all").is_err());
-        assert!(LdsoCache::parse(&[]).is_err());
+        assert!(LdsoCache::parse(b"not a cache at all", &X86_64).is_err());
+        assert!(LdsoCache::parse(&[], &X86_64).is_err());
     }
 
     #[test]
@@ -1007,7 +1032,7 @@ mod ldso_cache_tests {
             combined(&[(X8664, 0, "libz.so.1", "/usr/lib64/libz.so.1")]),
         ] {
             for len in 0..cache.len() {
-                let _ = LdsoCache::parse(&cache[..len]);
+                let _ = LdsoCache::parse(&cache[..len], &X86_64);
             }
         }
     }
@@ -1016,6 +1041,6 @@ mod ldso_cache_tests {
     fn an_entry_count_larger_than_the_file_is_rejected() {
         let mut data = new_format(&[(X8664, 0, "libz.so.1", "/usr/lib64/libz.so.1")]);
         data[20..24].copy_from_slice(&u32::MAX.to_le_bytes()); // nlibs
-        assert!(LdsoCache::parse(&data).is_err());
+        assert!(LdsoCache::parse(&data, &X86_64).is_err());
     }
 }

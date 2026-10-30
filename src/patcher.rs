@@ -939,6 +939,7 @@ mod verneed_tests {
     /// soname on `remove_needed`.
     fn plan_removing(soname: &str) -> MergePlan {
         MergePlan {
+            arch: &crate::arch::X86_64,
             is_pie: true,
             load_address: 0x10_0000,
             exec_size: 0x1000,
@@ -1229,6 +1230,7 @@ mod gnu_property_tests {
     /// A plan that merged one unit out of `lib`.
     fn plan_merging(lib: &str) -> MergePlan {
         MergePlan {
+            arch: &crate::arch::X86_64,
             is_pie: true,
             load_address: 0x10_0000,
             exec_size: 0x1000,

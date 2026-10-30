@@ -23,6 +23,7 @@ pub fn plan_layout(
     exe_elf: &object::read::elf::ElfFile64<'_>,
     imports: &[crate::types::ImportedSymbol],
     exe_got_vas: &HashMap<String, u64>,
+    arch: &'static crate::arch::Arch,
     is_pie: bool,
     init_fini: InitFiniArrays,
     lib_order: &[PathBuf],
@@ -217,6 +218,7 @@ pub fn plan_layout(
     // The relocations to neutralize are chosen by the caller, so leave them empty here.
     // Relative relocs are populated during segment building (trampolines) and patching (GOT).
     Ok(MergePlan {
+        arch,
         is_pie,
         load_address,
         exec_size,
@@ -569,12 +571,14 @@ mod tests {
     ) -> MergePlan {
         let mapped = MappedElf::open(std::path::Path::new(GREP)).expect("open test/grep");
         let exe = mapped.parse().expect("parse test/grep");
-        let rela = crate::symbol_analysis::RelaTables::read(&exe).expect("test/grep .rela tables");
+        let rela = crate::symbol_analysis::RelaTables::read(&exe, &crate::arch::X86_64)
+            .expect("test/grep .rela tables");
         plan_layout(
             units,
             &exe,
             &[],
             &rela.got_slot_vas(),
+            &crate::arch::X86_64,
             is_pie,
             init_fini,
             lib_order,

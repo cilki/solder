@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use object::read::elf::ElfFile64;
 use tracing::{debug, warn};
 
+use crate::arch::Arch;
 use crate::elf_reader::{DynamicTable, MappedElf, dynamic_table_bytes, va_to_file_offset};
 use crate::lib_discovery::{
     LdsoCache, NotFound, expand_dynamic_tokens, is_excluded, resolve_library, soname_base,
@@ -47,13 +48,17 @@ fn effective_rpath<'a>(rpath: &'a [PathBuf], runpath: &[PathBuf]) -> &'a [PathBu
 /// each of which may carry dynamic string tokens. The tokens are expanded
 /// against `origin`, the directory of the object that recorded the entry — so
 /// these have to be read from the object they belong to, not from another one
-/// that happens to be in the same link.
-fn search_dirs<'a>(values: impl Iterator<Item = &'a str>, origin: &Path) -> Vec<PathBuf> {
+/// that happens to be in the same link — and `$LIB` against `arch`.
+fn search_dirs<'a>(
+    values: impl Iterator<Item = &'a str>,
+    origin: &Path,
+    arch: &Arch,
+) -> Vec<PathBuf> {
     values
         .flat_map(|s| s.split(':'))
         .filter(|p| !p.is_empty())
         .filter_map(|p| {
-            let dir = expand_dynamic_tokens(p, origin);
+            let dir = expand_dynamic_tokens(p, origin, arch);
             if dir.is_none() {
                 warn!(
                     entry = p,
@@ -66,8 +71,8 @@ fn search_dirs<'a>(values: impl Iterator<Item = &'a str>, origin: &Path) -> Vec<
 }
 
 /// Read `DT_NEEDED`, `DT_RPATH` and `DT_RUNPATH` out of the object at `path`,
-/// the executable or one of its libraries.
-pub fn parse_dynamic(elf: &ElfFile64<'_>, path: &Path) -> Result<DynamicInfo> {
+/// the executable or one of its libraries, all of which are built for `arch`.
+pub fn parse_dynamic(elf: &ElfFile64<'_>, path: &Path, arch: &Arch) -> Result<DynamicInfo> {
     use goblin::elf::dynamic::{DT_NEEDED, DT_RPATH, DT_RUNPATH};
 
     let bytes = elf.data();
@@ -87,6 +92,7 @@ pub fn parse_dynamic(elf: &ElfFile64<'_>, path: &Path) -> Result<DynamicInfo> {
                 .values_of(tag)
                 .filter_map(|val| dynamic.string_at(bytes, val)),
             origin,
+            arch,
         )
     };
 
@@ -182,6 +188,9 @@ pub fn dependency_search_path<'a>(
 pub struct LibrarySearch<'a> {
     exe: &'a DynamicInfo,
     cache: &'a LdsoCache,
+    /// The executable's architecture: what every library found has to be
+    /// built for, and what decides the default directories and `$LIB`.
+    arch: &'static Arch,
     /// The executable's effective `DT_RPATH` followed by solder's own search
     /// directories: the group [`resolve_library`] searches ahead of
     /// `LD_LIBRARY_PATH`.
@@ -191,10 +200,20 @@ pub struct LibrarySearch<'a> {
 impl<'a> LibrarySearch<'a> {
     /// `extra` is where solder's own `$SYSROOT/lib` and `-L` directories go —
     /// behind the executable's `DT_RPATH`, ahead of `LD_LIBRARY_PATH`.
-    pub fn new(exe: &'a DynamicInfo, extra: &[PathBuf], cache: &'a LdsoCache) -> Self {
+    pub fn new(
+        exe: &'a DynamicInfo,
+        extra: &[PathBuf],
+        cache: &'a LdsoCache,
+        arch: &'static Arch,
+    ) -> Self {
         let mut rpath = exe.search_rpath().to_vec();
         rpath.extend_from_slice(extra);
-        Self { exe, cache, rpath }
+        Self {
+            exe,
+            cache,
+            arch,
+            rpath,
+        }
     }
 
     /// The executable's `DT_NEEDED` entries, in the order it lists them.
@@ -211,6 +230,7 @@ impl<'a> LibrarySearch<'a> {
             &self.exe.runpath,
             self.cache,
             &self.exe.origin,
+            self.arch,
         )
     }
 
@@ -235,11 +255,11 @@ impl<'a> LibrarySearch<'a> {
             Some(lib) => {
                 let (rpath, runpath) = dependency_search_path(lib, &self.rpath);
                 let origin = lib.path.parent().unwrap_or(&self.exe.origin);
-                resolve_library(entry, &rpath, runpath, self.cache, origin)
+                resolve_library(entry, &rpath, runpath, self.cache, origin, self.arch)
             }
             None => self.find(entry),
         }?;
-        let lib = read_library_dynamic(&path)?;
+        let lib = read_library_dynamic(&path, self.arch)?;
         Ok((path, lib))
     }
 }
@@ -376,7 +396,7 @@ pub fn collect_imports(
             Err(e) => return Err(e).with_context(|| format!("resolving DT_NEEDED '{needed}'")),
         };
 
-        let lib = read_library_dynamic(&lib_path)?;
+        let lib = read_library_dynamic(&lib_path, search.arch)?;
         for name in lib.defined {
             sym_to_lib.entry(name).or_insert_with(|| lib_path.clone());
         }
@@ -436,7 +456,8 @@ struct RelaEntry {
     /// `r_offset` — the virtual address the relocation applies to, i.e. the
     /// GOT slot or data word being filled in.
     target_vaddr: u64,
-    /// Low half of `r_info`: the `R_X86_64_*` relocation type.
+    /// Low half of `r_info`: the relocation type, numbered as the executable's
+    /// architecture numbers them.
     r_type: u32,
     /// Name of the `.dynsym` symbol the entry refers to, empty if it has none.
     symbol: String,
@@ -478,10 +499,12 @@ pub struct RelaTables {
     /// undefined ones that are not weak, so the loader fails the executable
     /// outright rather than resolving them to zero.
     strong_undefined: HashSet<String>,
+    /// The executable's architecture, which decides what each `r_type` is.
+    arch: &'static Arch,
 }
 
 impl RelaTables {
-    pub fn read(elf: &ElfFile64<'_>) -> Result<Self> {
+    pub fn read(elf: &ElfFile64<'_>, arch: &'static Arch) -> Result<Self> {
         use goblin::elf::dynamic::{DT_JMPREL, DT_PLTREL, DT_PLTRELSZ, DT_RELA, DT_RELASZ};
         use goblin::elf::section_header::SHN_UNDEF;
         use goblin::elf::sym::STB_WEAK;
@@ -535,6 +558,7 @@ impl RelaTables {
             jump_slot: read_rela_table(elf, &dynamic, "DT_JMPREL", DT_JMPREL, DT_PLTRELSZ, &names)?,
             dynamic: read_rela_table(elf, &dynamic, "DT_RELA", DT_RELA, DT_RELASZ, &names)?,
             strong_undefined,
+            arch,
         })
     }
 
@@ -562,13 +586,11 @@ impl RelaTables {
     /// of `.rela.plt` plus the GLOB_DATs of `.rela.dyn`, each paired with the
     /// kind of import it represents.
     fn imports(&self) -> impl Iterator<Item = (&RelaEntry, ImportKind)> {
-        use goblin::elf64::reloc::R_X86_64_GLOB_DAT;
-
         self.jump_slot
             .iter()
             .map(|e| (e, ImportKind::JumpSlot))
             .chain(
-                self.dynamic_of_type(R_X86_64_GLOB_DAT)
+                self.dynamic_of_type(self.arch.reloc.glob_dat)
                     .map(|e| (e, ImportKind::GlobDat)),
             )
     }
@@ -595,8 +617,7 @@ impl RelaTables {
         map
     }
 
-    /// The names of the symbols the executable copy-relocates
-    /// (`R_X86_64_COPY`).
+    /// The names of the symbols the executable copy-relocates (`R_*_COPY`).
     ///
     /// Such a symbol's storage belongs to the executable: the linker gave the
     /// executable a definition of its own in `.bss` and had ld.so copy the
@@ -607,9 +628,7 @@ impl RelaTables {
     /// Extracted code has to keep reaching that copy or the variable becomes
     /// two unrelated objects (see `collect_dynamic_range_relocs`).
     pub fn copy_reloc_symbols(&self) -> HashSet<String> {
-        use goblin::elf64::reloc::R_X86_64_COPY;
-
-        self.dynamic_of_type(R_X86_64_COPY)
+        self.dynamic_of_type(self.arch.reloc.copy)
             .map(|e| e.symbol.clone())
             .collect()
     }
@@ -668,7 +687,7 @@ pub struct LibraryDynamic {
 
 /// Read `lib_path`'s exports and dependencies.
 ///
-/// A file that is not an x86-64 shared object is an error rather than a
+/// A file that is not a shared object built for `arch` is an error rather than a
 /// library with no exports: everything this feeds — the symbol-to-library map
 /// the merge extracts code through, and the inherited-`DT_NEEDED` decision —
 /// assumes the file's code can run in the executable. See
@@ -679,13 +698,13 @@ pub struct LibraryDynamic {
 /// of `.dynstr` into a table of strings and walks every dynamic relocation to
 /// size `.dynsym` — for `libcrypto.so.3`, 6k strings and 28k relocations, none
 /// of which this needs, on every library the merge reads.
-pub fn read_library_dynamic(lib_path: &Path) -> Result<LibraryDynamic> {
+pub fn read_library_dynamic(lib_path: &Path, arch: &Arch) -> Result<LibraryDynamic> {
     use object::read::elf::Sym;
 
     let mapped =
         MappedElf::open(lib_path).with_context(|| format!("reading {}", lib_path.display()))?;
     let bytes = mapped.bytes();
-    crate::elf_reader::validate_merge_library(bytes, lib_path)?;
+    crate::elf_reader::validate_merge_library(bytes, lib_path, arch)?;
     let elf = mapped.parse()?;
     let endian = elf.endian();
 
@@ -721,7 +740,7 @@ pub fn read_library_dynamic(lib_path: &Path) -> Result<LibraryDynamic> {
         rpath,
         runpath,
         ..
-    } = parse_dynamic(&elf, lib_path)?;
+    } = parse_dynamic(&elf, lib_path, arch)?;
 
     Ok(LibraryDynamic {
         defined,
@@ -929,7 +948,7 @@ pub fn find_jump_slot_reloc_offsets(
         .collect()
 }
 
-/// Find the file offsets of R_X86_64_COPY relocations in `.rela.dyn` whose symbol
+/// Find the file offsets of copy relocations in `.rela.dyn` whose symbol
 /// is provided by a fully-merged library. Returns the offset of each entry's
 /// `r_info` field so the patcher can zero the entry (turning it into
 /// R_X86_64_NONE). Copy relocations import an initial data value from a shared
@@ -941,9 +960,7 @@ pub fn find_copy_reloc_offsets(
     rela: &RelaTables,
     removed_provided_syms: &HashSet<String>,
 ) -> Vec<(u64, String)> {
-    use goblin::elf64::reloc::R_X86_64_COPY;
-
-    rela.dynamic_of_type(R_X86_64_COPY)
+    rela.dynamic_of_type(rela.arch.reloc.copy)
         .filter(|e| removed_provided_syms.contains(&e.symbol))
         .map(|e| (e.r_info_offset, e.symbol.clone()))
         .collect()
@@ -993,7 +1010,8 @@ mod library_dynamic_tests {
 
     #[test]
     fn a_real_library_yields_its_exports_and_dependencies() {
-        let lib = read_library_dynamic(Path::new(PCRE2)).expect("read libpcre2-8.so.0");
+        let lib = read_library_dynamic(Path::new(PCRE2), &crate::arch::X86_64)
+            .expect("read libpcre2-8.so.0");
         assert!(lib.defined.contains("pcre2_compile_8"), "exports");
         assert!(
             lib.needed.iter().any(|n| n.starts_with("libc.so")),
@@ -1008,7 +1026,8 @@ mod library_dynamic_tests {
     /// without them, and the exports read either way have to be the same.
     #[test]
     fn a_library_without_section_headers_yields_the_same_exports() {
-        let with_headers = read_library_dynamic(Path::new(PCRE2)).expect("read libpcre2-8.so.0");
+        let with_headers = read_library_dynamic(Path::new(PCRE2), &crate::arch::X86_64)
+            .expect("read libpcre2-8.so.0");
 
         let mut bytes = std::fs::read(PCRE2).expect("read libpcre2-8.so.0");
         bytes[0x28..0x30].fill(0); // e_shoff
@@ -1017,7 +1036,8 @@ mod library_dynamic_tests {
         let path = dir.path().join("libpcre2-8.so.0");
         std::fs::write(&path, &bytes).expect("write the stripped library");
 
-        let without = read_library_dynamic(&path).expect("read the stripped library");
+        let without =
+            read_library_dynamic(&path, &crate::arch::X86_64).expect("read the stripped library");
         assert!(without.defined.contains("pcre2_compile_8"), "exports");
         assert_eq!(without.defined, with_headers.defined);
         assert_eq!(without.needed, with_headers.needed);
@@ -1038,7 +1058,7 @@ mod library_dynamic_tests {
             let path = dir.path().join("libpcre2-8.so.0");
             std::fs::write(&path, &bytes).expect("write the doctored library");
 
-            let Err(e) = read_library_dynamic(&path) else {
+            let Err(e) = read_library_dynamic(&path, &crate::arch::X86_64) else {
                 panic!("{what}: a foreign library must be refused");
             };
             let err = format!("{e:#}");
@@ -1065,7 +1085,7 @@ mod rela_table_tests {
 
     fn tables(bytes: &[u8]) -> RelaTables {
         let elf = ElfFile64::<object::Endianness>::parse(bytes).expect("parse the test binary");
-        RelaTables::read(&elf).expect("read the .rela tables")
+        RelaTables::read(&elf, &crate::arch::X86_64).expect("read the .rela tables")
     }
 
     /// An entry reduced to everything anything downstream reads off it.
@@ -1184,7 +1204,7 @@ mod rela_table_tests {
         bytes[at..at + 8].copy_from_slice(&DT_REL.to_le_bytes());
 
         let elf = ElfFile64::<object::Endianness>::parse(&*bytes).expect("parse");
-        let Err(e) = RelaTables::read(&elf) else {
+        let Err(e) = RelaTables::read(&elf, &crate::arch::X86_64) else {
             panic!("a DT_REL jump-slot table must be refused");
         };
         let err = format!("{e:#}");
@@ -1246,18 +1266,20 @@ mod unresolvable_dependency_tests {
         let fixture = grep_needing_an_absent_library();
         let mapped = MappedElf::open(fixture.path()).expect("open the fixture");
         let exe = mapped.parse().expect("parse the fixture");
-        let dyn_info = parse_dynamic(&exe, fixture.path()).expect("parse .dynamic");
+        let dyn_info =
+            parse_dynamic(&exe, fixture.path(), &crate::arch::X86_64).expect("parse .dynamic");
         assert_eq!(
             dyn_info.needed,
             vec!["libpcre2-8.so.0".to_string(), ABSENT.to_string()],
             "the fixture should need one library that resolves and one that cannot"
         );
 
-        let rela = RelaTables::read(&exe).expect("read the fixture's .rela tables");
+        let rela =
+            RelaTables::read(&exe, &crate::arch::X86_64).expect("read the fixture's .rela tables");
         let libs = [PathBuf::from(LIBS)];
-        let cache = LdsoCache::load();
+        let cache = LdsoCache::load(&crate::arch::X86_64);
 
-        let search = LibrarySearch::new(&dyn_info, &libs, &cache);
+        let search = LibrarySearch::new(&dyn_info, &libs, &cache, &crate::arch::X86_64);
         let info = collect_imports(&exe, &rela, &search, None)
             .expect("an unresolvable dependency must not fail a merge nobody asked for");
         assert_eq!(
@@ -1283,13 +1305,15 @@ mod unresolvable_dependency_tests {
         let fixture = grep_needing_an_absent_library();
         let mapped = MappedElf::open(fixture.path()).expect("open the fixture");
         let exe = mapped.parse().expect("parse the fixture");
-        let dyn_info = parse_dynamic(&exe, fixture.path()).expect("parse .dynamic");
-        let rela = RelaTables::read(&exe).expect("read the fixture's .rela tables");
+        let dyn_info =
+            parse_dynamic(&exe, fixture.path(), &crate::arch::X86_64).expect("parse .dynamic");
+        let rela =
+            RelaTables::read(&exe, &crate::arch::X86_64).expect("read the fixture's .rela tables");
         let libs = [PathBuf::from(LIBS)];
-        let cache = LdsoCache::load();
+        let cache = LdsoCache::load(&crate::arch::X86_64);
 
         let filter = [ABSENT.to_string()];
-        let search = LibrarySearch::new(&dyn_info, &libs, &cache);
+        let search = LibrarySearch::new(&dyn_info, &libs, &cache, &crate::arch::X86_64);
         let Err(err) = collect_imports(&exe, &rela, &search, Some(&filter)) else {
             panic!("a library named with -m has to be merged or refused");
         };
@@ -1637,8 +1661,8 @@ mod library_search_tests {
     #[test]
     fn an_executables_entry_resolves_through_solders_own_directories() {
         let exe = exe_without_a_search_path();
-        let cache = LdsoCache::load();
-        let search = LibrarySearch::new(&exe, &[PathBuf::from(LIBS)], &cache);
+        let cache = LdsoCache::load(&crate::arch::X86_64);
+        let search = LibrarySearch::new(&exe, &[PathBuf::from(LIBS)], &cache, &crate::arch::X86_64);
 
         assert_eq!(search.exe_needed(), [TINFO.to_owned()]);
         let (path, lib) = search.read(TINFO).expect("-L should resolve the fixture");
@@ -1659,8 +1683,8 @@ mod library_search_tests {
         std::fs::copy(Path::new(LIBS).join(TINFO), &bundled).expect("bundle a copy");
 
         let exe = exe_without_a_search_path();
-        let cache = LdsoCache::load();
-        let search = LibrarySearch::new(&exe, &[PathBuf::from(LIBS)], &cache);
+        let cache = LdsoCache::load(&crate::arch::X86_64);
+        let search = LibrarySearch::new(&exe, &[PathBuf::from(LIBS)], &cache, &crate::arch::X86_64);
         let declarer = lib_with_rpath(dir.path());
 
         let (path, _) = search
@@ -1867,11 +1891,17 @@ mod unprovided_import_tests {
     fn still_imported(lib_dir: &Path) -> BTreeSet<String> {
         let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
         let exe = mapped.parse().expect("parse test/grep");
-        let dyn_info = parse_dynamic(&exe, Path::new(GREP)).expect("parse .dynamic");
-        let rela = RelaTables::read(&exe).expect("read .rela tables");
+        let dyn_info =
+            parse_dynamic(&exe, Path::new(GREP), &crate::arch::X86_64).expect("parse .dynamic");
+        let rela = RelaTables::read(&exe, &crate::arch::X86_64).expect("read .rela tables");
 
-        let cache = LdsoCache::load();
-        let search = LibrarySearch::new(&dyn_info, &[lib_dir.to_path_buf()], &cache);
+        let cache = LdsoCache::load(&crate::arch::X86_64);
+        let search = LibrarySearch::new(
+            &dyn_info,
+            &[lib_dir.to_path_buf()],
+            &cache,
+            &crate::arch::X86_64,
+        );
         let info = collect_imports(&exe, &rela, &search, None).expect("collect imports");
 
         let merged: HashSet<String> = info.imports.iter().map(|i| i.name.clone()).collect();
