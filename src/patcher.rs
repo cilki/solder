@@ -131,12 +131,11 @@ fn remove_dt_needed(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
 fn ensure_bind_now(bytes: &mut [u8]) -> Result<()> {
     use goblin::elf::dynamic::{DF_1_NOW, DF_BIND_NOW, DT_BIND_NOW, DT_FLAGS, DT_FLAGS_1};
 
-    let dynamic = DynamicTable::parse(bytes).context("reading .dynamic for BIND_NOW")?;
+    let mut dynamic = DynamicTable::parse(bytes).context("reading .dynamic for BIND_NOW")?;
 
+    let flags = dynamic.value_of(DT_FLAGS).unwrap_or(0);
     let already_now = dynamic.value_of(DT_BIND_NOW).is_some()
-        || dynamic
-            .value_of(DT_FLAGS)
-            .is_some_and(|flags| flags & DF_BIND_NOW != 0)
+        || flags & DF_BIND_NOW != 0
         || dynamic
             .value_of(DT_FLAGS_1)
             .is_some_and(|flags| flags & DF_1_NOW != 0);
@@ -144,34 +143,10 @@ fn ensure_bind_now(bytes: &mut [u8]) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(idx) = dynamic.index_of(DT_FLAGS) {
-        // OR DF_BIND_NOW into the existing DT_FLAGS entry.
-        let at = dynamic.value_offset(idx);
-        let current = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
-        bytes[at..at + 8].copy_from_slice(&(current | DF_BIND_NOW).to_le_bytes());
-        return Ok(());
-    }
-
-    // Append a new DT_FLAGS entry over the DT_NULL terminator; the slot after
-    // it becomes the new terminator, so PT_DYNAMIC needs one spare slot.
-    let terminator = dynamic.used();
-    if terminator + 1 >= dynamic.capacity() {
-        bail!(
-            "no room in PT_DYNAMIC to add DT_FLAGS=DF_BIND_NOW entry \
-             ({} slots, {terminator} used)",
-            dynamic.capacity()
-        );
-    }
-
-    let at = dynamic.entry_offset(terminator);
-    bytes[at..at + 8].copy_from_slice(&DT_FLAGS.to_le_bytes());
-    bytes[at + 8..at + 16].copy_from_slice(&DF_BIND_NOW.to_le_bytes());
-    // Zeroing the following slot makes it the new DT_NULL terminator; slots
-    // past the old one may hold garbage.
-    let next = dynamic.entry_offset(terminator + 1);
-    bytes[next..next + DYN_ENTRY_SIZE].fill(0);
-
-    Ok(())
+    // OR DF_BIND_NOW into DT_FLAGS, adding the entry if there is none.
+    dynamic
+        .set_or_append(bytes, DT_FLAGS, flags | DF_BIND_NOW)
+        .context("adding DT_FLAGS=DF_BIND_NOW")
 }
 
 /// The `GNU_PROPERTY_X86_FEATURE_1_*` bits, for naming the ones being dropped.
@@ -479,10 +454,7 @@ fn remove_verneed_entries(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     }
 
     // Update DT_VERNEEDNUM to the number of surviving entries.
-    if let Some(idx) = dynamic.index_of(DT_VERNEEDNUM) {
-        let at = dynamic.value_offset(idx);
-        bytes[at..at + 8].copy_from_slice(&(kept_count as u64).to_le_bytes());
-    }
+    dynamic.set_value(bytes, DT_VERNEEDNUM, kept_count as u64);
 
     // The symbols that required those versions came from the merged-away
     // library, so they are undefined and unreferenced now: every relocation

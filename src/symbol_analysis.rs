@@ -1193,15 +1193,11 @@ mod rela_table_tests {
         use goblin::elf::dynamic::{DT_PLTREL, DT_REL};
 
         let mut bytes = read_test_binary("grep");
-        let at = {
-            let dynamic = DynamicTable::parse(&bytes).expect("parse .dynamic");
-            dynamic.value_offset(
-                dynamic
-                    .index_of(DT_PLTREL)
-                    .expect("test/grep has DT_PLTREL"),
-            )
-        };
-        bytes[at..at + 8].copy_from_slice(&DT_REL.to_le_bytes());
+        let dynamic = DynamicTable::parse(&bytes).expect("parse .dynamic");
+        assert!(
+            dynamic.set_value(&mut bytes, DT_PLTREL, DT_REL),
+            "test/grep has DT_PLTREL"
+        );
 
         let elf = ElfFile64::<object::Endianness>::parse(&*bytes).expect("parse");
         let Err(e) = RelaTables::read(&elf, &crate::arch::X86_64) else {

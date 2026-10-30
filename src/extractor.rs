@@ -3540,12 +3540,10 @@ mod tests {
         // named in `.dynamic` can be unreadable without the file being
         // malformed anywhere else.
         let dynamic = DynamicTable::parse(&bytes).expect(".dynamic");
-        let at = dynamic.value_offset(
-            dynamic
-                .index_of(object::elf::DT_RELR.0 as u64)
-                .expect("DT_RELR"),
+        assert!(
+            dynamic.set_value(&mut bytes, object::elf::DT_RELR.0 as u64, 0xdead_0000),
+            "DT_RELR"
         );
-        bytes[at..at + 8].copy_from_slice(&0xdead_0000u64.to_le_bytes());
 
         let lib = tempfile::Builder::new()
             .suffix(".so.6")

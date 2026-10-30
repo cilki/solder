@@ -113,7 +113,7 @@ pub fn write_output(
     let endian = exe.endian();
 
     // Read .dynamic from the ORIGINAL exe before we modify headers.
-    let dynamic = DynamicTable::parse(patched_exe).context("reading .dynamic for output")?;
+    let mut dynamic = DynamicTable::parse(patched_exe).context("reading .dynamic for output")?;
 
     // The existing program headers, as the parsed entries and as the bytes
     // they were parsed from — both are wanted below, and `bytes_of_slice` is
@@ -266,7 +266,7 @@ pub fn write_output(
     // Point DT_PREINIT_ARRAY/DT_FINI_ARRAY at our arrays and add a DT_NEEDED
     // entry per inherited soname.
     if plan.init_fini.is_some() || !plan.add_needed.is_empty() {
-        update_dynamic_entries(&mut out, plan, &dynamic, &ext_info)?;
+        update_dynamic_entries(&mut out, plan, &mut dynamic, &ext_info)?;
     }
 
     // Everything above describes the merge to the dynamic loader, which reads
@@ -1028,9 +1028,7 @@ fn pad_to(buf: &mut Vec<u8>, alignment: usize) {
 /// Write any updated DT_* d_val fields back into the in-memory .dynamic image.
 fn apply_extension_info(out: &mut [u8], dynamic: &DynamicTable, ext: &ExtensionInfo) {
     for &(tag, val) in &ext.dyn_updates {
-        if let Some(idx) = dynamic.index_of(tag) {
-            write_u64_le(out, dynamic.value_offset(idx), val);
-        }
+        dynamic.set_value(out, tag, val);
     }
 }
 
@@ -1045,41 +1043,10 @@ fn apply_extension_info(out: &mut [u8], dynamic: &DynamicTable, ext: &ExtensionI
 fn update_dynamic_entries(
     out: &mut [u8],
     plan: &MergePlan,
-    dynamic: &DynamicTable,
+    dynamic: &mut DynamicTable,
     ext: &ExtensionInfo,
 ) -> Result<()> {
-    use goblin::elf::dynamic::{DT_NEEDED, DT_NULL};
-
-    // New entries are appended at the DT_NULL terminator, pushing it down.
-    // The last slot must stay DT_NULL so ld.so's scan terminates.
-    let mut next_free = dynamic.used();
-
-    let write_dyn_entry = |out: &mut [u8], idx: usize, tag: u64, val: u64| {
-        write_u64_le(out, dynamic.entry_offset(idx), tag);
-        write_u64_le(out, dynamic.value_offset(idx), val);
-    };
-
-    // Update the existing entry for `tag`, or append a new one at the
-    // terminator. `force_new` is for DT_NEEDED, which repeats rather than
-    // being overwritten.
-    let mut set_dyn_entry = |out: &mut [u8], tag: u64, val: u64, force_new: bool| -> Result<()> {
-        match dynamic.index_of(tag).filter(|_| !force_new) {
-            Some(idx) => write_u64_le(out, dynamic.value_offset(idx), val),
-            None if next_free + 1 < dynamic.capacity() => {
-                write_dyn_entry(out, next_free, tag, val);
-                next_free += 1;
-                // Re-terminate (slots after the old terminator may be garbage).
-                write_dyn_entry(out, next_free, DT_NULL, 0);
-            }
-            None => bail!(
-                ".dynamic has no spare capacity to append dynamic tag {tag:#x} \
-                 ({} slots, {} used)",
-                dynamic.capacity(),
-                dynamic.used()
-            ),
-        }
-        Ok(())
-    };
+    use goblin::elf::dynamic::DT_NEEDED;
 
     // Point each rebuilt array's DT_* pair at the merged copy, creating the
     // pair if the executable did not have one (a binary with no constructors
@@ -1090,8 +1057,8 @@ fn update_dynamic_entries(
                 continue;
             }
             let (array_tag, size_tag) = kind.dynamic_tags();
-            set_dyn_entry(out, array_tag, array.vaddr, false)?;
-            set_dyn_entry(out, size_tag, array.size(), false)?;
+            dynamic.set_or_append(out, array_tag, array.vaddr)?;
+            dynamic.set_or_append(out, size_tag, array.size())?;
         }
     }
 
@@ -1107,9 +1074,11 @@ fn update_dynamic_entries(
             );
         }
         for (soname, &name_offset) in plan.add_needed.iter().zip(&ext.needed_name_offsets) {
-            set_dyn_entry(out, DT_NEEDED, name_offset as u64, true).with_context(|| {
-                format!("adding DT_NEEDED '{soname}' inherited from a merged library")
-            })?;
+            dynamic
+                .append(out, DT_NEEDED, name_offset as u64)
+                .with_context(|| {
+                    format!("adding DT_NEEDED '{soname}' inherited from a merged library")
+                })?;
         }
     }
 

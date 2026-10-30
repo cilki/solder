@@ -788,6 +788,48 @@ impl DynamicTable {
         self.entry_offset(index) + 8
     }
 
+    /// Overwrite the `d_val` of the first entry tagged `tag` in `bytes`, the
+    /// image this table was parsed from. Returns whether there was one.
+    pub fn set_value(&self, bytes: &mut [u8], tag: u64, val: u64) -> bool {
+        let Some(idx) = self.index_of(tag) else {
+            return false;
+        };
+        let at = self.value_offset(idx);
+        bytes[at..at + 8].copy_from_slice(&val.to_le_bytes());
+        true
+    }
+
+    /// Overwrite the `d_val` of the entry tagged `tag`, or append one if the
+    /// table has none.
+    pub fn set_or_append(&mut self, bytes: &mut [u8], tag: u64, val: u64) -> Result<()> {
+        if self.set_value(bytes, tag, val) {
+            return Ok(());
+        }
+        self.append(bytes, tag, val)
+    }
+
+    /// Append `(tag, val)` to the table in `bytes`, over the `DT_NULL`
+    /// terminator, which moves down into the next slot. That slot has to be
+    /// zeroed rather than assumed to be: the spare ones past the old
+    /// terminator are not guaranteed to be. So appending needs a spare slot
+    /// beyond the one the entry takes.
+    pub fn append(&mut self, bytes: &mut [u8], tag: u64, val: u64) -> Result<()> {
+        let idx = self.used();
+        if idx + 1 >= self.capacity {
+            bail!(
+                "no room in PT_DYNAMIC to append dynamic tag {tag:#x} ({} slots, {idx} used)",
+                self.capacity
+            );
+        }
+        let at = self.entry_offset(idx);
+        bytes[at..at + 8].copy_from_slice(&tag.to_le_bytes());
+        bytes[at + 8..at + 16].copy_from_slice(&val.to_le_bytes());
+        let next = self.entry_offset(idx + 1);
+        bytes[next..next + DYN_ENTRY_SIZE].fill(0);
+        self.entries.push((tag, val));
+        Ok(())
+    }
+
     /// The `.dynstr` string at `d_val`, for the tags whose value is a string
     /// table index (`DT_NEEDED`, `DT_RPATH`, `DT_RUNPATH`, `DT_SONAME`).
     pub fn string_at<'b>(&self, bytes: &'b [u8], d_val: u64) -> Option<&'b str> {
@@ -1237,26 +1279,12 @@ mod merge_library_tests {
     /// itself, so this is how a malformed one arrives.
     fn with_relr_tags(name: &str, table_va: u64, size: u64) -> Vec<u8> {
         let mut bytes = read_test_lib(name);
-        let dynamic = DynamicTable::parse(&bytes).expect(".dynamic of a test library");
-        let at = dynamic.used();
-        assert!(
-            at + 3 <= dynamic.capacity(),
-            "{name}: {} spare .dynamic slots, need 3",
-            dynamic.capacity() - at
-        );
-
-        for (i, (tag, val)) in [(DT_RELR, table_va), (DT_RELRSZ, size)]
-            .into_iter()
-            .enumerate()
-        {
-            let o = dynamic.entry_offset(at + i);
-            bytes[o..o + 8].copy_from_slice(&tag.to_le_bytes());
-            bytes[o + 8..o + 16].copy_from_slice(&val.to_le_bytes());
+        let mut dynamic = DynamicTable::parse(&bytes).expect(".dynamic of a test library");
+        for (tag, val) in [(DT_RELR, table_va), (DT_RELRSZ, size)] {
+            dynamic
+                .append(&mut bytes, tag, val)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
-        // The slot after the two becomes the new DT_NULL terminator; the ones
-        // past the old terminator are not guaranteed to be zeroed.
-        let end = dynamic.entry_offset(at + 2);
-        bytes[end..end + DYN_ENTRY_SIZE].fill(0);
         bytes
     }
 
@@ -1441,38 +1469,23 @@ pub(crate) mod relr_packing {
         out[stream_at + stream_bytes..rela_at + rela_size].fill(0);
         out[shdr_at + SH_SIZE..][..8].copy_from_slice(&(kept.len() as u64).to_le_bytes());
 
-        let dynamic = DynamicTable::parse(bytes).expect(".dynamic of a test library");
-        let mut set = |tag: u64, val: u64| {
-            if let Some(i) = dynamic.index_of(tag) {
-                out[dynamic.value_offset(i)..][..8].copy_from_slice(&val.to_le_bytes());
-            }
-        };
-        set(object::elf::DT_RELASZ.0 as u64, kept.len() as u64);
+        let mut dynamic = DynamicTable::parse(bytes).expect(".dynamic of a test library");
+        dynamic.set_value(&mut out, object::elf::DT_RELASZ.0 as u64, kept.len() as u64);
         // `DT_RELACOUNT` counts the relative entries `.rela.dyn` opens with,
         // and there are none left.
-        set(object::elf::DT_RELACOUNT.0 as u64, 0);
+        dynamic.set_value(&mut out, object::elf::DT_RELACOUNT.0 as u64, 0);
 
         // The `DT_RELR*` tags go over the spare slots the linker leaves past
-        // `DT_NULL`, with one more for the terminator that moves past them.
-        let tags = [
+        // `DT_NULL`.
+        for (tag, val) in [
             (DT_RELR, rela.addr + kept.len() as u64),
             (DT_RELRSZ, stream_bytes as u64),
             (object::elf::DT_RELRENT.0 as u64, RELR_ENTRY_SIZE),
-        ];
-        let at = dynamic.used();
-        assert!(
-            at + tags.len() < dynamic.capacity(),
-            "{} spare .dynamic slots, need {}",
-            dynamic.capacity() - at,
-            tags.len() + 1
-        );
-        for (i, (tag, val)) in tags.into_iter().enumerate() {
-            let o = dynamic.entry_offset(at + i);
-            out[o..o + 8].copy_from_slice(&tag.to_le_bytes());
-            out[o + 8..o + 16].copy_from_slice(&val.to_le_bytes());
+        ] {
+            dynamic
+                .append(&mut out, tag, val)
+                .expect("a spare .dynamic slot");
         }
-        let end = dynamic.entry_offset(at + tags.len());
-        out[end..end + DYN_ENTRY_SIZE].fill(0);
 
         (out, packed)
     }
@@ -1705,6 +1718,42 @@ mod dynamic_table_tests {
                 table.used()
             );
         }
+    }
+
+    /// `append` fills the spare slots past `DT_NULL`, which the linker does not
+    /// promise to have zeroed, so each entry it writes has to leave a fresh
+    /// terminator behind it; and the last slot has to stay that terminator, so
+    /// an append that would take it is refused.
+    #[test]
+    fn append_keeps_the_table_terminated_and_refuses_the_last_slot() {
+        use goblin::elf::dynamic::{DT_DEBUG, DT_NULL};
+
+        let mut bytes = read_test_binary("grep");
+        let mut table = DynamicTable::parse(&bytes).expect("parse .dynamic");
+        let (used, capacity) = (table.used(), table.capacity());
+        assert!(capacity > used + 1, "no spare slot to append into");
+        // Garbage in every spare slot, so a terminator only exists if written.
+        let spare = table.entry_offset(used + 1)..table.entry_offset(capacity);
+        bytes[spare].fill(0xa5);
+
+        for i in 0..capacity - used - 1 {
+            table
+                .append(&mut bytes, DT_DEBUG, i as u64)
+                .expect("a spare slot");
+            let reparsed = DynamicTable::parse(&bytes).expect("reparse .dynamic");
+            assert_eq!(reparsed.used(), used + i + 1);
+            assert_eq!(reparsed.values_of(DT_DEBUG).last(), Some(i as u64));
+        }
+
+        let err = table
+            .append(&mut bytes, DT_DEBUG, 0)
+            .expect_err("the last slot is the terminator's");
+        assert!(format!("{err}").contains("no room"), "{err}");
+        let last = table.entry_offset(capacity - 1);
+        assert_eq!(
+            u64::from_le_bytes(bytes[last..last + 8].try_into().unwrap()),
+            DT_NULL
+        );
     }
 
     #[test]
