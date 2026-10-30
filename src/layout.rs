@@ -214,7 +214,7 @@ pub fn plan_layout(
         });
     }
 
-    // Jump-slot reloc offsets are populated by the caller (patcher.rs), so leave empty here.
+    // The relocations to neutralize are chosen by the caller, so leave them empty here.
     // Relative relocs are populated during segment building (trampolines) and patching (GOT).
     Ok(MergePlan {
         is_pie,
@@ -225,8 +225,7 @@ pub fn plan_layout(
         units,
         trampoline_stubs,
         got_patches,
-        jump_slot_reloc_offsets: Vec::new(),
-        copy_reloc_offsets: Vec::new(),
+        neutralized_relocs: Vec::new(),
         // Which DT_NEEDED entries go and which arrive is decided by the
         // caller: it holds the soname → library mapping `collect_imports`
         // resolved, and the injected symbol set.

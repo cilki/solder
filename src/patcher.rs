@@ -11,7 +11,8 @@ use crate::types::{MergePlan, RelativeReloc};
 
 /// Apply all in-place patches to a mutable copy of the executable bytes:
 ///   1. Pre-fill GOT entries with resolved merged symbol addresses.
-///   2. Zero out JUMP_SLOT relocation entries so ld.so won't overwrite our patches.
+///   2. Zero out the JUMP_SLOT/GLOB_DAT entries of merged symbols, so ld.so
+///      won't overwrite our patches, and the COPY entries of merged-away data.
 ///   3. Remove DT_NEEDED entries for fully-merged libraries.
 ///   4. Remove version requirements (.gnu.version_r) for fully-merged libraries.
 ///   5. Force eager binding so the loader processes the zeroed (R_X86_64_NONE)
@@ -23,8 +24,7 @@ use crate::types::{MergePlan, RelativeReloc};
 /// for the patched GOT slots that need R_X86_64_RELATIVE relocations.
 pub fn apply_patches(exe_bytes: &mut [u8], plan: &mut MergePlan) -> Result<()> {
     patch_got(exe_bytes, plan)?;
-    zero_jump_slot_relocs(exe_bytes, plan)?;
-    zero_copy_relocs(exe_bytes, plan)?;
+    neutralize_relocs(exe_bytes, plan)?;
     remove_dt_needed(exe_bytes, plan)?;
     remove_verneed_entries(exe_bytes, plan)?;
     ensure_bind_now(exe_bytes)?;
@@ -57,32 +57,16 @@ fn patch_got(bytes: &mut [u8], plan: &mut MergePlan) -> Result<()> {
     Ok(())
 }
 
-/// Zero out r_info and r_addend for JUMP_SLOT relocations of merged symbols,
-/// so ld.so won't re-resolve them and overwrite our GOT entries.
-/// Each reloc entry file offset points to the r_info field (8 bytes into the entry).
-/// We zero both r_info (8 bytes) and r_addend (8 bytes) = 16 bytes total.
-fn zero_jump_slot_relocs(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
-    for &off in &plan.jump_slot_reloc_offsets {
-        let off = off as usize;
-        if off + 16 > bytes.len() {
-            bail!("JUMP_SLOT reloc offset 0x{:x} out of bounds", off);
-        }
-        bytes[off..off + 16].fill(0);
-    }
-    Ok(())
-}
-
-/// Zero out r_info and r_addend for R_X86_64_COPY relocations whose symbol was
-/// provided by a merged-away library, turning each into R_X86_64_NONE so ld.so
-/// skips it instead of failing to resolve the now-absent symbol. Each offset
-/// points to the entry's r_info field.
-fn zero_copy_relocs(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
-    for &off in &plan.copy_reloc_offsets {
-        let off = off as usize;
-        if off + 16 > bytes.len() {
-            bail!("COPY reloc offset 0x{:x} out of bounds", off);
-        }
-        bytes[off..off + 16].fill(0);
+/// Turn every relocation in `plan.neutralized_relocs` into R_X86_64_NONE, so
+/// ld.so skips it. Each offset points to the entry's r_info field (8 bytes
+/// into the entry); r_info and r_addend (8 bytes each) are zeroed together.
+fn neutralize_relocs(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
+    for &off in &plan.neutralized_relocs {
+        let field = (off as usize)
+            .checked_add(16)
+            .and_then(|end| bytes.get_mut(off as usize..end))
+            .with_context(|| format!("relocation r_info offset 0x{off:x} out of bounds"))?;
+        field.fill(0);
     }
     Ok(())
 }
@@ -135,7 +119,7 @@ fn remove_dt_needed(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
 /// Force eager symbol binding on the modified executable by ensuring a
 /// `DF_BIND_NOW` flag (or equivalent) is set in the dynamic section.
 ///
-/// Why this matters: `zero_jump_slot_relocs` rewrites the PLT relocations for
+/// Why this matters: `neutralize_relocs` rewrites the PLT relocations for
 /// merged symbols as `R_X86_64_NONE` (r_info = 0). Some glibc versions reject
 /// `R_X86_64_NONE` in the lazy PLT path (`elf_machine_lazy_rel`) and fail with
 /// "unexpected PLT reloc type 0x00". The eager path (`elf_machine_rela`) always
@@ -963,8 +947,7 @@ mod verneed_tests {
             units: Vec::new(),
             trampoline_stubs: Vec::new(),
             got_patches: Vec::new(),
-            jump_slot_reloc_offsets: Vec::new(),
-            copy_reloc_offsets: Vec::new(),
+            neutralized_relocs: Vec::new(),
             remove_needed: vec![soname.to_owned()],
             add_needed: Vec::new(),
             relative_relocs: Vec::new(),
@@ -1265,8 +1248,7 @@ mod gnu_property_tests {
             }],
             trampoline_stubs: Vec::new(),
             got_patches: Vec::new(),
-            jump_slot_reloc_offsets: Vec::new(),
-            copy_reloc_offsets: Vec::new(),
+            neutralized_relocs: Vec::new(),
             remove_needed: Vec::new(),
             add_needed: Vec::new(),
             relative_relocs: Vec::new(),

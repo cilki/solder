@@ -343,8 +343,7 @@ fn run() -> Result<()> {
 
     // ── Step 5: patch executable in-place (GOT, JUMP_SLOTs, DT_NEEDED) ───────
     // Find JUMP_SLOT reloc file offsets for the merged symbols.
-    plan.jump_slot_reloc_offsets =
-        symbol_analysis::find_jump_slot_reloc_offsets(&rela, &merged_names);
+    plan.neutralized_relocs = symbol_analysis::find_jump_slot_reloc_offsets(&rela, &merged_names);
 
     // Neutralize copy relocations for data symbols exported by a library we are
     // removing (e.g. ncurses' UP/PC/BC). Only symbols a library we are dropping
@@ -368,7 +367,7 @@ fn run() -> Result<()> {
                 lib.display()
             );
         }
-        plan.copy_reloc_offsets.push(off);
+        plan.neutralized_relocs.push(off);
     }
 
     let mut patched_exe = exe_mapped.bytes().to_vec();
@@ -689,8 +688,7 @@ mod dry_run_report_tests {
             units: Vec::new(),
             trampoline_stubs: Vec::new(),
             got_patches: Vec::new(),
-            jump_slot_reloc_offsets: Vec::new(),
-            copy_reloc_offsets: Vec::new(),
+            neutralized_relocs: Vec::new(),
             remove_needed: Vec::new(),
             add_needed: Vec::new(),
             relative_relocs: Vec::new(),

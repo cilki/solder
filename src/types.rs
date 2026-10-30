@@ -469,12 +469,15 @@ pub struct MergePlan {
     pub trampoline_stubs: Vec<TrampolineStub>,
     /// GOT entries in the executable to patch with merged symbol addresses.
     pub got_patches: Vec<GotPatch>,
-    /// JUMP_SLOT relocation file offsets to zero out (r_info + r_addend fields).
-    pub jump_slot_reloc_offsets: Vec<u64>,
-    /// R_X86_64_COPY relocation file offsets to zero out. Copy relocations for
-    /// data symbols provided by a fully-merged library (e.g. ncurses' UP/PC/BC)
-    /// must be neutralized, or ld.so fails to resolve the now-absent symbol.
-    pub copy_reloc_offsets: Vec<u64>,
+    /// File offsets of the `r_info` fields of the executable's relocations to
+    /// turn into R_X86_64_NONE (r_info and r_addend zeroed):
+    ///
+    ///   * the JUMP_SLOTs and GLOB_DATs of merged symbols, so ld.so does not
+    ///     re-resolve them and overwrite the GOT slots the merge pre-filled;
+    ///   * the R_X86_64_COPYs of data symbols a fully-merged library provided
+    ///     (e.g. ncurses' UP/PC/BC), or ld.so fails to resolve the now-absent
+    ///     symbol.
+    pub neutralized_relocs: Vec<u64>,
     /// DT_NEEDED string values to remove from the dynamic section.
     pub remove_needed: Vec<String>,
     /// Sonames to add to DT_NEEDED: dependencies of the merged-away libraries
