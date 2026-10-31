@@ -1079,6 +1079,9 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
     // in stripped libraries), it overwrites the never-executed inter-function
     // alignment padding that follows the branch instead.
     let mut bytes = bytes;
+    if is_aarch64 {
+        veneer_aarch64_short_branches(&mut bytes, &mut relocs.relocations, &key.sym)?;
+    }
     for reloc in relocs.relocations.iter_mut() {
         if reloc.size != 8 {
             continue;
@@ -1122,6 +1125,72 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
         relocations,
     });
 
+    Ok(())
+}
+
+/// Send each aarch64 short-range branch that leaves its unit through a `b`
+/// veneer appended to the unit, the aarch64 counterpart of the x86-64 rel8
+/// veneers in [`process_symbol`].
+///
+/// A `b.cond`, `cbz` or `tbz` reaches ±1 MiB or ±32 KiB, and nothing keeps its
+/// target that close once the merge has placed the units: the library had it
+/// nearby, the merged segment may not, and the relocator could then only
+/// refuse the merge. A linker in the same position cannot help either, since
+/// AAELF64 only lets it insert veneers for `b`/`bl`. So the branch is pointed
+/// at a `b` at the end of its own unit, which moves with it and so never goes
+/// out of reach, and the relocation moves to that `b`, whose ±128 MiB covers
+/// any merged segment. Compilers do not branch conditionally into another
+/// function, but hand-written assembly (glibc's string functions, OpenSSL's
+/// primitives) does.
+///
+/// A branch inside its own unit carries no relocation (see
+/// [`CodeRef::moves_with_its_unit`]) and is left alone.
+fn veneer_aarch64_short_branches(
+    bytes: &mut Vec<u8>,
+    relocations: &mut [ExtractedReloc],
+    sym: &str,
+) -> Result<()> {
+    use aarch64::{Field, INSN_LEN};
+
+    for reloc in relocations.iter_mut() {
+        let Some(insn) = reloc.insn.as_mut() else {
+            continue;
+        };
+        if !matches!(insn.field, Field::Imm19 | Field::Imm14) {
+            continue;
+        }
+        let at = reloc.offset_within_unit as usize;
+        let word = u32::from_le_bytes(
+            bytes[at..at + INSN_LEN]
+                .try_into()
+                .expect("an instruction word"),
+        );
+        if !aarch64::is_short_branch(word) {
+            continue;
+        }
+
+        // A unit may stop short of a word boundary when a symbol's size
+        // does; the bytes in between are never executed.
+        bytes.resize(bytes.len().next_multiple_of(INSN_LEN), 0);
+        let veneer = bytes.len();
+        bytes.extend_from_slice(&aarch64::VENEER.to_le_bytes());
+
+        let branch = insn
+            .field
+            .patch(word, veneer as u64, 0, at as u64)
+            .with_context(|| {
+                format!(
+                    "branch at offset {at:#x} in '{sym}' cannot reach a veneer at the \
+                     end of the unit"
+                )
+            })?;
+        bytes[at..at + INSN_LEN].copy_from_slice(&branch.to_le_bytes());
+
+        // The target and addend stay as they were: an aarch64 field's addend
+        // is the offset into the target, with no width folded in.
+        reloc.offset_within_unit = veneer as u64;
+        insn.field = Field::Imm26;
+    }
     Ok(())
 }
 
@@ -5866,9 +5935,8 @@ mod tests {
         ))
     }
 
-    /// Extract `seed` and everything it reaches from the aarch64 fixture,
-    /// with each unit's relocations spelled out as `offset field -> target`.
-    fn extract_aarch64(seed: &str) -> BTreeMap<String, Vec<String>> {
+    /// Extract `seed` and everything it reaches from the aarch64 fixture.
+    fn extract_aarch64_units(seed: &str) -> Vec<ExtractedUnit> {
         let mut state = test_state();
         state.arch = &crate::arch::AARCH64;
         let key = key_in(&mut state, &aarch64_lib(), seed);
@@ -5877,10 +5945,16 @@ mod tests {
             process_symbol(&key, id, &mut state)
                 .unwrap_or_else(|e| panic!("extract '{}': {e:#}", key.sym));
         }
+        state.units
+    }
+
+    /// [`extract_aarch64_units`], with each unit's relocations spelled out as
+    /// `offset field -> target`.
+    fn extract_aarch64(seed: &str) -> BTreeMap<String, Vec<String>> {
+        let units = extract_aarch64_units(seed);
         let name_of: BTreeMap<u32, String> =
-            state.units.iter().map(|u| (u.id.0, u.name.clone())).collect();
-        state
-            .units
+            units.iter().map(|u| (u.id.0, u.name.clone())).collect();
+        units
             .iter()
             .map(|u| {
                 let relocs = u
@@ -5958,5 +6032,121 @@ mod tests {
                 "0x14 Imm26[] -> extern puts+0",
             ]
         );
+    }
+
+    /// `clamp`'s three conditional branches into other functions are each
+    /// sent through a `b` appended to the unit, and it is the `b` that is
+    /// relocated:
+    ///
+    /// ```text
+    /// 0x0: tbnz w0, #31, clamp_zero
+    /// 0x4: cbz  w0, clamp_zero
+    /// 0xc: b.gt clamp_hundred
+    /// ```
+    #[test]
+    fn an_aarch64_short_branch_out_of_its_unit_goes_through_a_veneer() {
+        let units = extract_aarch64("clamp");
+        assert_eq!(
+            units["clamp"],
+            [
+                "0x14 Imm26[] -> clamp_zero+0",
+                "0x18 Imm26[] -> clamp_zero+0",
+                "0x1c Imm26[] -> clamp_hundred+0",
+            ]
+        );
+    }
+
+    /// Placed 64 MiB from its targets, far past what `tbnz` (±32 KiB) or
+    /// `cbz`/`b.cond` (±1 MiB) reach, each of `clamp`'s branches still
+    /// arrives where it did in the library, by way of its veneer.
+    #[test]
+    fn an_aarch64_short_branch_reaches_its_target_from_anywhere_through_its_veneer() {
+        use aarch64::{INSN_LEN, pc_relative_ref};
+
+        let units = extract_aarch64_units("clamp");
+        let vaddr_of = |name: &str| match name {
+            "clamp" => 0x4000_0000u64,
+            "clamp_zero" => 0x4400_0000,
+            "clamp_hundred" => 0x4400_0008,
+            other => panic!("unexpected unit '{other}'"),
+        };
+        let mut clamp = units
+            .iter()
+            .find(|u| u.name == "clamp")
+            .expect("clamp extracted")
+            .clone();
+        let base = vaddr_of("clamp");
+        for reloc in &clamp.relocations {
+            let RelocTarget::MergedUnit(id) = reloc.target else {
+                panic!("{reloc:?} is not to a merged unit");
+            };
+            let target = &units.iter().find(|u| u.id == id).expect("target").name;
+            let at = reloc.offset_within_unit as usize;
+            let word = u32::from_le_bytes(clamp.bytes[at..at + INSN_LEN].try_into().unwrap());
+            let field = reloc.insn.as_ref().expect("an instruction field").field;
+            let patched = field
+                .patch(word, vaddr_of(target), reloc.addend, base + at as u64)
+                .expect("a b reaches 64 MiB");
+            clamp.bytes[at..at + INSN_LEN].copy_from_slice(&patched.to_le_bytes());
+        }
+
+        let word_at = |vaddr: u64| {
+            let at = (vaddr - base) as usize;
+            u32::from_le_bytes(clamp.bytes[at..at + INSN_LEN].try_into().unwrap())
+        };
+        let follow = |vaddr: u64| {
+            pc_relative_ref(word_at(vaddr), vaddr)
+                .unwrap()
+                .expect("a branch")
+                .target
+        };
+        for (branch, target) in [
+            (0x0, "clamp_zero"),
+            (0x4, "clamp_zero"),
+            (0xc, "clamp_hundred"),
+        ] {
+            let veneer = follow(base + branch);
+            assert!(
+                veneer >= base + 0x14 && veneer < base + clamp.bytes.len() as u64,
+                "the branch at {branch:#x} leaves the unit for {veneer:#x}"
+            );
+            assert_eq!(
+                word_at(veneer) & 0xfc00_0000,
+                aarch64::VENEER,
+                "a b at {veneer:#x}"
+            );
+            assert_eq!(follow(veneer), vaddr_of(target), "branch at {branch:#x}");
+        }
+    }
+
+    /// A veneer that the branch itself cannot reach, as for a `tbz` near the
+    /// start of a unit longer than 32 KiB, is refused rather than written
+    /// wrong.
+    #[test]
+    fn a_veneer_out_of_the_short_branchs_reach_is_an_error() {
+        use crate::types::InsnField;
+
+        const TBNZ_W0_31: u32 = 0x37f8_0000;
+        let mut bytes = TBNZ_W0_31.to_le_bytes().to_vec();
+        bytes.resize(1 << 15, 0);
+        let mut relocs = vec![ExtractedReloc {
+            insn: Some(InsnField {
+                field: aarch64::Field::Imm14,
+                adrps: Vec::new(),
+            }),
+            ..pcrel_reloc(0, 32, 0, RelocTarget::External("far".into()))
+        }];
+        let err = veneer_aarch64_short_branches(&mut bytes, &mut relocs, "long")
+            .expect_err("the end of the unit is 32 KiB away");
+        assert!(
+            format!("{err:#}").contains("cannot reach a veneer"),
+            "{err:#}"
+        );
+
+        // One word shorter, the veneer is within reach.
+        let mut bytes = TBNZ_W0_31.to_le_bytes().to_vec();
+        bytes.resize((1 << 15) - 4, 0);
+        veneer_aarch64_short_branches(&mut bytes, &mut relocs, "long").expect("in reach");
+        assert_eq!(relocs[0].offset_within_unit, (1 << 15) - 4);
     }
 }

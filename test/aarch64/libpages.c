@@ -28,3 +28,40 @@ int shout(void)
 {
     return puts(banner);
 }
+
+/*
+ * Hand-written assembly, the way glibc's string functions and OpenSSL's
+ * primitives are, branching conditionally into another function: something
+ * a compiler never does. `clamp` returns 0 for a negative or zero argument,
+ * 100 for anything above 100, and the argument otherwise.
+ */
+__asm__(
+    "	.text\n"
+    "	.p2align 2\n"
+    "	.type	clamp_zero, %function\n"
+    "clamp_zero:\n"
+    "	.cfi_startproc\n"
+    "	mov	w0, #0\n"
+    "	ret\n"
+    "	.cfi_endproc\n"
+    "	.size	clamp_zero, .-clamp_zero\n"
+    "	.p2align 2\n"
+    "	.type	clamp_hundred, %function\n"
+    "clamp_hundred:\n"
+    "	.cfi_startproc\n"
+    "	mov	w0, #100\n"
+    "	ret\n"
+    "	.cfi_endproc\n"
+    "	.size	clamp_hundred, .-clamp_hundred\n"
+    "	.p2align 2\n"
+    "	.globl	clamp\n"
+    "	.type	clamp, %function\n"
+    "clamp:\n"
+    "	.cfi_startproc\n"
+    "	tbnz	w0, #31, clamp_zero\n"
+    "	cbz	w0, clamp_zero\n"
+    "	cmp	w0, #100\n"
+    "	b.gt	clamp_hundred\n"
+    "	ret\n"
+    "	.cfi_endproc\n"
+    "	.size	clamp, .-clamp\n");

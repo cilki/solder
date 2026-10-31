@@ -182,6 +182,20 @@ impl Field {
     }
 }
 
+/// `b .`, the unconditional branch a short-range branch is sent through once
+/// its own field may not reach (see [`is_short_branch`]). Its `imm26` is left
+/// zero for the relocator to fill in.
+pub const VENEER: u32 = 0x1400_0000;
+
+/// Whether `word` is a branch that reaches less far than `b`: `b.cond` and
+/// `bc.cond`, `cbz`/`cbnz` (`imm19`, ±1 MiB) or `tbz`/`tbnz` (`imm14`,
+/// ±32 KiB). The load-literal forms share `imm19` but are not branches, so no
+/// `b` can stand in for them.
+pub fn is_short_branch(word: u32) -> bool {
+    let load_literal = word & 0x3b00_0000 == 0x1800_0000;
+    Field::Imm14.fits(word) || Field::Imm19.fits(word) && !load_literal
+}
+
 /// The power of two a `:lo12:` immediate in `word` is scaled by — 0 for an
 /// `add`, the access size for an unsigned-offset load/store — or `None` when
 /// `word` is neither.
@@ -989,6 +1003,21 @@ mod tests {
             .chain(NO_REFS.iter().copied())
             .flat_map(u32::to_le_bytes)
             .collect()
+    }
+
+    /// The short branches are exactly the code references `b`/`bl` cannot
+    /// stand for: every one but `b`/`bl` themselves, and no load literal.
+    #[test]
+    fn short_branches_are_the_branches_narrower_than_b() {
+        for &(word, field, _, is_code_ref) in SAMPLES {
+            let short = is_code_ref && field != Field::Imm26;
+            assert_eq!(is_short_branch(word), short, "0x{word:08x}");
+        }
+        for &word in NO_REFS {
+            assert!(!is_short_branch(word), "0x{word:08x}");
+        }
+        assert!(Field::Imm26.fits(VENEER) && !is_short_branch(VENEER));
+        assert_eq!(decode(VENEER).map(|i| i.opcode), Some(Opcode::B));
     }
 
     #[test]

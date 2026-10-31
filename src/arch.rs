@@ -216,8 +216,7 @@ fn aarch64_trampoline(vaddr: u64, slot: u64) -> anyhow::Result<Vec<u8>> {
 /// Not in [`SUPPORTED`] yet, so an aarch64 executable is still refused at the
 /// gate: the extractor follows a section-anchor reference (`adrp`/`add` of an
 /// anchor, then `add #offset`) to the anchor object rather than the one it
-/// reaches, and no veneer is inserted for a short-range branch that ends up
-/// out of reach after layout. Until then this is what the per-architecture
+/// reaches. Until then this is what the per-architecture
 /// tables of the search, the reader, the extractor, the patcher and the
 /// writer are tested against.
 #[cfg_attr(not(test), allow(dead_code))]
