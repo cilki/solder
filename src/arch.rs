@@ -9,8 +9,9 @@
 //! architecture is adding a descriptor rather than finding every literal.
 //!
 //! What is *not* here yet is the machine code itself — instruction decoding,
-//! PLT stub recognition, trampolines, jump tables — which is still x86-64 only
-//! and is the reason [`SUPPORTED`] lists nothing else.
+//! PLT stub recognition, trampolines, jump tables. The extractor still only
+//! decodes x86-64, which is why [`SUPPORTED`] lists nothing else even though
+//! [`AARCH64`] is described.
 
 /// Why a dynamic relocation type cannot be lifted into the merged executable:
 /// its slot is filled with something other than `S + A`. See
@@ -164,6 +165,81 @@ pub static X86_64: Arch = {
     }
 };
 
+/// aarch64 (`EM_AARCH64`), LP64, per the ARM ELF ABI (AAELF64) and glibc's
+/// `sysdeps/aarch64`.
+///
+/// Not in [`SUPPORTED`] yet: the extractor cannot decode aarch64 code, so an
+/// aarch64 executable is still refused at the gate. Until then this is what
+/// the per-architecture tables of the search, the reader and the patcher are
+/// tested against.
+#[cfg_attr(not(test), allow(dead_code))]
+pub static AARCH64: Arch = {
+    use Unliftable::{Copy, Ifunc, Tls};
+    use object::elf::{
+        EM_AARCH64, GNU_PROPERTY_AARCH64_FEATURE_1_AND, R_AARCH64_COPY, R_AARCH64_GLOB_DAT,
+        R_AARCH64_IRELATIVE, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE, R_AARCH64_TLS_DTPMOD,
+        R_AARCH64_TLS_DTPREL, R_AARCH64_TLS_TPREL, R_AARCH64_TLSDESC,
+    };
+
+    Arch {
+        name: "aarch64",
+        e_machine: EM_AARCH64.0,
+        reloc: DynRelocTypes {
+            relative: R_AARCH64_RELATIVE.0,
+            glob_dat: R_AARCH64_GLOB_DAT.0,
+            jump_slot: R_AARCH64_JUMP_SLOT.0,
+            copy: R_AARCH64_COPY.0,
+        },
+        // Every dynamic relocation AAELF64 defines other than the three above.
+        // Unlike x86-64 there is no SIZE relocation, and the static TLS forms
+        // (`TLSGD_ADR_PAGE21` and the rest) are resolved by the linker into
+        // instruction fields and GOT slots carrying the dynamic ones below, so
+        // they never reach a shared library's dynamic tables. The TLS names
+        // are the ones readelf prints; `object` and glibc's `elf.h` drop the
+        // `64`.
+        unliftable_relocs: &[
+            (R_AARCH64_TLS_DTPMOD.0, "R_AARCH64_TLS_DTPMOD64", Tls),
+            (R_AARCH64_TLS_DTPREL.0, "R_AARCH64_TLS_DTPREL64", Tls),
+            (R_AARCH64_TLS_TPREL.0, "R_AARCH64_TLS_TPREL64", Tls),
+            (R_AARCH64_TLSDESC.0, "R_AARCH64_TLSDESC", Tls),
+            (R_AARCH64_IRELATIVE.0, "R_AARCH64_IRELATIVE", Ifunc),
+            (R_AARCH64_COPY.0, "R_AARCH64_COPY", Copy),
+        ],
+        // `FLAG_AARCH64_LIB64 | FLAG_ELF_LIBC6`, glibc's
+        // `sysdeps/unix/sysv/linux/aarch64/dl-cache.h`. As on x86-64,
+        // `_dl_cache_check_flags` accepts exactly this value, so an ILP32
+        // (`FLAG_AARCH64_LIB32`) or foreign entry is never loaded.
+        ldso_cache_flags: 0x0a03,
+        // glibc's aarch64 `configure` puts LP64 libraries in `/lib64`, the
+        // same as x86-64, so `$LIB` expands the same way.
+        lib_token: "lib64",
+        default_lib_dirs: &[
+            "/lib64",
+            "/usr/lib64",
+            "/lib",
+            "/usr/lib",
+            "/lib/aarch64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+        ],
+        // aarch64 kernels run with 4, 16 or 64 KiB pages, which is why
+        // distribution linkers default to `-z max-page-size=0x10000`.
+        max_page_size: 0x10000,
+        gnu_properties: GnuProperties {
+            feature_1_and: GNU_PROPERTY_AARCH64_FEATURE_1_AND.0,
+            feature_1_family: "BTI/PAC/GCS",
+            // `GNU_PROPERTY_AARCH64_FEATURE_1_{BTI,PAC,GCS}`. BTI is the one
+            // that faults: the loader maps the executable's code guarded, and
+            // a merged function without a `bti c` landing pad is entered
+            // through the trampoline's `br`. GCS (binutils 2.44, glibc 2.41)
+            // is AND-combined the same way, and glibc checks it against every
+            // object it loads.
+            feature_1_bits: &[(1 << 0, "BTI"), (1 << 1, "PAC"), (1 << 2, "GCS")],
+            // aarch64 has no ISA-level property.
+            isa_1_needed: None,
+        },
+    }
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,12 +263,26 @@ mod tests {
         }
     }
 
+    /// Every descriptor, supported or not yet.
+    const DESCRIBED: [&Arch; 2] = [&X86_64, &AARCH64];
+
+    #[test]
+    fn every_supported_architecture_is_described() {
+        for arch in SUPPORTED {
+            assert!(
+                DESCRIBED.iter().any(|d| std::ptr::eq(*d, *arch)),
+                "{}",
+                arch.name
+            );
+        }
+    }
+
     /// The relocation types the merge handles itself are pointer slots it
     /// fills in; one that also turned up as unliftable would be refused by the
     /// gate meant to let it through.
     #[test]
     fn no_handled_relocation_is_also_unliftable() {
-        for arch in SUPPORTED {
+        for arch in DESCRIBED {
             let r = &arch.reloc;
             for handled in [r.relative, r.glob_dat, r.jump_slot] {
                 assert!(
@@ -200,6 +290,51 @@ mod tests {
                     "{}: {handled}",
                     arch.name
                 );
+            }
+        }
+    }
+
+    /// Each architecture numbers its relocations from its own range, so a
+    /// type copied from the wrong one would be silently ignored or, worse,
+    /// match an unrelated relocation of this one.
+    #[test]
+    fn the_aarch64_dynamic_relocations_are_its_own() {
+        let r = &AARCH64.reloc;
+        // AAELF64 table "Dynamic relocations": 1024 upwards.
+        assert_eq!(
+            (r.copy, r.glob_dat, r.jump_slot, r.relative),
+            (1024, 1025, 1026, 1027)
+        );
+        let unliftable: Vec<u32> = AARCH64.unliftable_relocs.iter().map(|(t, ..)| *t).collect();
+        assert_eq!(unliftable, [1028, 1029, 1030, 1031, 1032, 1024]);
+        for (t, name, _) in AARCH64.unliftable_relocs {
+            assert!(name.starts_with("R_AARCH64_"), "{t}: {name}");
+        }
+    }
+
+    /// A descriptor's own tables have to be internally consistent: one
+    /// relocation type, one feature bit, one directory each.
+    #[test]
+    fn no_descriptor_repeats_an_entry() {
+        for arch in DESCRIBED {
+            let mut types: Vec<u32> = arch.unliftable_relocs.iter().map(|(t, ..)| *t).collect();
+            types.sort_unstable();
+            types.dedup();
+            assert_eq!(types.len(), arch.unliftable_relocs.len(), "{}", arch.name);
+
+            let bits = &arch.gnu_properties.feature_1_bits;
+            for (i, (bit, name)) in bits.iter().enumerate() {
+                assert_eq!(bit.count_ones(), 1, "{}: {name}", arch.name);
+                assert!(
+                    bits[i + 1..].iter().all(|(other, _)| other != bit),
+                    "{}: {name}",
+                    arch.name
+                );
+            }
+
+            let dirs = arch.default_lib_dirs;
+            for (i, dir) in dirs.iter().enumerate() {
+                assert!(!dirs[i + 1..].contains(dir), "{}: {dir}", arch.name);
             }
         }
     }

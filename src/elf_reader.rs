@@ -1624,6 +1624,17 @@ mod page_size_tests {
         assert_eq!(page_size_for([0x1000, 0x4000].into_iter(), 0x10000), 0x4000);
     }
 
+    /// The same executable linked for 64 KiB pages keeps them on aarch64,
+    /// whose kernels run with 64 KiB pages, but not on x86-64, whose don't.
+    #[test]
+    fn a_64k_p_align_is_a_page_size_on_aarch64_only() {
+        let mut bytes = std::fs::read(GREP).expect("read test/grep");
+        set_load_alignment(&mut bytes, 0x10000);
+        let elf = ElfFile64::<object::Endianness>::parse(&*bytes).expect("parse");
+        assert_eq!(page_size(&elf, &crate::arch::AARCH64), 0x10000);
+        assert_eq!(page_size(&elf, &crate::arch::X86_64), 0x1000);
+    }
+
     /// A 2 MiB `p_align` on x86-64 asks for huge-page alignment, not 2 MiB
     /// pages; honouring it would pad the file by megabytes for nothing.
     #[test]

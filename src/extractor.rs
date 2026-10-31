@@ -3415,6 +3415,53 @@ mod tests {
         }
     }
 
+    /// The gate reads relocation numbers in the library's architecture: under
+    /// aarch64 its own three pointer slots pass, its TLS and ifunc types are
+    /// refused by their binutils names, and x86-64's `R_X86_64_RELATIVE` (8)
+    /// is just an unknown number.
+    #[test]
+    fn the_unliftable_gate_numbers_relocations_by_the_architecture() {
+        use crate::arch::AARCH64;
+        let check = |r_type: u32| {
+            reject_unliftable_dynamic_reloc(
+                &AARCH64,
+                object::RelocationKind::Unknown,
+                Some(r_type),
+                "sym",
+                Path::new("libfoo.so.1"),
+            )
+        };
+        for handled in [
+            object::elf::R_AARCH64_RELATIVE.0,
+            object::elf::R_AARCH64_GLOB_DAT.0,
+            object::elf::R_AARCH64_JUMP_SLOT.0,
+        ] {
+            check(handled).unwrap_or_else(|e| panic!("{handled}: {e:#}"));
+        }
+        for (r_type, name, why) in [
+            (
+                object::elf::R_AARCH64_TLS_TPREL.0,
+                "R_AARCH64_TLS_TPREL64",
+                "thread",
+            ),
+            (
+                object::elf::R_AARCH64_TLSDESC.0,
+                "R_AARCH64_TLSDESC",
+                "thread",
+            ),
+            (
+                object::elf::R_AARCH64_IRELATIVE.0,
+                "R_AARCH64_IRELATIVE",
+                "ifunc",
+            ),
+            (object::elf::R_X86_64_RELATIVE.0, "relocation type 8", ""),
+        ] {
+            let msg = format!("{:#}", check(r_type).expect_err(name));
+            assert!(msg.contains(name), "{msg}");
+            assert!(msg.contains(why), "{msg}");
+        }
+    }
+
     /// `libtinfo.so.6` relinked as `-z pack-relative-relocs` would have it —
     /// every `R_X86_64_RELATIVE` entry of `.rela.dyn` moved into a `DT_RELR`
     /// table — written where extraction can open it. See

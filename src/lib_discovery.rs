@@ -795,6 +795,28 @@ mod resolution_tests {
         }
     }
 
+    /// The same search from the other side: for an aarch64 executable it is
+    /// the x86-64 build that belongs to another machine.
+    #[test]
+    fn an_x86_64_library_is_passed_over_for_an_aarch64_executable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let x86_64 = place_pcre(root.path(), "x86_64", |_| {});
+        let native = place_pcre(root.path(), "aarch64", aarch64);
+        let resolved = resolve_library(
+            "libpcre2-8.so.0",
+            &[
+                x86_64.parent().unwrap().to_owned(),
+                native.parent().unwrap().to_owned(),
+            ],
+            &[],
+            &empty_cache(),
+            root.path(),
+            &crate::arch::AARCH64,
+        )
+        .expect("the aarch64 build is on the path");
+        assert_eq!(resolved, native);
+    }
+
     /// With nothing but foreign builds on the path the soname is not found —
     /// a dependency this machine does not have, as far as ld.so is concerned —
     /// and the message says which files were passed over and why.
@@ -1017,6 +1039,43 @@ mod ldso_cache_tests {
             Some(Path::new("/usr/lib64/libbar.so.1")),
             "a 32-bit library cannot be merged into a 64-bit executable"
         );
+    }
+
+    /// One cache can list the same soname for several ABIs; each
+    /// architecture's loader takes only the entry flagged with its own
+    /// `_DL_CACHE_DEFAULT_ID`, and so must the search for an executable of it.
+    #[test]
+    fn each_architecture_takes_its_own_entry_from_a_shared_cache() {
+        use crate::arch::AARCH64;
+        /// `FLAG_AARCH64_LIB32 | FLAG_ELF_LIBC6`: the ILP32 build.
+        const AARCH64_ILP32: u32 = 0x0b03;
+        let data = new_format(&[
+            (AARCH64_ILP32, 0, "libbaz.so.1", "/usr/libilp32/libbaz.so.1"),
+            (
+                X8664,
+                0,
+                "libbaz.so.1",
+                "/usr/lib/x86_64-linux-gnu/libbaz.so.1",
+            ),
+            (
+                AARCH64.ldso_cache_flags,
+                0,
+                "libbaz.so.1",
+                "/usr/lib/aarch64-linux-gnu/libbaz.so.1",
+            ),
+        ]);
+        for (arch, path) in [
+            (&X86_64, "/usr/lib/x86_64-linux-gnu/libbaz.so.1"),
+            (&AARCH64, "/usr/lib/aarch64-linux-gnu/libbaz.so.1"),
+        ] {
+            let cache = LdsoCache::parse(&data, arch).expect("multiarch cache");
+            assert_eq!(
+                cache.lookup("libbaz.so.1"),
+                Some(Path::new(path)),
+                "{}",
+                arch.name
+            );
+        }
     }
 
     #[test]

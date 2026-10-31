@@ -1082,6 +1082,11 @@ mod gnu_property_tests {
 
     const IBT: u32 = 1 << 0;
     const SHSTK: u32 = 1 << 1;
+    /// `GNU_PROPERTY_AARCH64_FEATURE_1_{BTI,PAC,GCS}`, as binutils' and
+    /// glibc's `elf.h` number them.
+    const BTI: u32 = object::elf::GNU_PROPERTY_AARCH64_FEATURE_1_BTI;
+    const PAC: u32 = object::elf::GNU_PROPERTY_AARCH64_FEATURE_1_PAC;
+    const GCS: u32 = 1 << 2;
     /// `NT_GNU_PROPERTY_TYPE_0`, the note type whose descriptor is the GNU
     /// property array.
     const NT_GNU_PROPERTY_TYPE_0: u32 = object::elf::NT_GNU_PROPERTY_TYPE_0.0;
@@ -1153,28 +1158,25 @@ mod gnu_property_tests {
     }
 
     /// The property types come from the architecture, not from x86-64: under
-    /// a descriptor shaped like aarch64's — a `FEATURE_1_AND` at `0xc0000000`
-    /// carrying BTI/PAC and no ISA property — the x86-64 properties are
-    /// someone else's and are skipped, and its own feature property is read.
+    /// aarch64's descriptor — a `FEATURE_1_AND` at `0xc0000000` carrying
+    /// BTI/PAC/GCS and no ISA property — the x86-64 properties are someone
+    /// else's and are skipped, and its own feature property is read.
     #[test]
     fn the_property_types_read_are_the_architectures() {
-        const BTI: u32 = 1 << 0;
-        const PAC: u32 = 1 << 1;
-        let aarch64_like = GnuProperties {
-            feature_1_and: object::elf::GNU_PROPERTY_AARCH64_FEATURE_1_AND.0,
-            feature_1_family: "BTI/PAC",
-            feature_1_bits: &[(BTI, "BTI"), (PAC, "PAC")],
-            isa_1_needed: None,
-        };
+        let aarch64 = &crate::arch::AARCH64.gnu_properties;
+        assert_eq!(
+            aarch64.feature_1_and,
+            object::elf::GNU_PROPERTY_AARCH64_FEATURE_1_AND.0
+        );
 
         let mut desc = property(ISA_1_NEEDED, 0x4);
         desc.extend_from_slice(&property(FEATURE_1_AND, IBT));
-        desc.extend_from_slice(&property(aarch64_like.feature_1_and, BTI | PAC));
+        desc.extend_from_slice(&property(aarch64.feature_1_and, BTI | PAC));
         let notes = note(NT_GNU_PROPERTY_TYPE_0, &desc, 8);
 
         let mut found = ProgramProperties::default();
         let iter = NoteIterator::new(Endianness::Little, 8, &notes).expect("valid alignment");
-        found.scan(&notes, Endianness::Little, iter, &aarch64_like);
+        found.scan(&notes, Endianness::Little, iter, aarch64);
         assert_eq!(
             found,
             ProgramProperties {
@@ -1182,7 +1184,7 @@ mod gnu_property_tests {
                 isa: None,
             }
         );
-        assert_eq!(feature_names(PAC, &aarch64_like), "PAC");
+        assert_eq!(feature_names(PAC, aarch64), "PAC");
 
         // And the same note under x86-64 yields the x86-64 pair.
         assert_eq!(
@@ -1238,8 +1240,13 @@ mod gnu_property_tests {
 
     /// A plan that merged one unit out of `lib`.
     fn plan_merging(lib: &str) -> MergePlan {
+        plan_merging_for(&crate::arch::X86_64, lib)
+    }
+
+    /// A plan for an `arch` executable that merged one unit out of `lib`.
+    fn plan_merging_for(arch: &'static crate::arch::Arch, lib: &str) -> MergePlan {
         MergePlan {
-            arch: &crate::arch::X86_64,
+            arch,
             is_pie: true,
             page_size: crate::elf_reader::MIN_PAGE_SIZE,
             load_address: 0x10_0000,
@@ -1295,6 +1302,36 @@ mod gnu_property_tests {
             read(&bytes).features,
             Some((at, 0)),
             "the executable still claims CET features the merged code does not have"
+        );
+    }
+
+    /// The aarch64 counterpart, and the more dangerous one: with BTI claimed
+    /// the loader maps the executable's code guarded, and the merged
+    /// functions, entered through the trampoline's `br`, have no `bti c` to
+    /// land on unless their library was built with branch protection. The
+    /// property is aarch64's own type, which the x86-64 descriptor would not
+    /// even see.
+    #[test]
+    fn merging_a_library_without_bti_withdraws_the_bti_claim() {
+        let aarch64 = &crate::arch::AARCH64;
+        let mut bytes = std::fs::read(GREP).expect("read test/grep");
+        let (at, _) = read(&bytes).isa.expect("test/grep has an ISA property");
+        bytes[at - 8..at - 4].copy_from_slice(&aarch64.gnu_properties.feature_1_and.to_le_bytes());
+        bytes[at..at + 4].copy_from_slice(&(BTI | PAC).to_le_bytes());
+        let read_aarch64 = |bytes: &[u8]| {
+            ProgramProperties::read(bytes, &aarch64.gnu_properties).expect("parse ELF")
+        };
+        assert_eq!(read_aarch64(&bytes).features, Some((at, BTI | PAC)));
+
+        update_gnu_properties(&mut bytes, &plan_merging_for(aarch64, PCRE2))
+            .expect("update properties");
+        assert_eq!(
+            read_aarch64(&bytes),
+            ProgramProperties {
+                features: Some((at, 0)),
+                isa: None,
+            },
+            "the executable still claims BTI/PAC over merged code built without them"
         );
     }
 
@@ -1355,5 +1392,8 @@ mod gnu_property_tests {
     fn dropped_features_are_named_in_the_warning() {
         assert_eq!(feature_names(IBT | SHSTK, X86), "IBT, SHSTK");
         assert_eq!(feature_names(1 << 9, X86), "0x200");
+        let aarch64 = &crate::arch::AARCH64.gnu_properties;
+        assert_eq!(feature_names(BTI | PAC | GCS, aarch64), "BTI, PAC, GCS");
+        assert_eq!(feature_names(GCS | 1 << 3, aarch64), "GCS, 0x8");
     }
 }
