@@ -9,10 +9,11 @@
 //! architecture is adding a descriptor rather than finding every literal.
 //!
 //! What is *not* here is the machine code itself — instruction decoding,
-//! PLT stub recognition, trampolines, jump tables. The extractor reads
-//! aarch64 code as well as x86-64 now, but the writer still only emits x86-64
-//! trampolines, which is why [`SUPPORTED`] lists nothing else even though
-//! [`AARCH64`] is described.
+//! PLT stub recognition, jump tables — beyond naming the encoder of each
+//! architecture's [`Trampoline`]. The extractor reads aarch64 code and the
+//! writer emits aarch64 trampolines, but [`SUPPORTED`] still lists only
+//! x86-64 even though [`AARCH64`] is described: see there for what is
+//! missing.
 
 /// Why a dynamic relocation type cannot be lifted into the merged executable:
 /// its slot is filled with something other than `S + A`. See
@@ -61,6 +62,18 @@ pub struct GnuProperties {
     pub isa_1_needed: Option<u32>,
 }
 
+/// The stub the merged code calls in place of a function that stays in a
+/// shared library: it jumps to whatever address the loader resolved into a
+/// GOT slot. See `writer::build_merged_segment`.
+#[derive(Debug, Clone)]
+pub struct Trampoline {
+    /// The bytes `layout` reserves for each stub, at a 16-byte boundary.
+    pub len: u64,
+    /// The stub at `vaddr` that jumps through the GOT slot at `slot`, at most
+    /// `len` bytes; an error if it cannot reach the slot from there.
+    pub encode: fn(vaddr: u64, slot: u64) -> anyhow::Result<Vec<u8>>,
+}
+
 /// One target architecture.
 #[derive(Debug, Clone)]
 pub struct Arch {
@@ -86,6 +99,8 @@ pub struct Arch {
     pub max_page_size: u64,
     /// The GNU properties the merge recomputes for the whole program.
     pub gnu_properties: GnuProperties,
+    /// How merged code reaches a function still resolved at runtime.
+    pub trampoline: Trampoline,
 }
 
 impl Arch {
@@ -163,16 +178,48 @@ pub static X86_64: Arch = {
             ],
             isa_1_needed: Some(GNU_PROPERTY_X86_ISA_1_NEEDED.0),
         },
+        // The stub is six bytes; the other eight of the fourteen reserved
+        // are left zero, where an absolute address once followed it.
+        trampoline: Trampoline {
+            len: 14,
+            encode: x86_64_trampoline,
+        },
     }
 };
+
+/// `jmp qword ptr [rip + disp32]`, the indirect jump a PLT stub makes: the CPU
+/// reads the function pointer the loader wrote into the GOT slot at `slot` and
+/// jumps there. Being RIP-relative it needs no rebasing under PIE.
+fn x86_64_trampoline(vaddr: u64, slot: u64) -> anyhow::Result<Vec<u8>> {
+    const LEN: u64 = 6;
+    let rel = (slot as i64).wrapping_sub(vaddr.wrapping_add(LEN) as i64);
+    let rel = i32::try_from(rel).map_err(|_| {
+        anyhow::anyhow!(
+            "GOT slot offset 0x{rel:x} does not fit in i32 \
+             (stub at 0x{vaddr:x}, target at 0x{slot:x})"
+        )
+    })?;
+    let mut out = vec![0xff, 0x25];
+    out.extend_from_slice(&rel.to_le_bytes());
+    Ok(out)
+}
+
+/// `bti c; adrp x16; ldr x17; br x17`: see `aarch64::trampoline`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn aarch64_trampoline(vaddr: u64, slot: u64) -> anyhow::Result<Vec<u8>> {
+    crate::aarch64::trampoline(vaddr, slot).map(Vec::from)
+}
 
 /// aarch64 (`EM_AARCH64`), LP64, per the ARM ELF ABI (AAELF64) and glibc's
 /// `sysdeps/aarch64`.
 ///
-/// Not in [`SUPPORTED`] yet: the writer cannot emit aarch64 trampolines, so
-/// an aarch64 executable is still refused at the gate. Until then this is
-/// what the per-architecture tables of the search, the reader, the extractor
-/// and the patcher are tested against.
+/// Not in [`SUPPORTED`] yet, so an aarch64 executable is still refused at the
+/// gate: the extractor follows a section-anchor reference (`adrp`/`add` of an
+/// anchor, then `add #offset`) to the anchor object rather than the one it
+/// reaches, and no veneer is inserted for a short-range branch that ends up
+/// out of reach after layout. Until then this is what the per-architecture
+/// tables of the search, the reader, the extractor, the patcher and the
+/// writer are tested against.
 #[cfg_attr(not(test), allow(dead_code))]
 pub static AARCH64: Arch = {
     use Unliftable::{Copy, Ifunc, Tls};
@@ -237,6 +284,10 @@ pub static AARCH64: Arch = {
             feature_1_bits: &[(1 << 0, "BTI"), (1 << 1, "PAC"), (1 << 2, "GCS")],
             // aarch64 has no ISA-level property.
             isa_1_needed: None,
+        },
+        trampoline: Trampoline {
+            len: crate::aarch64::TRAMPOLINE_LEN as u64,
+            encode: aarch64_trampoline,
         },
     }
 };

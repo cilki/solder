@@ -24,9 +24,9 @@
 //! does not, which is where in the word that operand is kept.
 //!
 //! The extractor reads an aarch64 library's references and PLT stubs through
-//! this module, and the relocator writes [`Field`]s with it. The trampolines
-//! are not wired in yet, and `arch::SUPPORTED` still refuses aarch64
-//! executables.
+//! this module, the relocator writes [`Field`]s with it, and the writer emits
+//! its trampolines through `arch::AARCH64`. `arch::SUPPORTED` still refuses
+//! aarch64 executables.
 
 use std::collections::BTreeSet;
 

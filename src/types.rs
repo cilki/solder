@@ -418,9 +418,9 @@ pub struct AssignedUnit {
     pub assigned_vaddr: u64,
 }
 
-/// A 14-byte trampoline stub: `jmp [rip+0]` followed by an 8-byte absolute address.
+/// A trampoline stub (`arch::Trampoline`) that jumps through a GOT slot.
 /// Used so that merged library code can call external (e.g. glibc) symbols via
-/// the executable's existing GOT entries.
+/// the executable's existing GOT entries, or ones the merge adds.
 #[derive(Debug, Clone)]
 pub struct TrampolineStub {
     pub symbol_name: String,

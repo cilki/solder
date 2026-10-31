@@ -33,35 +33,27 @@ pub fn build_merged_segment(plan: &mut MergePlan) -> Result<Vec<u8>> {
         seg[off..end].copy_from_slice(&au.unit.bytes);
     }
 
+    // Each stub jumps through the GOT slot the loader resolves its symbol
+    // into, addressing the slot PC-relatively, so the load base does not
+    // matter and no RELATIVE relocation is needed under PIE.
+    let trampoline = &plan.arch.trampoline;
     for stub in &plan.trampoline_stubs {
-        let off = (stub.vaddr - plan.load_address) as usize;
-        // Real PLT stub encoding: `FF 25 <imm32>` = `jmp qword ptr [rip + imm32]`.
-        // The CPU computes effective address (rip_after + imm32), reads the
-        // 8-byte function pointer the loader wrote into that GOT slot, and
-        // jumps there. We use a RIP-relative offset so the loader's load-base
-        // offset doesn't matter (PIE and non-PIE both work without extra
-        // RELATIVE relocs).
-        if off + 14 > seg.len() {
-            bail!("trampoline for '{}' overflows segment", stub.symbol_name);
-        }
-        let rip_after = stub.vaddr + 6;
-        let rel = (stub.target_got_vaddr as i64) - (rip_after as i64);
-        if !(i32::MIN as i64..=i32::MAX as i64).contains(&rel) {
+        let code = (trampoline.encode)(stub.vaddr, stub.target_got_vaddr)
+            .with_context(|| format!("trampoline for '{}'", stub.symbol_name))?;
+        if code.len() as u64 > trampoline.len {
             bail!(
-                "trampoline for '{}': GOT slot offset 0x{:x} does not fit in i32 \
-                 (stub at 0x{:x}, target at 0x{:x})",
+                "trampoline for '{}' is {} bytes but {} were reserved — internal error",
                 stub.symbol_name,
-                rel,
-                stub.vaddr,
-                stub.target_got_vaddr
+                code.len(),
+                trampoline.len
             );
         }
-        seg[off] = 0xFF;
-        seg[off + 1] = 0x25;
-        seg[off + 2..off + 6].copy_from_slice(&(rel as i32).to_le_bytes());
-        // The remaining 8 bytes of the reserved 14-byte slot are unused; leave
-        // them zeroed. (Kept at 14 bytes total so the layout calculation that
-        // reserves 14-byte trampolines stays correct.)
+        let off = (stub.vaddr - plan.load_address) as usize;
+        let end = off + trampoline.len as usize;
+        if end > seg.len() {
+            bail!("trampoline for '{}' overflows segment", stub.symbol_name);
+        }
+        seg[off..off + code.len()].copy_from_slice(&code);
     }
 
     // Write the preinit and fini arrays if present. Each entry is a link-time
@@ -1176,6 +1168,80 @@ mod runtime_write_tests {
             addend: 0,
         });
         check_runtime_writes_are_writable(&plan).expect("the executable's own GOT is writable");
+    }
+}
+
+#[cfg(test)]
+mod trampoline_tests {
+    use super::*;
+    use crate::types::TrampolineStub;
+
+    const LOAD: u64 = 0x40_0000;
+    /// A GOT slot in the executable, below the merged region.
+    const SLOT: u64 = 0x3f_ff08;
+
+    /// A plan for `arch` whose only content is a trampoline at the start of
+    /// the merged region, jumping through `slot`.
+    fn plan(arch: &'static crate::arch::Arch, slot: u64) -> MergePlan {
+        MergePlan {
+            arch,
+            is_pie: true,
+            page_size: arch.max_page_size,
+            load_address: LOAD,
+            exec_size: arch.max_page_size,
+            rodata_end: arch.max_page_size,
+            writable_end: arch.max_page_size,
+            units: Vec::new(),
+            trampoline_stubs: vec![TrampolineStub {
+                symbol_name: "memcpy".to_owned(),
+                vaddr: LOAD,
+                target_got_vaddr: slot,
+            }],
+            got_patches: Vec::new(),
+            neutralized_relocs: Vec::new(),
+            remove_needed: Vec::new(),
+            add_needed: Vec::new(),
+            relative_relocs: Vec::new(),
+            new_externals: Vec::new(),
+            got_imports: Vec::new(),
+            init_fini: None,
+        }
+    }
+
+    /// `jmp qword ptr [rip + disp32]`, with the displacement measured from the
+    /// end of the six-byte instruction.
+    #[test]
+    fn an_x86_64_trampoline_jumps_through_its_slot() {
+        let mut plan = plan(&crate::arch::X86_64, SLOT);
+        let seg = build_merged_segment(&mut plan).expect("build the segment");
+        let disp = (SLOT as i64 - (LOAD + 6) as i64) as i32;
+        assert_eq!(seg[..2], [0xff, 0x25]);
+        assert_eq!(seg[2..6], disp.to_le_bytes());
+        assert_eq!(seg[6..14], [0; 8]);
+        assert!(plan.relative_relocs.is_empty(), "nothing in it is absolute");
+    }
+
+    /// An aarch64 plan gets aarch64 code. It used to get the x86-64 bytes
+    /// above, which decode as an undefined instruction.
+    #[test]
+    fn an_aarch64_trampoline_is_aarch64_code() {
+        let mut plan = plan(&crate::arch::AARCH64, SLOT);
+        let seg = build_merged_segment(&mut plan).expect("build the segment");
+        let expected = crate::aarch64::trampoline(LOAD, SLOT).expect("encode");
+        assert_eq!(seg[..crate::aarch64::TRAMPOLINE_LEN], expected);
+        assert!(plan.relative_relocs.is_empty(), "nothing in it is absolute");
+    }
+
+    /// A slot the stub cannot address is an error naming the symbol, not a
+    /// stub that jumps through some other address.
+    #[test]
+    fn a_slot_out_of_reach_is_refused() {
+        for arch in [&crate::arch::X86_64, &crate::arch::AARCH64] {
+            let mut plan = plan(arch, LOAD + 0x1_0000_0000);
+            let err = build_merged_segment(&mut plan).expect_err(arch.name);
+            let err = format!("{err:#}");
+            assert!(err.contains("memcpy"), "{}: {err}", arch.name);
+        }
     }
 }
 

@@ -69,10 +69,10 @@ pub fn plan_layout(
 
     let mut units: Vec<AssignedUnit> = assign_addresses(load_address, &mut offset, text);
 
-    // Assign VA to each trampoline stub (14 bytes: FF 25 00 00 00 00 + 8 byte addr).
+    // Assign VA to each trampoline stub (`arch.trampoline.len` bytes each).
     //
     // For each external name we need a GOT slot the loader will fill with the
-    // resolved function address; the trampoline does `jmp [got_slot]`. If the
+    // resolved function address; the trampoline jumps through it. If the
     // executable already imports the symbol, we reuse its existing GOT slot.
     // Otherwise a fresh 8-byte slot is allocated further down, in the writable
     // run — ld.so writes the resolved address into it, so it cannot sit next
@@ -83,7 +83,7 @@ pub fn plan_layout(
         // Align each trampoline to 16 bytes for neatness.
         offset = align_up(offset, 16);
         let vaddr = load_address + offset;
-        offset += 14;
+        offset += arch.trampoline.len;
         let target_got_vaddr = match exe_got_vas.get(name) {
             Some(va) => *va,
             None => {
@@ -667,7 +667,8 @@ mod tests {
         assert_eq!(plan.trampoline_stubs.len(), 2);
         for stub in &plan.trampoline_stubs {
             assert!(
-                stub.vaddr >= plan.load_address && stub.vaddr + 14 <= code_end,
+                stub.vaddr >= plan.load_address
+                    && stub.vaddr + plan.arch.trampoline.len <= code_end,
                 "trampoline for '{}' is not inside the executable run",
                 stub.symbol_name
             );
