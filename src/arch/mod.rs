@@ -8,12 +8,27 @@
 //! and handed to every stage that reads one, so that supporting a second
 //! architecture is adding a descriptor rather than finding every literal.
 //!
-//! What is *not* here is the machine code itself — instruction decoding,
-//! PLT stub recognition, jump tables — beyond naming the encoder of each
-//! architecture's [`Trampoline`]. The extractor reads aarch64 code and the
-//! writer emits aarch64 trampolines, but [`SUPPORTED`] still lists only
-//! x86-64 even though [`AARCH64`] is described: see there for what is
-//! missing.
+//! Each architecture lives in a module of its own — [`x86_64`], [`aarch64`] —
+//! which defines its descriptor and everything that reads or writes its
+//! machine code: decoding a function and finding the addresses it keeps
+//! ([`MachineCode::scan`]), reading a PLT stub
+//! ([`MachineCode::plt_stub_slot`]), keeping short branches in reach
+//! ([`MachineCode::veneer_short_branches`]) and writing a trampoline
+//! ([`Trampoline`]). The stages outside this module go through the
+//! descriptor and never name an architecture, so a third one is a new module
+//! and an entry in [`SUPPORTED`].
+//!
+//! [`SUPPORTED`] still lists only x86-64 even though [`AARCH64`] is
+//! described: see there for what is missing.
+
+pub mod aarch64;
+pub mod x86_64;
+
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use aarch64::AARCH64;
+pub use x86_64::X86_64;
+
+use crate::types::{ExtractedReloc, InsnField, RelocTarget};
 
 /// Why a dynamic relocation type cannot be lifted into the merged executable:
 /// its slot is filled with something other than `S + A`. See
@@ -101,6 +116,8 @@ pub struct Arch {
     pub gnu_properties: GnuProperties,
     /// How merged code reaches a function still resolved at runtime.
     pub trampoline: Trampoline,
+    /// How the extractor reads and rewrites this architecture's code.
+    pub code: MachineCode,
 }
 
 impl Arch {
@@ -113,183 +130,159 @@ impl Arch {
 /// Every architecture the merge accepts an executable for.
 pub static SUPPORTED: &[&Arch] = &[&X86_64];
 
-/// x86-64 (`EM_X86_64`), per the System V AMD64 psABI and glibc's
-/// `sysdeps/x86_64`.
-pub static X86_64: Arch = {
-    use Unliftable::{Copy, Ifunc, Size, Tls};
-    use object::elf::{
-        EM_X86_64, GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_ISA_1_NEEDED, R_X86_64_COPY,
-        R_X86_64_DTPMOD64, R_X86_64_DTPOFF32, R_X86_64_DTPOFF64, R_X86_64_GLOB_DAT,
-        R_X86_64_GOTPC32_TLSDESC, R_X86_64_GOTTPOFF, R_X86_64_IRELATIVE, R_X86_64_JUMP_SLOT,
-        R_X86_64_RELATIVE, R_X86_64_SIZE32, R_X86_64_SIZE64, R_X86_64_TLSDESC,
-        R_X86_64_TLSDESC_CALL, R_X86_64_TLSGD, R_X86_64_TLSLD, R_X86_64_TPOFF32, R_X86_64_TPOFF64,
-    };
-
-    Arch {
-        name: "x86-64",
-        e_machine: EM_X86_64.0,
-        reloc: DynRelocTypes {
-            relative: R_X86_64_RELATIVE.0,
-            glob_dat: R_X86_64_GLOB_DAT.0,
-            jump_slot: R_X86_64_JUMP_SLOT.0,
-            copy: R_X86_64_COPY.0,
-        },
-        unliftable_relocs: &[
-            (R_X86_64_DTPMOD64.0, "R_X86_64_DTPMOD64", Tls),
-            (R_X86_64_DTPOFF64.0, "R_X86_64_DTPOFF64", Tls),
-            (R_X86_64_TPOFF64.0, "R_X86_64_TPOFF64", Tls),
-            (R_X86_64_TLSGD.0, "R_X86_64_TLSGD", Tls),
-            (R_X86_64_TLSLD.0, "R_X86_64_TLSLD", Tls),
-            (R_X86_64_DTPOFF32.0, "R_X86_64_DTPOFF32", Tls),
-            (R_X86_64_GOTTPOFF.0, "R_X86_64_GOTTPOFF", Tls),
-            (R_X86_64_TPOFF32.0, "R_X86_64_TPOFF32", Tls),
-            (R_X86_64_GOTPC32_TLSDESC.0, "R_X86_64_GOTPC32_TLSDESC", Tls),
-            (R_X86_64_TLSDESC_CALL.0, "R_X86_64_TLSDESC_CALL", Tls),
-            (R_X86_64_TLSDESC.0, "R_X86_64_TLSDESC", Tls),
-            (R_X86_64_IRELATIVE.0, "R_X86_64_IRELATIVE", Ifunc),
-            (R_X86_64_SIZE32.0, "R_X86_64_SIZE32", Size),
-            (R_X86_64_SIZE64.0, "R_X86_64_SIZE64", Size),
-            (R_X86_64_COPY.0, "R_X86_64_COPY", Copy),
-        ],
-        // `FLAG_X8664_LIB64 | FLAG_ELF_LIBC6`. On x86-64
-        // `_dl_cache_check_flags` accepts this value and nothing else, so an
-        // entry with any other `flags` is one the loader would never load.
-        ldso_cache_flags: 0x0303,
-        lib_token: "lib64",
-        default_lib_dirs: &[
-            "/lib64",
-            "/usr/lib64",
-            "/lib",
-            "/usr/lib",
-            "/lib/x86_64-linux-gnu",
-            "/usr/lib/x86_64-linux-gnu",
-        ],
-        // x86-64 pages are 4 KiB. A 2 MiB `p_align`, which binutils used as
-        // the default `max-page-size` before 2.31, is for huge pages.
-        max_page_size: 0x1000,
-        gnu_properties: GnuProperties {
-            feature_1_and: GNU_PROPERTY_X86_FEATURE_1_AND.0,
-            feature_1_family: "CET",
-            feature_1_bits: &[
-                (1 << 0, "IBT"),
-                (1 << 1, "SHSTK"),
-                (1 << 2, "LAM_U48"),
-                (1 << 3, "LAM_U57"),
-            ],
-            isa_1_needed: Some(GNU_PROPERTY_X86_ISA_1_NEEDED.0),
-        },
-        // The stub is six bytes; the other eight of the fourteen reserved
-        // are left zero, where an absolute address once followed it.
-        trampoline: Trampoline {
-            len: 14,
-            encode: x86_64_trampoline,
-        },
-    }
-};
-
-/// `jmp qword ptr [rip + disp32]`, the indirect jump a PLT stub makes: the CPU
-/// reads the function pointer the loader wrote into the GOT slot at `slot` and
-/// jumps there. Being RIP-relative it needs no rebasing under PIE.
-fn x86_64_trampoline(vaddr: u64, slot: u64) -> anyhow::Result<Vec<u8>> {
-    const LEN: u64 = 6;
-    let rel = (slot as i64).wrapping_sub(vaddr.wrapping_add(LEN) as i64);
-    let rel = i32::try_from(rel).map_err(|_| {
-        anyhow::anyhow!(
-            "GOT slot offset 0x{rel:x} does not fit in i32 \
-             (stub at 0x{vaddr:x}, target at 0x{slot:x})"
-        )
-    })?;
-    let mut out = vec![0xff, 0x25];
-    out.extend_from_slice(&rel.to_le_bytes());
-    Ok(out)
+/// The extractor's view of an architecture's machine code: the steps of
+/// extracting a function that depend on how its instructions are encoded.
+#[derive(Debug, Clone)]
+pub struct MachineCode {
+    /// Read a text unit's code: how far it runs, every address its
+    /// instructions keep and the jump tables it indexes. An error where the
+    /// code holds a reference the scanner cannot account for, since copying it
+    /// as it is would leave it aimed at wherever the old offset lands.
+    pub scan: fn(&TextUnit<'_, '_>) -> anyhow::Result<UnitScan>,
+    /// The GOT slot the PLT stub at `addr`, inside a PLT section loaded at
+    /// `sec_addr` whose bytes are `sec_data`, jumps through; `None` when
+    /// there is no stub there (the PLT0 resolver, a misaligned address).
+    pub plt_stub_slot: fn(sec_data: &[u8], sec_addr: u64, addr: u64) -> Option<u64>,
+    /// Send each relocation the unit `bytes` of the symbol `sym` carries in a
+    /// field too short to be sure of reaching another unit through a veneer
+    /// in the unit that does, rewriting the branch and moving the relocation
+    /// to the veneer. An error when a branch cannot reach anywhere a veneer
+    /// could go.
+    pub veneer_short_branches:
+        fn(bytes: &mut Vec<u8>, relocs: &mut [ExtractedReloc], sym: &str) -> anyhow::Result<()>,
 }
 
-/// `bti c; adrp x16; ldr x17; br x17`: see `aarch64::trampoline`.
-#[cfg_attr(not(test), allow(dead_code))]
-fn aarch64_trampoline(vaddr: u64, slot: u64) -> anyhow::Result<Vec<u8>> {
-    crate::aarch64::trampoline(vaddr, slot).map(Vec::from)
+/// One text unit handed to [`MachineCode::scan`].
+pub struct TextUnit<'a, 'data> {
+    /// The unit: the function plus whatever sits between its last instruction
+    /// and the next bound, which is not code.
+    pub bytes: &'a [u8],
+    /// Where `bytes` was loaded in the library.
+    pub vaddr: u64,
+    /// Where `.eh_frame` says the function ends, if an FDE starts at `vaddr`.
+    /// A unit covers the function plus everything the linker left before the
+    /// bound extraction stopped at: alignment padding and, in the hand-written
+    /// assembly libcrypto is full of, constants kept in `.text`. Scanning that
+    /// tail as code invents relocations out of data, so a scanner stops at
+    /// this bound — but only where the code agrees that it ends there, since
+    /// unwind info covering just part of a function is common in assembly and
+    /// missing a relocation in real code is far worse than inventing one in
+    /// data.
+    pub fde_end: Option<u64>,
+    /// The symbol the unit is extracted for, for messages.
+    pub sym: &'a str,
+    /// The library, for what the code reads out of other sections (a jump
+    /// table's entries).
+    pub elf: &'a object::read::elf::ElfFile64<'data>,
 }
 
-/// aarch64 (`EM_AARCH64`), LP64, per the ARM ELF ABI (AAELF64) and glibc's
-/// `sysdeps/aarch64`.
-///
-/// Not in [`SUPPORTED`] yet, so an aarch64 executable is still refused at the
-/// gate: the extractor follows a section-anchor reference (`adrp`/`add` of an
-/// anchor, then `add #offset`) to the anchor object rather than the one it
-/// reaches. Until then this is what the per-architecture
-/// tables of the search, the reader, the extractor, the patcher and the
-/// writer are tested against.
-#[cfg_attr(not(test), allow(dead_code))]
-pub static AARCH64: Arch = {
-    use Unliftable::{Copy, Ifunc, Tls};
-    use object::elf::{
-        EM_AARCH64, GNU_PROPERTY_AARCH64_FEATURE_1_AND, R_AARCH64_COPY, R_AARCH64_GLOB_DAT,
-        R_AARCH64_IRELATIVE, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE, R_AARCH64_TLS_DTPMOD,
-        R_AARCH64_TLS_DTPREL, R_AARCH64_TLS_TPREL, R_AARCH64_TLSDESC,
-    };
+/// What [`MachineCode::scan`] found in a text unit.
+#[derive(Debug, Default)]
+pub struct UnitScan {
+    /// Every address the code keeps. An architecture whose references come in
+    /// pairs lists the half carrying the full address first; see
+    /// [`RefSite::AdrpOf`].
+    pub refs: Vec<CodeRef>,
+    /// The jump tables the code indexes.
+    pub jump_tables: Vec<JumpTable>,
+}
 
-    Arch {
-        name: "aarch64",
-        e_machine: EM_AARCH64.0,
-        reloc: DynRelocTypes {
-            relative: R_AARCH64_RELATIVE.0,
-            glob_dat: R_AARCH64_GLOB_DAT.0,
-            jump_slot: R_AARCH64_JUMP_SLOT.0,
-            copy: R_AARCH64_COPY.0,
-        },
-        // Every dynamic relocation AAELF64 defines other than the three above.
-        // Unlike x86-64 there is no SIZE relocation, and the static TLS forms
-        // (`TLSGD_ADR_PAGE21` and the rest) are resolved by the linker into
-        // instruction fields and GOT slots carrying the dynamic ones below, so
-        // they never reach a shared library's dynamic tables. The TLS names
-        // are the ones readelf prints; `object` and glibc's `elf.h` drop the
-        // `64`.
-        unliftable_relocs: &[
-            (R_AARCH64_TLS_DTPMOD.0, "R_AARCH64_TLS_DTPMOD64", Tls),
-            (R_AARCH64_TLS_DTPREL.0, "R_AARCH64_TLS_DTPREL64", Tls),
-            (R_AARCH64_TLS_TPREL.0, "R_AARCH64_TLS_TPREL64", Tls),
-            (R_AARCH64_TLSDESC.0, "R_AARCH64_TLSDESC", Tls),
-            (R_AARCH64_IRELATIVE.0, "R_AARCH64_IRELATIVE", Ifunc),
-            (R_AARCH64_COPY.0, "R_AARCH64_COPY", Copy),
-        ],
-        // `FLAG_AARCH64_LIB64 | FLAG_ELF_LIBC6`, glibc's
-        // `sysdeps/unix/sysv/linux/aarch64/dl-cache.h`. As on x86-64,
-        // `_dl_cache_check_flags` accepts exactly this value, so an ILP32
-        // (`FLAG_AARCH64_LIB32`) or foreign entry is never loaded.
-        ldso_cache_flags: 0x0a03,
-        // glibc's aarch64 `configure` puts LP64 libraries in `/lib64`, the
-        // same as x86-64, so `$LIB` expands the same way.
-        lib_token: "lib64",
-        default_lib_dirs: &[
-            "/lib64",
-            "/usr/lib64",
-            "/lib",
-            "/usr/lib",
-            "/lib/aarch64-linux-gnu",
-            "/usr/lib/aarch64-linux-gnu",
-        ],
-        // aarch64 kernels run with 4, 16 or 64 KiB pages, which is why
-        // distribution linkers default to `-z max-page-size=0x10000`.
-        max_page_size: 0x10000,
-        gnu_properties: GnuProperties {
-            feature_1_and: GNU_PROPERTY_AARCH64_FEATURE_1_AND.0,
-            feature_1_family: "BTI/PAC/GCS",
-            // `GNU_PROPERTY_AARCH64_FEATURE_1_{BTI,PAC,GCS}`. BTI is the one
-            // that faults: the loader maps the executable's code guarded, and
-            // a merged function without a `bti c` landing pad is entered
-            // through the trampoline's `br`. GCS (binutils 2.44, glibc 2.41)
-            // is AND-combined the same way, and glibc checks it against every
-            // object it loads.
-            feature_1_bits: &[(1 << 0, "BTI"), (1 << 1, "PAC"), (1 << 2, "GCS")],
-            // aarch64 has no ISA-level property.
-            isa_1_needed: None,
-        },
-        trampoline: Trampoline {
-            len: crate::aarch64::TRAMPOLINE_LEN as u64,
-            encode: aarch64_trampoline,
-        },
+/// A table of 32-bit offsets, each the distance from the table's base to a
+/// branch target inside the function that indexes it. The table and the
+/// function move apart in the merge, so each entry is relocated.
+#[derive(Debug, Clone)]
+pub struct JumpTable {
+    /// Virtual address of the table base in the shared library.
+    pub table_vaddr: u64,
+    /// Target virtual addresses, one per 4-byte table entry.
+    pub targets: Vec<u64>,
+}
+
+/// An address found in machine code: an x86-64 RIP-relative displacement, or
+/// an aarch64 instruction field.
+#[derive(Debug, Clone)]
+pub struct CodeRef {
+    /// Byte offset within the code of the patch site: where the displacement
+    /// starts, or the instruction word that holds the field.
+    pub offset: usize,
+    /// Target virtual address this reference points to.
+    pub target_vaddr: u64,
+    /// Whether this is a code reference (call/jmp) vs data reference (lea/mov).
+    pub is_code_ref: bool,
+    /// How many bytes at `target_vaddr` the instruction reads or writes, where
+    /// the instruction says: that bounds the object the reference reaches, and
+    /// so bounds how much of a data section has to be copied for it (see
+    /// `extractor::needed_prefix`). `None` for a code reference, and for the
+    /// instructions that take an address without saying what is at it.
+    pub access_len: Option<u64>,
+    /// How the address is written into the code.
+    pub site: RefSite,
+}
+
+#[derive(Debug, Clone)]
+pub enum RefSite {
+    /// An x86-64 little-endian displacement.
+    Disp {
+        /// Size of the encoded displacement in bytes: 4 (rel32) or 1 (rel8,
+        /// short jumps only).
+        size: u8,
+        /// Relocation addend: -(bytes from displacement start to instruction
+        /// end). This is -4 when the displacement is the final field, but
+        /// instructions like `cmpb $imm, [rip+d]` carry an immediate after the
+        /// displacement, which shifts next_ip further and makes the addend
+        /// more negative.
+        addend: i64,
+    },
+    /// An aarch64 instruction field.
+    Insn(InsnField),
+    /// The `adrp` half of an aarch64 pair. It is relocated against whatever
+    /// the `:lo12:` instruction at this unit offset resolved to: the page is
+    /// all an `adrp` encodes, so that is the only way to know which object it
+    /// is for.
+    AdrpOf(usize),
+}
+
+impl CodeRef {
+    /// Whether the reference stays right when the unit moves as a whole and
+    /// its target moves with it. A displacement, or an aarch64 branch or `adr`,
+    /// to somewhere inside the same function is; an `adrp` pair is not, since
+    /// it names a 4 KiB page and the low twelve bits of an absolute address,
+    /// and the unit is not placed at the same offset into a page.
+    pub fn moves_with_its_unit(&self) -> bool {
+        match &self.site {
+            RefSite::Disp { .. } => true,
+            RefSite::Insn(insn) => insn.field != aarch64::Field::Lo12,
+            RefSite::AdrpOf(_) => false,
+        }
     }
-};
+
+    /// Whether this is the `:lo12:` half of an aarch64 pair, which carries the
+    /// full address that the `adrp`s of the pair name only the page of: what it
+    /// resolves to is what they are relocated against.
+    pub fn completes_a_page(&self) -> bool {
+        matches!(&self.site, RefSite::Insn(insn) if insn.field == aarch64::Field::Lo12)
+    }
+
+    /// The relocation writing `target`, `extra` bytes into it, at this site.
+    pub fn reloc(&self, extra: i64, target: RelocTarget) -> ExtractedReloc {
+        match &self.site {
+            RefSite::Disp { size, addend } => {
+                crate::extractor::pcrel_reloc(self.offset as u64, size * 8, addend + extra, target)
+            }
+            RefSite::Insn(insn) => ExtractedReloc {
+                insn: Some(insn.clone()),
+                ..crate::extractor::pcrel_reloc(self.offset as u64, 32, extra, target)
+            },
+            RefSite::AdrpOf(_) => ExtractedReloc {
+                insn: Some(InsnField {
+                    field: aarch64::Field::AdrpPage,
+                    adrps: Vec::new(),
+                }),
+                ..crate::extractor::pcrel_reloc(self.offset as u64, 32, extra, target)
+            },
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

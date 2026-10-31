@@ -144,7 +144,7 @@ fn apply_unit_relocations(
 /// `offset` to reach `S + A` from `P`, leaving the rest of the word alone.
 fn apply_insn_reloc(
     bytes: &mut [u8],
-    field: crate::aarch64::Field,
+    field: crate::arch::aarch64::Field,
     offset: usize,
     s: u64,
     a: i64,
@@ -152,7 +152,7 @@ fn apply_insn_reloc(
 ) -> Result<()> {
     let unit_len = bytes.len();
     let site = offset
-        .checked_add(crate::aarch64::INSN_LEN)
+        .checked_add(crate::arch::aarch64::INSN_LEN)
         .and_then(|end| bytes.get_mut(offset..end))
         .with_context(|| {
             format!("instruction at offset {offset} overflows unit of size {unit_len}")
@@ -182,11 +182,13 @@ fn check_adrp_pages(
     for &adrp in adrps {
         let at = adrp as usize;
         let word = bytes
-            .get(at..at + crate::aarch64::INSN_LEN)
+            .get(at..at + crate::arch::aarch64::INSN_LEN)
             .map(|w| u32::from_le_bytes(w.try_into().expect("one word")))
-            .with_context(|| format!("adrp at offset {at} overflows unit of size {}", bytes.len()))?;
-        let page = crate::aarch64::pc_relative_ref(word, base + adrp)?
-            .filter(|r| r.field == crate::aarch64::Field::AdrpPage)
+            .with_context(|| {
+                format!("adrp at offset {at} overflows unit of size {}", bytes.len())
+            })?;
+        let page = crate::arch::aarch64::pc_relative_ref(word, base + adrp)?
+            .filter(|r| r.field == crate::arch::aarch64::Field::AdrpPage)
             .with_context(|| format!("0x{word:08x} at offset 0x{at:x} is not an adrp"))?
             .target;
         if page != want {
@@ -465,7 +467,7 @@ mod tests {
     /// the load reaching 0x10 and the store `store_at` bytes into unit 1 at
     /// 0x50_0f00, both completing the one `adrp`.
     fn shared_adrp_unit(store_at: i64) -> (AssignedUnit, UnitVaddrs) {
-        use crate::aarch64::Field::{AdrpPage, Lo12};
+        use crate::arch::aarch64::Field::{AdrpPage, Lo12};
         use crate::types::{ExtractedReloc, ExtractedUnit, InsnField, SectionKind, UnitId};
 
         const ADRP_X2: u32 = 0x9000_0002;
@@ -521,7 +523,7 @@ mod tests {
             .chunks_exact(4)
             .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
             .collect();
-        let adrp = crate::aarch64::pc_relative_ref(words[0], 0x40_0010)
+        let adrp = crate::arch::aarch64::pc_relative_ref(words[0], 0x40_0010)
             .unwrap()
             .expect("still an adrp");
         assert_eq!(adrp.target, 0x50_0000);

@@ -5,14 +5,7 @@ use iced_x86::{FlowControl, Instruction, Mnemonic, OpKind, Register};
 use object::ObjectSection;
 use tracing::debug;
 
-/// A detected jump table in .rodata
-#[derive(Debug, Clone)]
-pub struct JumpTable {
-    /// Virtual address of the table base in the shared library
-    pub table_vaddr: u64,
-    /// Target virtual addresses, one per 4-byte table entry
-    pub targets: Vec<u64>,
-}
+pub use crate::arch::JumpTable;
 
 /// Abstract value tracked per register during symbolic execution.
 #[derive(Debug, Clone)]
@@ -104,7 +97,7 @@ fn memory_regs(instr: &Instruction) -> (Register, Register) {
 ///
 /// `instrs` are the function's instructions and `code_len` the number of bytes
 /// they span, decoded once by the caller (see
-/// [`crate::extractor::decode_instructions`]).
+/// [`super::decode_instructions`]).
 pub fn detect_jump_tables(
     instrs: &[Instruction],
     code_len: u64,
@@ -417,7 +410,7 @@ mod tests {
         };
 
         let (code, base) = function_code(elf, "pcre2_config_8");
-        let instrs = crate::extractor::decode_instructions(&code, base);
+        let instrs = super::super::decode_instructions(&code, base);
         let tables = detect_jump_tables(&instrs, code.len() as u64, base, "pcre2_config_8", elf)
             .expect("detect");
         assert_eq!(tables.len(), 2, "{tables:#x?}");

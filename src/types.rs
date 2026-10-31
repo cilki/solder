@@ -256,7 +256,7 @@ pub struct ExtractedReloc {
 #[derive(Debug, Clone)]
 pub struct InsnField {
     /// Which bits of the word carry the address.
-    pub field: crate::aarch64::Field,
+    pub field: crate::arch::aarch64::Field,
     /// For a `:lo12:` half, the unit offsets of the `adrp`s whose page it
     /// completes. The `:lo12:` bits only say where in a page the target is;
     /// the relocator checks that each of these `adrp`s was pointed at the

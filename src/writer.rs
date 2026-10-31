@@ -1227,8 +1227,8 @@ mod trampoline_tests {
     fn an_aarch64_trampoline_is_aarch64_code() {
         let mut plan = plan(&crate::arch::AARCH64, SLOT);
         let seg = build_merged_segment(&mut plan).expect("build the segment");
-        let expected = crate::aarch64::trampoline(LOAD, SLOT).expect("encode");
-        assert_eq!(seg[..crate::aarch64::TRAMPOLINE_LEN], expected);
+        let expected = crate::arch::aarch64::trampoline(LOAD, SLOT).expect("encode");
+        assert_eq!(seg[..crate::arch::aarch64::TRAMPOLINE_LEN], expected);
         assert!(plan.relative_relocs.is_empty(), "nothing in it is absolute");
     }
 
@@ -1537,7 +1537,9 @@ mod section_header_tests {
         );
 
         let dynamic = DynamicTable::parse(&bytes).expect("parse .dynamic of the merged output");
-        let va = dynamic.value_of(DT_PREINIT_ARRAY).expect("DT_PREINIT_ARRAY");
+        let va = dynamic
+            .value_of(DT_PREINIT_ARRAY)
+            .expect("DT_PREINIT_ARRAY");
         let size = dynamic
             .value_of(DT_PREINIT_ARRAYSZ)
             .expect("DT_PREINIT_ARRAYSZ");

@@ -151,7 +151,12 @@ pub fn plan_layout(
     // out of — so nothing needs the ambiguous form.
     let unit_vaddrs: HashMap<(&PathBuf, &str), u64> = units
         .iter()
-        .map(|au| ((&au.unit.source_lib, au.unit.name.as_str()), au.assigned_vaddr))
+        .map(|au| {
+            (
+                (&au.unit.source_lib, au.unit.name.as_str()),
+                au.assigned_vaddr,
+            )
+        })
         .collect();
 
     // Build GOT patches: one per imported symbol.

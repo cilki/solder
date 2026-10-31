@@ -3,16 +3,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow, bail};
-use iced_x86::Instruction;
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
-use crate::aarch64;
-use crate::arch::{Arch, Unliftable};
+use crate::arch::{Arch, RefSite, TextUnit, UnitScan, Unliftable};
 use crate::elf_reader::MappedElf;
 use crate::types::{
     DATA_BLOB_ALIGNMENT, DataSectionCopy, ExtractedReloc, ExtractedUnit, GotSlotFixup,
-    InitFiniArrays, InitFiniEntry, InsnField, RelocTarget, SectionKind, UnboundedEnd, UnitId,
+    InitFiniArrays, InitFiniEntry, RelocTarget, SectionKind, UnboundedEnd, UnitId,
 };
 
 /// The map the extractor's own caches are kept in.
@@ -548,7 +546,12 @@ struct UnitRelocs {
 /// scanner found, at `offset` bytes into the unit being extracted. Every
 /// scanned reference is patched the same way — only the displacement width,
 /// the addend and the target differ.
-fn pcrel_reloc(offset: u64, size: u8, addend: i64, target: RelocTarget) -> ExtractedReloc {
+pub(crate) fn pcrel_reloc(
+    offset: u64,
+    size: u8,
+    addend: i64,
+    target: RelocTarget,
+) -> ExtractedReloc {
     ExtractedReloc {
         offset_within_unit: offset,
         kind: object::RelocationKind::Relative,
@@ -850,36 +853,25 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
     }
 
     // A text unit's bytes are the function plus whatever sits between its last
-    // instruction and the next bound, which is not code (see
-    // `decode_unit_code`). Decoding is what extraction spends most of its time
-    // on, and the extent, the RIP-relative scan and the jump-table detector all
-    // want the same instruction stream, so it is decoded once here and shared
-    // rather than re-derived by each of the three.
-    //
-    // aarch64 code is read a word at a time by `aarch64`'s own scanners, so
-    // there is no stream to share; and its references come from two of them,
-    // one per instruction and one pairing each `adrp` with what completes it.
-    let is_aarch64 = state.arch.e_machine == object::elf::EM_AARCH64.0;
-    let (code, code_refs) = if section_kind != SectionKind::Text {
-        let code = UnitCode {
-            instrs: Vec::new(),
-            len: bytes.len(),
-        };
-        (code, Vec::new())
-    } else if is_aarch64 {
-        let len = aarch64_code_len(&bytes, sym_vaddr, lib.index);
-        let refs = scan_aarch64_refs(&bytes[..len], sym_vaddr)?;
-        let code = UnitCode {
-            instrs: Vec::new(),
-            len,
-        };
-        (code, refs)
+    // instruction and the next bound, which is not code. The architecture's
+    // scanner reads the code once and reports everything the rest of this
+    // function needs from it: how far the code runs, the addresses its
+    // instructions keep, and the jump tables it indexes. See
+    // `arch::MachineCode::scan`.
+    let scan = if section_kind == SectionKind::Text {
+        (state.arch.code.scan)(&TextUnit {
+            bytes: &bytes,
+            vaddr: sym_vaddr,
+            fde_end: function_fde_end(lib.index, sym_vaddr),
+            sym: &key.sym,
+            elf: lib.elf,
+        })?
     } else {
-        let code = decode_unit_code(&bytes, sym_vaddr, lib.index);
-        let refs = scan_rip_relative_refs(&code.instrs, &bytes, sym_vaddr);
-        (code, refs)
+        UnitScan {
+            refs: Vec::new(),
+            jump_tables: Vec::new(),
+        }
     };
-    let code_len = code.len;
 
     // What each aarch64 `:lo12:` instruction resolved to, by its offset, for
     // the `adrp` that supplies its page (see `RefSite::AdrpOf`).
@@ -887,11 +879,11 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
 
     // Create synthetic relocations for each reference the scan found (calls,
     // jumps, and data accesses) so they get patched correctly.
-    for code_ref in code_refs {
+    for code_ref in scan.refs {
         let target_addr = code_ref.target_vaddr;
 
         if let RefSite::AdrpOf(lo12) = code_ref.site {
-            // `scan_aarch64_refs` puts every `:lo12:` ahead of the `adrp`s.
+            // The scanner puts every `:lo12:` ahead of the `adrp`s.
             // One that resolved nowhere was warned about already, and leaves
             // nothing for its page to agree with.
             if let Some((extra, target)) = lo12_resolved.get(&lo12) {
@@ -944,9 +936,9 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
                     // The relocator computes S + A - P against the unit's
                     // base, so an interior target is reached through the
                     // addend.
-                    relocs.relocations.push(
-                        code_ref.reloc(dep.offset as i64, RelocTarget::MergedUnit(dep.id)),
-                    );
+                    relocs
+                        .relocations
+                        .push(code_ref.reloc(dep.offset as i64, RelocTarget::MergedUnit(dep.id)));
                 } else {
                     warn!(
                         symbol = key.sym,
@@ -967,22 +959,16 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
                 Some((dep.offset as i64, RelocTarget::MergedUnit(dep.id)))
             } else {
                 // Otherwise try to extract the data section
-                ensure_data_blob_extracted(
-                    lib,
-                    &key.sym,
-                    target_addr,
-                    code_ref.access_len,
-                    state,
-                )?
-                .map(|(blob_id, blob_base)| {
-                    (
-                        0,
-                        RelocTarget::DataBlobOffset(blob_id, target_addr - blob_base),
-                    )
-                })
+                ensure_data_blob_extracted(lib, &key.sym, target_addr, code_ref.access_len, state)?
+                    .map(|(blob_id, blob_base)| {
+                        (
+                            0,
+                            RelocTarget::DataBlobOffset(blob_id, target_addr - blob_base),
+                        )
+                    })
             };
             if let Some((extra, target)) = resolved {
-                if is_aarch64 {
+                if code_ref.completes_a_page() {
                     lo12_resolved.insert(code_ref.offset, (extra, target.clone()));
                 }
                 relocs.relocations.push(code_ref.reloc(extra, target));
@@ -997,120 +983,76 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
         }
     }
 
-    // Jump table detection via symbolic execution
-    if section_kind == SectionKind::Text
-        && let Ok(jump_tables) = crate::jump_table::detect_jump_tables(
-            &code.instrs,
-            code_len as u64,
-            sym_vaddr,
-            &key.sym,
-            lib.elf,
-        )
-    {
-        if !jump_tables.is_empty() {
-            debug!(
-                count = jump_tables.len(),
-                symbol = key.sym,
-                "Found jump tables"
-            );
-        }
+    // Jump tables the scanner found: each entry is the offset of a target in
+    // this unit from the table's base, which the merge moves apart.
+    if !scan.jump_tables.is_empty() {
+        debug!(
+            count = scan.jump_tables.len(),
+            symbol = key.sym,
+            "Found jump tables"
+        );
+    }
+    for table in scan.jump_tables {
+        // 1. Ensure .rodata blob containing table is extracted. The table
+        // is as long as the entries detected in it, four bytes apiece, and
+        // the relocations written below cover all of them — so that, and
+        // not one entry, is what the copy has to reach.
+        let table_len = Some(JUMP_TABLE_ENTRY_SIZE * table.targets.len() as u64);
+        if let Some((blob_id, blob_base)) =
+            ensure_data_blob_extracted(lib, &key.sym, table.table_vaddr, table_len, state)?
+        {
+            // 2. Create relocations for each table entry
+            for (idx, target_addr) in table.targets.iter().enumerate() {
+                let entry_offset_in_blob =
+                    (table.table_vaddr - blob_base) + idx as u64 * JUMP_TABLE_ENTRY_SIZE;
 
-        for table in jump_tables {
-            // 1. Ensure .rodata blob containing table is extracted. The table
-            // is as long as the entries detected in it, four bytes apiece, and
-            // the relocations written below cover all of them — so that, and
-            // not one entry, is what the copy has to reach.
-            let table_len = Some(JUMP_TABLE_ENTRY_SIZE * table.targets.len() as u64);
-            if let Some((blob_id, blob_base)) =
-                ensure_data_blob_extracted(lib, &key.sym, table.table_vaddr, table_len, state)?
-            {
-                // 2. Create relocations for each table entry
-                for (idx, target_addr) in table.targets.iter().enumerate() {
-                    let entry_offset_in_blob =
-                        (table.table_vaddr - blob_base) + idx as u64 * JUMP_TABLE_ENTRY_SIZE;
-
-                    // Skip if a relocation already exists at this offset (from another
-                    // function detecting an overlapping table at the same .rodata address)
-                    if !state.claim_blob_offset(blob_id, entry_offset_in_blob) {
-                        continue;
-                    }
-
-                    // 3. `detect_jump_tables` only keeps entries that branch into
-                    // this unit, so the target is always an offset into it.
-                    let offset_in_target = (*target_addr - sym_vaddr) as i64;
-
-                    // Jump table entry format: target = table_base + *(i32*)entry
-                    // Therefore: *(i32*)entry = target - table_base
-                    //
-                    // After relocation:
-                    // - entry is at address P (= table_base_va + idx*4)
-                    // - target is at address S + offset_in_target
-                    // - We need: *(i32*)P = (S + offset_in_target) - table_base_va
-                    //
-                    // Relocation formula writes: *(i32*)P = S + A - P
-                    // Since P = table_base_va + idx*4:
-                    //   S + A - P = S + A - table_base_va - idx*4
-                    // We need this to equal S + offset_in_target - table_base_va
-                    // Therefore: A = offset_in_target + idx*4
-                    let addend = offset_in_target + (idx * 4) as i64;
-
-                    // 4. Add jump table entry relocation to the data blob. Its
-                    // target is this very unit — `detect_jump_tables` keeps no
-                    // other — and this unit's id is the one reserved for it at
-                    // the top, so the entry needs no placeholder.
-                    let Some(blob_unit) = state.unit_mut(blob_id) else {
-                        continue;
-                    };
-                    blob_unit.relocations.push(pcrel_reloc(
-                        entry_offset_in_blob,
-                        32,
-                        addend, // offset within target function, PC-relative
-                        RelocTarget::MergedUnit(id),
-                    ));
+                // Skip if a relocation already exists at this offset (from another
+                // function detecting an overlapping table at the same .rodata address)
+                if !state.claim_blob_offset(blob_id, entry_offset_in_blob) {
+                    continue;
                 }
+
+                // 3. `detect_jump_tables` only keeps entries that branch into
+                // this unit, so the target is always an offset into it.
+                let offset_in_target = (*target_addr - sym_vaddr) as i64;
+
+                // Jump table entry format: target = table_base + *(i32*)entry
+                // Therefore: *(i32*)entry = target - table_base
+                //
+                // After relocation:
+                // - entry is at address P (= table_base_va + idx*4)
+                // - target is at address S + offset_in_target
+                // - We need: *(i32*)P = (S + offset_in_target) - table_base_va
+                //
+                // Relocation formula writes: *(i32*)P = S + A - P
+                // Since P = table_base_va + idx*4:
+                //   S + A - P = S + A - table_base_va - idx*4
+                // We need this to equal S + offset_in_target - table_base_va
+                // Therefore: A = offset_in_target + idx*4
+                let addend = offset_in_target + (idx * 4) as i64;
+
+                // 4. Add jump table entry relocation to the data blob. Its
+                // target is this very unit — `detect_jump_tables` keeps no
+                // other — and this unit's id is the one reserved for it at
+                // the top, so the entry needs no placeholder.
+                let Some(blob_unit) = state.unit_mut(blob_id) else {
+                    continue;
+                };
+                blob_unit.relocations.push(pcrel_reloc(
+                    entry_offset_in_blob,
+                    32,
+                    addend, // offset within target function, PC-relative
+                    RelocTarget::MergedUnit(id),
+                ));
             }
         }
     }
 
-    // Rewrite short (rel8) branch relocations through 5-byte `jmp rel32`
-    // veneers. A 1-byte displacement can rarely reach its real target once
-    // units are repacked. The veneer goes at the end of the unit when the
-    // short jump can reach it; for larger units (over-extended anonymous units
-    // in stripped libraries), it overwrites the never-executed inter-function
-    // alignment padding that follows the branch instead.
+    // A short branch to another unit may not reach it once the units are
+    // repacked, so the architecture sends each through a veneer of its own
+    // that does. See `arch::MachineCode::veneer_short_branches`.
     let mut bytes = bytes;
-    if is_aarch64 {
-        veneer_aarch64_short_branches(&mut bytes, &mut relocs.relocations, &key.sym)?;
-    }
-    for reloc in relocs.relocations.iter_mut() {
-        if reloc.size != 8 {
-            continue;
-        }
-        let disp_off = reloc.offset_within_unit as usize;
-        let end_off = bytes.len();
-        let veneer_off = if end_off as i64 - (disp_off as i64 + 1) <= i8::MAX as i64 {
-            bytes.extend_from_slice(&[0xe9, 0, 0, 0, 0]);
-            end_off
-        } else if let Some(slot) = find_padding_slot(&bytes, disp_off + 1, 5) {
-            bytes[slot..slot + 5].copy_from_slice(&[0xe9, 0, 0, 0, 0]);
-            slot
-        } else {
-            bail!(
-                "short jump at offset {:#x} in '{}' has no reachable spot for a \
-                 rel32 veneer (unit end {} bytes away, no padding after the jump)",
-                disp_off,
-                key.sym,
-                end_off - disp_off
-            );
-        };
-        bytes[disp_off] = (veneer_off as i64 - (disp_off as i64 + 1)) as i8 as u8;
-        reloc.offset_within_unit = veneer_off as u64 + 1;
-        reloc.size = 32;
-        // The addend of a scanned branch is -(displacement width) plus the
-        // target's offset into its unit. Only the width changes here, from the
-        // rel8 field to the veneer's rel32 one; the target offset must survive.
-        reloc.addend -= 3;
-    }
+    (state.arch.code.veneer_short_branches)(&mut bytes, &mut relocs.relocations, &key.sym)?;
 
     // Register this unit under the id reserved for it.
     let relocations = state.take_unit_relocs(id, &mut bytes, relocs);
@@ -1125,72 +1067,6 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
         relocations,
     });
 
-    Ok(())
-}
-
-/// Send each aarch64 short-range branch that leaves its unit through a `b`
-/// veneer appended to the unit, the aarch64 counterpart of the x86-64 rel8
-/// veneers in [`process_symbol`].
-///
-/// A `b.cond`, `cbz` or `tbz` reaches ±1 MiB or ±32 KiB, and nothing keeps its
-/// target that close once the merge has placed the units: the library had it
-/// nearby, the merged segment may not, and the relocator could then only
-/// refuse the merge. A linker in the same position cannot help either, since
-/// AAELF64 only lets it insert veneers for `b`/`bl`. So the branch is pointed
-/// at a `b` at the end of its own unit, which moves with it and so never goes
-/// out of reach, and the relocation moves to that `b`, whose ±128 MiB covers
-/// any merged segment. Compilers do not branch conditionally into another
-/// function, but hand-written assembly (glibc's string functions, OpenSSL's
-/// primitives) does.
-///
-/// A branch inside its own unit carries no relocation (see
-/// [`CodeRef::moves_with_its_unit`]) and is left alone.
-fn veneer_aarch64_short_branches(
-    bytes: &mut Vec<u8>,
-    relocations: &mut [ExtractedReloc],
-    sym: &str,
-) -> Result<()> {
-    use aarch64::{Field, INSN_LEN};
-
-    for reloc in relocations.iter_mut() {
-        let Some(insn) = reloc.insn.as_mut() else {
-            continue;
-        };
-        if !matches!(insn.field, Field::Imm19 | Field::Imm14) {
-            continue;
-        }
-        let at = reloc.offset_within_unit as usize;
-        let word = u32::from_le_bytes(
-            bytes[at..at + INSN_LEN]
-                .try_into()
-                .expect("an instruction word"),
-        );
-        if !aarch64::is_short_branch(word) {
-            continue;
-        }
-
-        // A unit may stop short of a word boundary when a symbol's size
-        // does; the bytes in between are never executed.
-        bytes.resize(bytes.len().next_multiple_of(INSN_LEN), 0);
-        let veneer = bytes.len();
-        bytes.extend_from_slice(&aarch64::VENEER.to_le_bytes());
-
-        let branch = insn
-            .field
-            .patch(word, veneer as u64, 0, at as u64)
-            .with_context(|| {
-                format!(
-                    "branch at offset {at:#x} in '{sym}' cannot reach a veneer at the \
-                     end of the unit"
-                )
-            })?;
-        bytes[at..at + INSN_LEN].copy_from_slice(&branch.to_le_bytes());
-
-        // The target and addend stay as they were: an aarch64 field's addend
-        // is the offset into the target, with no width folded in.
-        reloc.offset_within_unit = veneer as u64;
-        insn.field = Field::Imm26;
-    }
     Ok(())
 }
 
@@ -1303,7 +1179,10 @@ struct LibIndex {
 /// name no object. Taken for one, `$x` shadows the function at its address
 /// and a `$d` inside `.text` cuts the function holding a literal pool short.
 fn is_mapping_symbol(name: &str) -> bool {
-    matches!(name.as_bytes(), [b'$', b'x' | b'd'] | [b'$', b'x' | b'd', b'.', ..])
+    matches!(
+        name.as_bytes(),
+        [b'$', b'x' | b'd'] | [b'$', b'x' | b'd', b'.', ..]
+    )
 }
 
 impl LibIndex {
@@ -1708,470 +1587,38 @@ fn anon_target_is_extractable(lib: Lib<'_, '_>, addr: u64) -> bool {
             .is_some_and(|section| section.kind() == ObjSectionKind::Text)
 }
 
-/// A text unit's instruction stream, and how many of the unit's leading bytes
-/// those instructions cover.
-struct UnitCode {
-    /// The unit's first `len` bytes, decoded.
-    instrs: Vec<Instruction>,
-    /// How many of a text unit's leading bytes are instructions of the function
-    /// it was extracted for.
-    len: usize,
-}
-
-/// Decode a text unit's code, stopping where the function's instructions do.
-///
-/// A unit covers the function plus everything the linker left between its last
-/// instruction and the bound extraction stopped at: alignment padding, and —
-/// in the hand-written assembly libcrypto is full of — the constants the module
-/// keeps in `.text` next to the code that uses them (CRYPTOGAMS' banner
-/// strings, RC4's option strings). Decoding that tail as code invents
-/// relocations, extraction dependencies and short-branch veneers out of
-/// constant data: `.solder.anon.0x20db00` in `test/libs/libcrypto.so.3` is a
-/// 0x63-byte function followed by 0x4d bytes of banner string, which decodes
-/// into seven bogus rel8 branches and a reference 0x20 MiB outside the library.
-/// One such invention — a rel8 branch with nowhere to put its veneer — is a
-/// hard error, so the fiction is not merely wasteful.
-///
-/// `.eh_frame` says where the function ends. Trust it only where the
-/// instruction stream agrees: the last instruction inside the FDE has to end
-/// exactly at the FDE's end and has to be one that does not fall through.
-/// Hand-written assembly whose unwind info covers only part of its function
-/// fails that test and keeps being scanned to the end of the unit, since
-/// missing a relocation in real code is far worse than inventing one in data.
-fn decode_unit_code(bytes: &[u8], vaddr: u64, index: &LibIndex) -> UnitCode {
-    // Only an FDE that starts where the unit starts describes the unit's
-    // function; one that merely contains `vaddr` belongs to a function the unit
-    // begins partway into, and says nothing about where the unit's code ends.
-    let fde_end = index
-        .fdes
-        .containing(vaddr)
-        .filter(|&(start, _)| start == vaddr)
-        .map(|(_, end)| end);
-    decode_to_code_bound(bytes, vaddr, fde_end)
-}
-
-/// `decode_unit_code` with the unwind bound supplied rather than looked up.
-fn decode_to_code_bound(bytes: &[u8], vaddr: u64, fde_end: Option<u64>) -> UnitCode {
-    // A bound at or past the end of the unit leaves nothing to cut.
-    let claimed = fde_end
-        .and_then(|end| end.checked_sub(vaddr))
-        .map(|len| len as usize)
-        .filter(|&len| len < bytes.len());
-
-    // Decode only as far as the unwind info claims the function runs. Where the
-    // claim holds, the tail — which is not code — is never decoded at all,
-    // which is the point of cutting there in the first place.
-    let Some(len) = claimed else {
-        return UnitCode {
-            instrs: decode_instructions(bytes, vaddr),
-            len: bytes.len(),
-        };
-    };
-
-    let mut instrs = decode_instructions(&bytes[..len], vaddr);
-    if ends_the_function(&instrs, vaddr + len as u64) {
-        return UnitCode { instrs, len };
-    }
-
-    // The claim was rejected, so the scanners get the whole unit. Decoding one
-    // instruction does not depend on what follows it, so what has been decoded
-    // already stands — bar a last instruction the cut may have run through the
-    // middle of — and the decode picks up after it instead of starting over.
-    instrs.pop();
-    let resume = instrs.last().map_or(vaddr, |i| i.next_ip());
-    instrs.extend(decode_instructions(
-        &bytes[(resume - vaddr) as usize..],
-        resume,
-    ));
-    UnitCode {
-        instrs,
-        len: bytes.len(),
-    }
-}
-
-/// Whether the decode agrees that a function ends at `end`: the last
-/// instruction has to end exactly on it and has to be one that does not fall
-/// through. Anything else — unwind info that stops mid-function, a bound that
-/// lands inside an instruction — is not an ending.
-fn ends_the_function(instrs: &[Instruction], end: u64) -> bool {
-    use iced_x86::FlowControl;
-
-    instrs.last().is_some_and(|last| {
-        !last.is_invalid()
-            && last.next_ip() == end
-            && matches!(
-                last.flow_control(),
-                FlowControl::Return
-                    | FlowControl::UnconditionalBranch
-                    | FlowControl::IndirectBranch
-                    | FlowControl::Exception
-            )
-    })
-}
-
-/// How many of an aarch64 text unit's leading bytes are its function's code:
-/// as far as the function's FDE claims, if [`aarch64::ends_the_function`]
-/// agrees that the code stops there, and the whole unit otherwise. See
-/// [`decode_unit_code`] for why the tail is worth cutting off and why the
-/// claim has to be checked.
-fn aarch64_code_len(bytes: &[u8], vaddr: u64, index: &LibIndex) -> usize {
+/// Where `.eh_frame` says the function starting at `vaddr` ends, if an FDE
+/// starts exactly there. One that merely contains `vaddr` belongs to a
+/// function the unit begins partway into, and says nothing about where the
+/// unit's code ends. The scanners check the claim before trusting it; see
+/// `arch::TextUnit::fde_end`.
+fn function_fde_end(index: &LibIndex, vaddr: u64) -> Option<u64> {
     index
         .fdes
         .containing(vaddr)
         .filter(|&(start, _)| start == vaddr)
-        .and_then(|(_, end)| end.checked_sub(vaddr))
-        .map(|len| len as usize)
-        .filter(|&len| len < bytes.len() && aarch64::ends_the_function(&bytes[..len]))
-        .unwrap_or(bytes.len())
-}
-
-/// Every address the aarch64 function in `code`, loaded at `vaddr`, keeps in
-/// its instructions: each branch, `adr` and literal load
-/// ([`aarch64::scan_pc_relative_refs`]), and each `adrp` pair
-/// ([`aarch64::pair_lo12_refs`]).
-///
-/// A pair is two references to one address. The `:lo12:` half carries it
-/// whole and comes first; each `adrp` follows as a [`RefSite::AdrpOf`] the
-/// first `:lo12:` it pairs with, which is the only place its full target is
-/// known. An `adrp` nothing completes reaches no address and is left alone.
-///
-/// A reference the scanners cannot account for — a page used other than as a
-/// `:lo12:` base, a PC-relative form with no field to rewrite — fails the
-/// extraction, since copying it as it is would leave it aimed at wherever the
-/// old offset lands.
-fn scan_aarch64_refs(code: &[u8], vaddr: u64) -> Result<Vec<CodeRef>> {
-    let mut refs = Vec::new();
-    let pairs = aarch64::pair_lo12_refs(code, vaddr)?;
-    for pair in &pairs {
-        let word = u32::from_le_bytes(
-            code[pair.offset..pair.offset + aarch64::INSN_LEN]
-                .try_into()
-                .expect("one word"),
-        );
-        refs.push(CodeRef {
-            offset: pair.offset,
-            target_vaddr: pair.target,
-            is_code_ref: false,
-            access_len: aarch64::lo12_access_len(word),
-            site: RefSite::Insn(InsnField {
-                field: aarch64::Field::Lo12,
-                adrps: pair.adrps.iter().map(|&a| a as u64).collect(),
-            }),
-        });
-    }
-    for (offset, r) in aarch64::scan_pc_relative_refs(code, vaddr)? {
-        let (site, target_vaddr) = if r.field == aarch64::Field::AdrpPage {
-            let Some(pair) = pairs.iter().find(|p| p.adrps.contains(&offset)) else {
-                continue;
-            };
-            (RefSite::AdrpOf(pair.offset), pair.target)
-        } else {
-            let site = RefSite::Insn(InsnField {
-                field: r.field,
-                adrps: Vec::new(),
-            });
-            (site, r.target)
-        };
-        refs.push(CodeRef {
-            offset,
-            target_vaddr,
-            is_code_ref: r.is_code_ref,
-            access_len: None,
-            site,
-        });
-    }
-    Ok(refs)
-}
-
-/// Find a run of at least `need` bytes of alignment padding starting at
-/// `start`: nop-family instructions or int3 fill emitted between functions,
-/// which is never executed and can be overwritten by a branch veneer.
-fn find_padding_slot(bytes: &[u8], start: usize, need: usize) -> Option<usize> {
-    use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic};
-
-    if start >= bytes.len() {
-        return None;
-    }
-    let mut decoder = Decoder::with_ip(64, &bytes[start..], 0, DecoderOptions::NONE);
-    let mut instr = Instruction::default();
-    let mut run = 0usize;
-    while decoder.can_decode() && run < need {
-        decoder.decode_out(&mut instr);
-        match instr.mnemonic() {
-            Mnemonic::Nop | Mnemonic::Int3 => run += instr.len(),
-            _ => break,
-        }
-    }
-    (run >= need).then_some(start)
-}
-
-/// An address found in machine code: an x86-64 RIP-relative displacement, or
-/// an aarch64 instruction field.
-#[derive(Debug, Clone)]
-struct CodeRef {
-    /// Byte offset within the code of the patch site: where the displacement
-    /// starts, or the instruction word that holds the field.
-    offset: usize,
-    /// Target virtual address this reference points to.
-    target_vaddr: u64,
-    /// Whether this is a code reference (call/jmp) vs data reference (lea/mov).
-    is_code_ref: bool,
-    /// How many bytes at `target_vaddr` the instruction reads or writes, where
-    /// the instruction says: that bounds the object the reference reaches, and
-    /// so bounds how much of a data section has to be copied for it (see
-    /// [`needed_prefix`]). `None` for a code reference, and for the
-    /// instructions that take an address without saying what is at it.
-    access_len: Option<u64>,
-    /// How the address is written into the code.
-    site: RefSite,
-}
-
-#[derive(Debug, Clone)]
-enum RefSite {
-    /// An x86-64 little-endian displacement.
-    Disp {
-        /// Size of the encoded displacement in bytes: 4 (rel32) or 1 (rel8,
-        /// short jumps only).
-        size: u8,
-        /// Relocation addend: -(bytes from displacement start to instruction
-        /// end). This is -4 when the displacement is the final field, but
-        /// instructions like `cmpb $imm, [rip+d]` carry an immediate after the
-        /// displacement, which shifts next_ip further and makes the addend
-        /// more negative.
-        addend: i64,
-    },
-    /// An aarch64 instruction field.
-    Insn(InsnField),
-    /// The `adrp` half of an aarch64 pair. It is relocated against whatever
-    /// the `:lo12:` instruction at this unit offset resolved to: the page is
-    /// all an `adrp` encodes, so that is the only way to know which object it
-    /// is for.
-    AdrpOf(usize),
-}
-
-impl CodeRef {
-    /// Whether the reference stays right when the unit moves as a whole and
-    /// its target moves with it. A displacement, or an aarch64 branch or `adr`,
-    /// to somewhere inside the same function is; an `adrp` pair is not, since
-    /// it names a 4 KiB page and the low twelve bits of an absolute address,
-    /// and the unit is not placed at the same offset into a page.
-    fn moves_with_its_unit(&self) -> bool {
-        match &self.site {
-            RefSite::Disp { .. } => true,
-            RefSite::Insn(insn) => insn.field != aarch64::Field::Lo12,
-            RefSite::AdrpOf(_) => false,
-        }
-    }
-
-    /// The relocation writing `target`, `extra` bytes into it, at this site.
-    fn reloc(&self, extra: i64, target: RelocTarget) -> ExtractedReloc {
-        match &self.site {
-            RefSite::Disp { size, addend } => {
-                pcrel_reloc(self.offset as u64, size * 8, addend + extra, target)
-            }
-            RefSite::Insn(insn) => ExtractedReloc {
-                insn: Some(insn.clone()),
-                ..pcrel_reloc(self.offset as u64, 32, extra, target)
-            },
-            RefSite::AdrpOf(_) => ExtractedReloc {
-                insn: Some(InsnField {
-                    field: aarch64::Field::AdrpPage,
-                    adrps: Vec::new(),
-                }),
-                ..pcrel_reloc(self.offset as u64, 32, extra, target)
-            },
-        }
-    }
-}
-
-/// How many bytes `instr` touches at its RIP-relative memory operand, or
-/// `None` where the instruction does not say.
-///
-/// A memory operand's width is the whole of what the instruction reads or
-/// writes, which is what makes it a bound on the object: `movdqa [rip+d],
-/// %xmm0` reads sixteen bytes and cannot reach the seventeenth. Two kinds of
-/// instruction do not bound anything:
-///
-///   * `lea`, which computes the address and leaves what lives there to
-///     whatever uses it — the base of a string, of a table indexed by a
-///     register, of a struct read field by field. iced reports its memory size
-///     as unknown, which is exactly right.
-///   * the bit-test family with a register bit offset (`bt %rax, [rip+d]`),
-///     where the operand width is the unit the offset counts in and not the
-///     extent touched: the accessed word is `offset / width` of them along.
-fn rip_access_len(instr: &Instruction) -> Option<u64> {
-    use iced_x86::{Mnemonic, OpKind};
-
-    if matches!(
-        instr.mnemonic(),
-        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc
-    ) && instr.op_count() > 1
-        && instr.op_kind(1) != OpKind::Immediate8
-    {
-        return None;
-    }
-    Some(instr.memory_size().size() as u64).filter(|&len| len > 0)
-}
-
-/// Decode `bytes`, loaded at `vaddr`, into an instruction stream.
-pub fn decode_instructions(bytes: &[u8], vaddr: u64) -> Vec<Instruction> {
-    use iced_x86::{Decoder, DecoderOptions};
-
-    let mut decoder = Decoder::with_ip(64, bytes, vaddr, DecoderOptions::NONE);
-    // An `Instruction` is forty bytes and x86-64 instructions average rather
-    // under four, so growing the vector from nothing copies the stream several
-    // times over on the way up — and the stream is every text byte solder
-    // extracts, 3.6 MB of it for `test/md5sum` against `libcrypto.so.3`. Three
-    // bytes an instruction is a deliberate under-estimate of the length: it
-    // leaves room for the densest real code without over-allocating by much on
-    // the rest, and a stream that beats it still only grows the once.
-    let mut instrs = Vec::with_capacity(bytes.len() / 3 + 1);
-    while decoder.can_decode() {
-        // Decoding into the vector's own slot is one forty-byte copy rather
-        // than two: `decode` returns by value and `push` then moves it in.
-        instrs.push(Instruction::default());
-        decoder.decode_out(instrs.last_mut().expect("just pushed"));
-    }
-    instrs
-}
-
-/// Scan decoded machine code for all RIP-relative references (calls, jumps, and
-/// data accesses). Returns a list of references with their offsets and target
-/// addresses.
-///
-/// `bytes` is the unit the instructions were decoded from, needed to locate the
-/// encoded displacement inside each instruction; `instrs` may cover only a
-/// prefix of it.
-fn scan_rip_relative_refs(
-    instrs: &[Instruction],
-    bytes: &[u8],
-    base_vaddr: u64,
-) -> Vec<CodeRef> {
-    use iced_x86::{FlowControl, OpKind};
-
-    let mut refs = Vec::new();
-
-    for instr in instrs {
-        let instr_offset = (instr.ip() - base_vaddr) as usize;
-
-        match instr.flow_control() {
-            FlowControl::Call
-            | FlowControl::UnconditionalBranch
-            | FlowControl::ConditionalBranch => {
-                // Near call/jmp/jcc. rel32 forms carry the displacement in the
-                // last 4 bytes; short (rel8) jmp/jcc forms in the last byte.
-                // Verify the encoded bytes actually match before recording, so
-                // an unexpected encoding is skipped instead of corrupted.
-                if instr.op_count() >= 1 && instr.op_kind(0) == OpKind::NearBranch64 {
-                    let target = instr.near_branch_target();
-                    let rel = target.wrapping_sub(instr.next_ip()) as i64;
-                    let instr_bytes = &bytes[instr_offset..instr_offset + instr.len()];
-                    let is_rel32 = instr.len() >= 5
-                        && i32::try_from(rel)
-                            .is_ok_and(|r| instr_bytes[instr.len() - 4..] == r.to_le_bytes());
-                    let is_rel8 = !is_rel32
-                        && i8::try_from(rel).is_ok_and(|r| instr_bytes[instr.len() - 1] == r as u8);
-                    if is_rel32 || is_rel8 {
-                        let disp_size: u8 = if is_rel32 { 4 } else { 1 };
-                        refs.push(CodeRef {
-                            offset: instr_offset + instr.len() - disp_size as usize,
-                            target_vaddr: target,
-                            is_code_ref: true,
-                            access_len: None,
-                            site: RefSite::Disp {
-                                size: disp_size,
-                                addend: -(disp_size as i64),
-                            },
-                        });
-                    }
-                }
-            }
-            // `is_ip_rel_memory_operand` describes the instruction and not any
-            // one of its operands, so an instruction that addresses nothing
-            // through RIP has no operand worth looking at. Asking once settles
-            // the great majority of the stream — the scan sees every text byte
-            // the merge extracts, 3.6 MB of it for `test/md5sum` against
-            // `libcrypto.so.3` — where asking inside the loop walked the
-            // operands of each of them first.
-            _ if !instr.is_ip_rel_memory_operand() => {}
-            _ => {
-                // Check all operands for RIP-relative memory references
-                for op_idx in 0..instr.op_count() {
-                    if instr.op_kind(op_idx) == OpKind::Memory {
-                        let target = instr.ip_rel_memory_address();
-                        // Find the displacement bytes within the instruction.
-                        // The disp32 encodes (target - next_ip) as a signed 32-bit value.
-                        let disp32 = (target as i64 - instr.next_ip() as i64) as i32;
-                        let disp_bytes = disp32.to_le_bytes();
-                        let instr_bytes = &bytes[instr_offset..instr_offset + instr.len()];
-                        // Search backwards — the displacement is near the end
-                        let disp_pos = instr_bytes.windows(4).rposition(|w| w == disp_bytes);
-                        if let Some(pos) = disp_pos {
-                            refs.push(CodeRef {
-                                offset: instr_offset + pos,
-                                target_vaddr: target,
-                                is_code_ref: false,
-                                access_len: rip_access_len(instr),
-                                site: RefSite::Disp {
-                                    size: 4,
-                                    addend: -((instr.len() - pos) as i64),
-                                },
-                            });
-                        }
-                        break; // Only one memory operand per instruction
-                    }
-                }
-            }
-        }
-    }
-
-    refs
+        .map(|(_, end)| end)
 }
 
 /// The external symbol the PLT stub at `addr` jumps to, or `None` when `addr`
 /// is not a stub.
 ///
-/// The stub is decoded rather than looked up by entry index: every flavor
-/// (.plt, .plt.got, .plt.sec) starts with an optional endbr64 and/or bnd
-/// prefix followed by `ff 25 <disp32>` (jmp [rip+disp32]) through its GOT
-/// slot, and the dynamic relocation against that slot — JUMP_SLOT for classic
-/// PLT entries, GLOB_DAT for .plt.got-style stubs like `__cxa_finalize@plt` —
+/// The stub is decoded rather than looked up by entry index: the architecture
+/// reads the GOT slot it jumps through (`arch::MachineCode::plt_stub_slot`),
+/// and the dynamic relocation against that slot — JUMP_SLOT for classic PLT
+/// entries, GLOB_DAT for .plt.got-style stubs like `__cxa_finalize@plt` —
 /// names the symbol. Both halves of that lookup come out of the library's
 /// [`LibIndex`], built once per library.
-///
-/// An aarch64 library's stubs are read by [`aarch64::plt_stub_slot`] instead.
-fn plt_target(lib: Lib<'_, '_>, addr: u64) -> Option<String> {
+fn plt_target(lib: Lib<'_, '_>, arch: &Arch, addr: u64) -> Option<String> {
     let (sec_addr, section) = lib.index.plt_span_at(addr)?;
     let sec_data = lib.elf.section_by_index(section).ok()?.data().ok()?;
-
-    let got_va = if lib.elf.architecture() == object::Architecture::Aarch64 {
-        aarch64::plt_stub_slot(sec_data.get((addr - sec_addr) as usize..)?, addr)?
-    } else {
-        x86_64_plt_stub_slot(sec_data, sec_addr, addr)?
-    };
+    let got_va = (arch.code.plt_stub_slot)(sec_data, sec_addr, addr)?;
 
     if let Some(name) = lib.index.got_to_name.get(&got_va) {
         return Some(name.clone());
     }
     // Fallback: a symbol defined at this exact address.
     find_symbol_at_address(lib.index, addr)
-}
-
-/// The GOT slot the x86-64 PLT stub at `addr` in a PLT section loaded at
-/// `sec_addr` jumps through; see [`plt_target`].
-fn x86_64_plt_stub_slot(sec_data: &[u8], sec_addr: u64, addr: u64) -> Option<u64> {
-    let mut off = (addr - sec_addr) as usize;
-    if sec_data.len() >= off + 4 && sec_data[off..off + 4] == [0xf3, 0x0f, 0x1e, 0xfa] {
-        off += 4; // endbr64
-    }
-    if sec_data.get(off) == Some(&0xf2) {
-        off += 1; // bnd prefix
-    }
-    if sec_data.len() < off + 6 || sec_data[off] != 0xff || sec_data[off + 1] != 0x25 {
-        return None; // not an indirect-jump stub (e.g. the PLT0 resolver)
-    }
-    let disp = i32::from_le_bytes(sec_data[off + 2..off + 6].try_into().expect("4 bytes"));
-    Some((sec_addr + off as u64 + 6).wrapping_add(disp as i64 as u64))
 }
 
 /// The target a call to the PLT stub at `addr` gets, or `None` when `addr` is
@@ -2201,7 +1648,7 @@ fn plt_reference(lib: Lib<'_, '_>, addr: u64, state: &mut ExtractionState) -> Op
     if let Some(hit) = state.plt_refs.get(&(lib.id, addr)) {
         return hit.clone();
     }
-    let resolved = plt_target(lib, addr).map(|ext_name| {
+    let resolved = plt_target(lib, state.arch, addr).map(|ext_name| {
         if !state.external_syms.contains(&ext_name)
             && let Some(other_lib) = state.cross_lib_syms.get(&ext_name).cloned()
         {
@@ -3929,14 +3376,14 @@ mod tests {
                 "{name}: .plt is not PLT0 followed by one 16-byte stub per JUMP_SLOT"
             );
             assert_eq!(
-                plt_target(lib, plt.address()),
+                plt_target(lib, &crate::arch::X86_64, plt.address()),
                 None,
                 "{name}: PLT0 jumps through the loader's own slot, not a symbol's"
             );
             for (i, (_, expected)) in jump_slots.iter().enumerate() {
                 let stub = plt.address() + (i as u64 + 1) * 16;
                 assert_eq!(
-                    plt_target(lib, stub).as_deref(),
+                    plt_target(lib, &crate::arch::X86_64, stub).as_deref(),
                     Some(expected.as_str()),
                     "{name}: the stub at {stub:#x}"
                 );
@@ -3947,7 +3394,7 @@ mod tests {
             // `.plt` entries never exercise.
             let plt_got = elf.section_by_name(".plt.got").expect(".plt.got");
             let glob_dats = relocated(object::elf::R_X86_64_GLOB_DAT.0);
-            let resolved = plt_target(lib, plt_got.address())
+            let resolved = plt_target(lib, &crate::arch::X86_64, plt_got.address())
                 .unwrap_or_else(|| panic!("{name}: the first .plt.got stub went unresolved"));
             assert!(
                 glob_dats.iter().any(|(_, sym)| *sym == resolved),
@@ -5327,42 +4774,6 @@ mod tests {
         assert_eq!((copy.bytes, copy.section_bytes as u64), (8, data_size));
     }
 
-    /// `lea` is the reference that cannot be bounded: it hands out an address
-    /// and says nothing about what lives there, so the copy has to run to
-    /// whatever the library itself names above it. A load of the same address
-    /// through the same
-    /// displacement does say, and iced is where both answers come from — so
-    /// hold it to them rather than to the documentation.
-    #[test]
-    fn an_address_taken_by_lea_is_unbounded_and_a_load_of_it_is_not() {
-        // 48 8d 05 10 00 00 00   lea  rax, [rip+0x10]
-        // 48 8b 05 10 00 00 00   mov  rax, [rip+0x10]
-        // 0f 10 05 10 00 00 00   movups xmm0, [rip+0x10]
-        // 80 3d 10 00 00 00 00   cmp  byte [rip+0x10], 0
-        // 48 0f a3 05 10 00 00 00  bt   [rip+0x10], rax
-        let code: &[u8] = &[
-            0x48, 0x8d, 0x05, 0x10, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00,
-            0x0f, 0x10, 0x05, 0x10, 0x00, 0x00, 0x00, 0x80, 0x3d, 0x10, 0x00, 0x00, 0x00, 0x00,
-            0x48, 0x0f, 0xa3, 0x05, 0x10, 0x00, 0x00, 0x00,
-        ];
-        let instrs = decode_instructions(code, 0x1000);
-        let lens: Vec<Option<u64>> = instrs.iter().map(rip_access_len).collect();
-        assert_eq!(
-            lens,
-            vec![None, Some(8), Some(16), Some(1), None],
-            "decoded as {:?}",
-            instrs
-                .iter()
-                .map(|i| (i.mnemonic(), i.memory_size()))
-                .collect::<Vec<_>>()
-        );
-
-        // And the scan passes that on: same displacement, different bound.
-        let refs = scan_rip_relative_refs(&instrs, code, 0x1000);
-        let bounds: Vec<Option<u64>> = refs.iter().map(|r| r.access_len).collect();
-        assert_eq!(bounds, lens, "the scan dropped or reordered a bound");
-    }
-
     /// A copy whose end comes from [`needed_prefix`]'s fallback rather than
     /// from what the merged code reads is the only step of the merge with no
     /// bound of its own, and the pointers it roots are what turn a handful of
@@ -5804,79 +5215,6 @@ mod tests {
         }
     }
 
-    /// The extent `decode_to_code_bound` settles on is what keeps the
-    /// instruction scanners off the non-code tail of a text unit. It gets to
-    /// cut only where the decode backs the unwind table up.
-    mod instruction_extent_tests {
-        const VA: u64 = 0x1000;
-
-        /// How far `decode_to_code_bound` decodes, which is the extent the
-        /// instruction scanners then get.
-        fn instruction_extent(bytes: &[u8], vaddr: u64, fde_end: u64) -> usize {
-            let code = super::super::decode_to_code_bound(bytes, vaddr, Some(fde_end));
-            // Whatever the extent, the instructions handed on cover exactly it.
-            assert_eq!(
-                code.instrs.last().map_or(vaddr, |i| i.next_ip()),
-                vaddr + code.len as u64,
-                "decoded instructions do not span the reported extent"
-            );
-            code.len
-        }
-
-        /// `ret` followed by the kind of string constant hand-written assembly
-        /// keeps next to its code. Everything after the `ret` is data.
-        #[test]
-        fn a_function_ending_in_ret_cuts_at_the_fde_end() {
-            let mut bytes = vec![0x31, 0xc0, 0xc3]; // xor eax, eax; ret
-            bytes.extend_from_slice(b"CRYPTOGAMS by <appro@openssl.org>\0");
-            assert_eq!(instruction_extent(&bytes, VA, VA + 3), 3);
-        }
-
-        /// A tail call is just as much the end of the function as a `ret`.
-        #[test]
-        fn a_function_ending_in_a_jump_cuts_at_the_fde_end() {
-            let mut bytes = vec![0xeb, 0x00]; // jmp .+0
-            bytes.extend_from_slice(&[0x11; 16]);
-            assert_eq!(instruction_extent(&bytes, VA, VA + 2), 2);
-        }
-
-        /// Unwind info that describes only a function's prologue — which
-        /// hand-written assembly does carry — must not cost the rest of the
-        /// function its relocations. A `ret` that reaches past the recorded end
-        /// is the giveaway that real code continues.
-        #[test]
-        fn unwind_info_stopping_mid_function_scans_the_whole_unit() {
-            // push rbp; mov rbp, rsp; ret — the FDE covers only the first two.
-            let bytes = vec![0x55, 0x48, 0x89, 0xe5, 0xc3];
-            assert_eq!(instruction_extent(&bytes, VA, VA + 4), bytes.len());
-        }
-
-        /// A fall-through last instruction means the function does not end at
-        /// the recorded end either, however well the boundary lines up.
-        #[test]
-        fn a_fall_through_last_instruction_is_not_an_ending() {
-            let bytes = vec![0x90, 0x90, 0x90, 0x90]; // nop * 4
-            assert_eq!(instruction_extent(&bytes, VA, VA + 2), bytes.len());
-        }
-
-        /// A boundary the decode cannot land on exactly — here it falls inside
-        /// the 4-byte `mov` — is not a boundary to cut on.
-        #[test]
-        fn a_boundary_inside_an_instruction_is_not_cut_on() {
-            let bytes = vec![0x48, 0x89, 0xe5, 0xc3, 0x00]; // mov rbp, rsp; ret
-            assert_eq!(instruction_extent(&bytes, VA, VA + 2), bytes.len());
-        }
-
-        /// An FDE that covers the unit (or more of it) leaves nothing to cut.
-        #[test]
-        fn an_fde_covering_the_whole_unit_changes_nothing() {
-            let bytes = vec![0x31, 0xc0, 0xc3];
-            assert_eq!(instruction_extent(&bytes, VA, VA + 3), bytes.len());
-            assert_eq!(instruction_extent(&bytes, VA, VA + 0x100), bytes.len());
-            assert_eq!(instruction_extent(&bytes, VA, VA - 1), bytes.len());
-        }
-    }
-
     /// The constants hand-written assembly keeps in `.text` are not code, and
     /// a unit's byte range runs from its function's entry to the next bound —
     /// so it covers them. Decoding them produced relocations, extraction
@@ -5972,7 +5310,10 @@ mod tests {
                             Some(insn) => format!("{:?}{:?}", insn.field, insn.adrps),
                             None => format!("{:?}/{}", r.kind, r.size),
                         };
-                        format!("{:#x} {site} -> {target}+{}", r.offset_within_unit, r.addend)
+                        format!(
+                            "{:#x} {site} -> {target}+{}",
+                            r.offset_within_unit, r.addend
+                        )
                     })
                     .collect();
                 (u.name.clone(), relocs)
@@ -6061,7 +5402,7 @@ mod tests {
     /// arrives where it did in the library, by way of its veneer.
     #[test]
     fn an_aarch64_short_branch_reaches_its_target_from_anywhere_through_its_veneer() {
-        use aarch64::{INSN_LEN, pc_relative_ref};
+        use crate::arch::aarch64::{self, INSN_LEN, pc_relative_ref};
 
         let units = extract_aarch64_units("clamp");
         let vaddr_of = |name: &str| match name {
@@ -6117,36 +5458,5 @@ mod tests {
             );
             assert_eq!(follow(veneer), vaddr_of(target), "branch at {branch:#x}");
         }
-    }
-
-    /// A veneer that the branch itself cannot reach, as for a `tbz` near the
-    /// start of a unit longer than 32 KiB, is refused rather than written
-    /// wrong.
-    #[test]
-    fn a_veneer_out_of_the_short_branchs_reach_is_an_error() {
-        use crate::types::InsnField;
-
-        const TBNZ_W0_31: u32 = 0x37f8_0000;
-        let mut bytes = TBNZ_W0_31.to_le_bytes().to_vec();
-        bytes.resize(1 << 15, 0);
-        let mut relocs = vec![ExtractedReloc {
-            insn: Some(InsnField {
-                field: aarch64::Field::Imm14,
-                adrps: Vec::new(),
-            }),
-            ..pcrel_reloc(0, 32, 0, RelocTarget::External("far".into()))
-        }];
-        let err = veneer_aarch64_short_branches(&mut bytes, &mut relocs, "long")
-            .expect_err("the end of the unit is 32 KiB away");
-        assert!(
-            format!("{err:#}").contains("cannot reach a veneer"),
-            "{err:#}"
-        );
-
-        // One word shorter, the veneer is within reach.
-        let mut bytes = TBNZ_W0_31.to_le_bytes().to_vec();
-        bytes.resize((1 << 15) - 4, 0);
-        veneer_aarch64_short_branches(&mut bytes, &mut relocs, "long").expect("in reach");
-        assert_eq!(relocs[0].offset_within_unit, (1 << 15) - 4);
     }
 }

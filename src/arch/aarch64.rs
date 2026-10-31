@@ -1,5 +1,5 @@
-//! The aarch64 instruction forms that carry an address, and how to rewrite one
-//! when the code or its target moves (#97, stage 3).
+//! aarch64: its descriptor, the instruction forms that carry an address, and
+//! how to rewrite one when the code or its target moves (#97, stage 3).
 //!
 //! An x86-64 reference is a little-endian rel8/rel32 displacement at the tail
 //! of the instruction, which `relocator::apply_one_reloc` overwrites whole. An
@@ -24,13 +24,19 @@
 //! does not, which is where in the word that operand is kept.
 //!
 //! The extractor reads an aarch64 library's references and PLT stubs through
-//! this module, the relocator writes [`Field`]s with it, and the writer emits
-//! its trampolines through `arch::AARCH64`. `arch::SUPPORTED` still refuses
-//! aarch64 executables.
+//! [`AARCH64`]'s [`MachineCode`], the relocator writes [`Field`]s with this
+//! module, and the writer emits its trampolines through the descriptor.
+//! `arch::SUPPORTED` still refuses aarch64 executables.
 
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use super::{
+    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, RefSite, TextUnit, Trampoline,
+    UnitScan, Unliftable,
+};
+use crate::types::{ExtractedReloc, InsnField};
 use yaxpeax_arch::{Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::{InstDecoder, Instruction, Opcode, Operand, ShiftStyle, SizeCode};
 
@@ -961,6 +967,251 @@ pub fn ends_the_function(code: &[u8]) -> bool {
     })
 }
 
+/// [`trampoline`], as the descriptor's [`Trampoline::encode`].
+fn encode_trampoline(vaddr: u64, slot: u64) -> Result<Vec<u8>> {
+    trampoline(vaddr, slot).map(Vec::from)
+}
+
+/// [`plt_stub_slot`], as the descriptor's [`MachineCode::plt_stub_slot`].
+fn plt_stub_slot_at(sec_data: &[u8], sec_addr: u64, addr: u64) -> Option<u64> {
+    plt_stub_slot(
+        sec_data.get(usize::try_from(addr - sec_addr).ok()?..)?,
+        addr,
+    )
+}
+
+/// aarch64 (`EM_AARCH64`), LP64, per the ARM ELF ABI (AAELF64) and glibc's
+/// `sysdeps/aarch64`.
+///
+/// Not in [`SUPPORTED`](super::SUPPORTED) yet, so an aarch64 executable is still refused at the
+/// gate: the extractor follows a section-anchor reference (`adrp`/`add` of an
+/// anchor, then `add #offset`) to the anchor object rather than the one it
+/// reaches. Until then this is what the per-architecture
+/// tables of the search, the reader, the extractor, the patcher and the
+/// writer are tested against.
+#[cfg_attr(not(test), allow(dead_code))]
+pub static AARCH64: Arch = {
+    use Unliftable::{Copy, Ifunc, Tls};
+    use object::elf::{
+        EM_AARCH64, GNU_PROPERTY_AARCH64_FEATURE_1_AND, R_AARCH64_COPY, R_AARCH64_GLOB_DAT,
+        R_AARCH64_IRELATIVE, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE, R_AARCH64_TLS_DTPMOD,
+        R_AARCH64_TLS_DTPREL, R_AARCH64_TLS_TPREL, R_AARCH64_TLSDESC,
+    };
+
+    Arch {
+        name: "aarch64",
+        e_machine: EM_AARCH64.0,
+        reloc: DynRelocTypes {
+            relative: R_AARCH64_RELATIVE.0,
+            glob_dat: R_AARCH64_GLOB_DAT.0,
+            jump_slot: R_AARCH64_JUMP_SLOT.0,
+            copy: R_AARCH64_COPY.0,
+        },
+        // Every dynamic relocation AAELF64 defines other than the three above.
+        // Unlike x86-64 there is no SIZE relocation, and the static TLS forms
+        // (`TLSGD_ADR_PAGE21` and the rest) are resolved by the linker into
+        // instruction fields and GOT slots carrying the dynamic ones below, so
+        // they never reach a shared library's dynamic tables. The TLS names
+        // are the ones readelf prints; `object` and glibc's `elf.h` drop the
+        // `64`.
+        unliftable_relocs: &[
+            (R_AARCH64_TLS_DTPMOD.0, "R_AARCH64_TLS_DTPMOD64", Tls),
+            (R_AARCH64_TLS_DTPREL.0, "R_AARCH64_TLS_DTPREL64", Tls),
+            (R_AARCH64_TLS_TPREL.0, "R_AARCH64_TLS_TPREL64", Tls),
+            (R_AARCH64_TLSDESC.0, "R_AARCH64_TLSDESC", Tls),
+            (R_AARCH64_IRELATIVE.0, "R_AARCH64_IRELATIVE", Ifunc),
+            (R_AARCH64_COPY.0, "R_AARCH64_COPY", Copy),
+        ],
+        // `FLAG_AARCH64_LIB64 | FLAG_ELF_LIBC6`, glibc's
+        // `sysdeps/unix/sysv/linux/aarch64/dl-cache.h`. As on x86-64,
+        // `_dl_cache_check_flags` accepts exactly this value, so an ILP32
+        // (`FLAG_AARCH64_LIB32`) or foreign entry is never loaded.
+        ldso_cache_flags: 0x0a03,
+        // glibc's aarch64 `configure` puts LP64 libraries in `/lib64`, the
+        // same as x86-64, so `$LIB` expands the same way.
+        lib_token: "lib64",
+        default_lib_dirs: &[
+            "/lib64",
+            "/usr/lib64",
+            "/lib",
+            "/usr/lib",
+            "/lib/aarch64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+        ],
+        // aarch64 kernels run with 4, 16 or 64 KiB pages, which is why
+        // distribution linkers default to `-z max-page-size=0x10000`.
+        max_page_size: 0x10000,
+        gnu_properties: GnuProperties {
+            feature_1_and: GNU_PROPERTY_AARCH64_FEATURE_1_AND.0,
+            feature_1_family: "BTI/PAC/GCS",
+            // `GNU_PROPERTY_AARCH64_FEATURE_1_{BTI,PAC,GCS}`. BTI is the one
+            // that faults: the loader maps the executable's code guarded, and
+            // a merged function without a `bti c` landing pad is entered
+            // through the trampoline's `br`. GCS (binutils 2.44, glibc 2.41)
+            // is AND-combined the same way, and glibc checks it against every
+            // object it loads.
+            feature_1_bits: &[(1 << 0, "BTI"), (1 << 1, "PAC"), (1 << 2, "GCS")],
+            // aarch64 has no ISA-level property.
+            isa_1_needed: None,
+        },
+        trampoline: Trampoline {
+            len: TRAMPOLINE_LEN as u64,
+            encode: encode_trampoline,
+        },
+        code: MachineCode {
+            scan,
+            plt_stub_slot: plt_stub_slot_at,
+            veneer_short_branches,
+        },
+    }
+};
+
+/// [`MachineCode::scan`]: how far the function's code runs, then every
+/// address it keeps ([`scan_refs`]). aarch64 code is read a word at a time,
+/// so there is no decoded stream to share, and no jump table to relocate: a
+/// switch table's entries are offsets from a label inside the function that
+/// indexes it, so they move with it.
+fn scan(unit: &TextUnit<'_, '_>) -> Result<UnitScan> {
+    let len = code_len(unit.bytes, unit.vaddr, unit.fde_end);
+    Ok(UnitScan {
+        refs: scan_refs(&unit.bytes[..len], unit.vaddr)?,
+        jump_tables: Vec::new(),
+    })
+}
+
+/// How many of a text unit's leading bytes are its function's code: as far
+/// as the function's FDE claims, if [`ends_the_function`] agrees that the
+/// code stops there, and the whole unit otherwise. See [`TextUnit::fde_end`].
+fn code_len(bytes: &[u8], vaddr: u64, fde_end: Option<u64>) -> usize {
+    fde_end
+        .and_then(|end| end.checked_sub(vaddr))
+        .map(|len| len as usize)
+        .filter(|&len| len < bytes.len() && ends_the_function(&bytes[..len]))
+        .unwrap_or(bytes.len())
+}
+
+/// Every address the aarch64 function in `code`, loaded at `vaddr`, keeps in
+/// its instructions: each branch, `adr` and literal load
+/// ([`scan_pc_relative_refs`]), and each `adrp` pair
+/// ([`pair_lo12_refs`]).
+///
+/// A pair is two references to one address. The `:lo12:` half carries it
+/// whole and comes first; each `adrp` follows as a [`RefSite::AdrpOf`] the
+/// first `:lo12:` it pairs with, which is the only place its full target is
+/// known. An `adrp` nothing completes reaches no address and is left alone.
+///
+/// A reference the scanners cannot account for — a page used other than as a
+/// `:lo12:` base, a PC-relative form with no field to rewrite — fails the
+/// extraction, since copying it as it is would leave it aimed at wherever the
+/// old offset lands.
+fn scan_refs(code: &[u8], vaddr: u64) -> Result<Vec<CodeRef>> {
+    let mut refs = Vec::new();
+    let pairs = pair_lo12_refs(code, vaddr)?;
+    for pair in &pairs {
+        let word = u32::from_le_bytes(
+            code[pair.offset..pair.offset + INSN_LEN]
+                .try_into()
+                .expect("one word"),
+        );
+        refs.push(CodeRef {
+            offset: pair.offset,
+            target_vaddr: pair.target,
+            is_code_ref: false,
+            access_len: lo12_access_len(word),
+            site: RefSite::Insn(InsnField {
+                field: Field::Lo12,
+                adrps: pair.adrps.iter().map(|&a| a as u64).collect(),
+            }),
+        });
+    }
+    for (offset, r) in scan_pc_relative_refs(code, vaddr)? {
+        let (site, target_vaddr) = if r.field == Field::AdrpPage {
+            let Some(pair) = pairs.iter().find(|p| p.adrps.contains(&offset)) else {
+                continue;
+            };
+            (RefSite::AdrpOf(pair.offset), pair.target)
+        } else {
+            let site = RefSite::Insn(InsnField {
+                field: r.field,
+                adrps: Vec::new(),
+            });
+            (site, r.target)
+        };
+        refs.push(CodeRef {
+            offset,
+            target_vaddr,
+            is_code_ref: r.is_code_ref,
+            access_len: None,
+            site,
+        });
+    }
+    Ok(refs)
+}
+
+/// Send each aarch64 short-range branch that leaves its unit through a `b`
+/// veneer appended to the unit, the aarch64 counterpart of the x86-64 rel8
+/// veneers (see [`MachineCode::veneer_short_branches`]).
+///
+/// A `b.cond`, `cbz` or `tbz` reaches ±1 MiB or ±32 KiB, and nothing keeps its
+/// target that close once the merge has placed the units: the library had it
+/// nearby, the merged segment may not, and the relocator could then only
+/// refuse the merge. A linker in the same position cannot help either, since
+/// AAELF64 only lets it insert veneers for `b`/`bl`. So the branch is pointed
+/// at a `b` at the end of its own unit, which moves with it and so never goes
+/// out of reach, and the relocation moves to that `b`, whose ±128 MiB covers
+/// any merged segment. Compilers do not branch conditionally into another
+/// function, but hand-written assembly (glibc's string functions, OpenSSL's
+/// primitives) does.
+///
+/// A branch inside its own unit carries no relocation (see
+/// [`CodeRef::moves_with_its_unit`](super::CodeRef::moves_with_its_unit)) and is left alone.
+fn veneer_short_branches(
+    bytes: &mut Vec<u8>,
+    relocations: &mut [ExtractedReloc],
+    sym: &str,
+) -> Result<()> {
+    for reloc in relocations.iter_mut() {
+        let Some(insn) = reloc.insn.as_mut() else {
+            continue;
+        };
+        if !matches!(insn.field, Field::Imm19 | Field::Imm14) {
+            continue;
+        }
+        let at = reloc.offset_within_unit as usize;
+        let word = u32::from_le_bytes(
+            bytes[at..at + INSN_LEN]
+                .try_into()
+                .expect("an instruction word"),
+        );
+        if !is_short_branch(word) {
+            continue;
+        }
+
+        // A unit may stop short of a word boundary when a symbol's size
+        // does; the bytes in between are never executed.
+        bytes.resize(bytes.len().next_multiple_of(INSN_LEN), 0);
+        let veneer = bytes.len();
+        bytes.extend_from_slice(&VENEER.to_le_bytes());
+
+        let branch = insn
+            .field
+            .patch(word, veneer as u64, 0, at as u64)
+            .with_context(|| {
+                format!(
+                    "branch at offset {at:#x} in '{sym}' cannot reach a veneer at the \
+                     end of the unit"
+                )
+            })?;
+        bytes[at..at + INSN_LEN].copy_from_slice(&branch.to_le_bytes());
+
+        // The target and addend stay as they were: an aarch64 field's addend
+        // is the offset into the target, with no width folded in.
+        reloc.offset_within_unit = veneer as u64;
+        insn.field = Field::Imm26;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1648,5 +1899,39 @@ mod tests {
             scan_pc_relative_refs(&bytes, BASE).unwrap().len(),
             SAMPLES.len()
         );
+    }
+
+    /// A veneer that the branch itself cannot reach, as for a `tbz` near the
+    /// start of a unit longer than 32 KiB, is refused rather than written
+    /// wrong.
+    #[test]
+    fn a_veneer_out_of_the_short_branchs_reach_is_an_error() {
+        const TBNZ_W0_31: u32 = 0x37f8_0000;
+        let mut bytes = TBNZ_W0_31.to_le_bytes().to_vec();
+        bytes.resize(1 << 15, 0);
+        let mut relocs = vec![ExtractedReloc {
+            insn: Some(InsnField {
+                field: Field::Imm14,
+                adrps: Vec::new(),
+            }),
+            ..crate::extractor::pcrel_reloc(
+                0,
+                32,
+                0,
+                crate::types::RelocTarget::External("far".into()),
+            )
+        }];
+        let err = veneer_short_branches(&mut bytes, &mut relocs, "long")
+            .expect_err("the end of the unit is 32 KiB away");
+        assert!(
+            format!("{err:#}").contains("cannot reach a veneer"),
+            "{err:#}"
+        );
+
+        // One word shorter, the veneer is within reach.
+        let mut bytes = TBNZ_W0_31.to_le_bytes().to_vec();
+        bytes.resize((1 << 15) - 4, 0);
+        veneer_short_branches(&mut bytes, &mut relocs, "long").expect("in reach");
+        assert_eq!(relocs[0].offset_within_unit, (1 << 15) - 4);
     }
 }
