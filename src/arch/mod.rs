@@ -14,7 +14,9 @@
 //! ([`MachineCode::scan`]), reading a PLT stub
 //! ([`MachineCode::plt_stub_slot`]), keeping short branches in reach
 //! ([`MachineCode::veneer_short_branches`]) and writing a trampoline
-//! ([`Trampoline`]). The stages outside this module go through the
+//! ([`Trampoline`]). Each relocation carries a [`Site`] that writes its own
+//! value: a little-endian [`Word`] on any architecture, or an instruction
+//! field the architecture's module encodes. The stages outside this module go through the
 //! descriptor and never name an architecture, so a third one is a new module
 //! and an entry in [`SUPPORTED`].
 //!
@@ -22,13 +24,16 @@
 //! described: see there for what is missing.
 
 pub mod aarch64;
+mod site;
 pub mod x86_64;
 
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use aarch64::AARCH64;
+pub use site::{Site, Word};
 pub use x86_64::X86_64;
 
-use crate::types::{ExtractedReloc, InsnField, RelocTarget};
+use crate::types::{ExtractedReloc, RelocTarget};
+use aarch64::InsnField;
 
 /// Why a dynamic relocation type cannot be lifted into the merged executable:
 /// its slot is filled with something other than `S + A`. See
@@ -223,9 +228,9 @@ pub struct CodeRef {
 pub enum RefSite {
     /// An x86-64 little-endian displacement.
     Disp {
-        /// Size of the encoded displacement in bytes: 4 (rel32) or 1 (rel8,
-        /// short jumps only).
-        size: u8,
+        /// The displacement: [`Word::Pc32`], or [`Word::Pc8`] for a short
+        /// jump.
+        word: Word,
         /// Relocation addend: -(bytes from displacement start to instruction
         /// end). This is -4 when the displacement is the final field, but
         /// instructions like `cmpb $imm, [rip+d]` carry an immediate after the
@@ -265,21 +270,22 @@ impl CodeRef {
 
     /// The relocation writing `target`, `extra` bytes into it, at this site.
     pub fn reloc(&self, extra: i64, target: RelocTarget) -> ExtractedReloc {
-        match &self.site {
-            RefSite::Disp { size, addend } => {
-                crate::extractor::pcrel_reloc(self.offset as u64, size * 8, addend + extra, target)
-            }
-            RefSite::Insn(insn) => ExtractedReloc {
-                insn: Some(insn.clone()),
-                ..crate::extractor::pcrel_reloc(self.offset as u64, 32, extra, target)
-            },
-            RefSite::AdrpOf(_) => ExtractedReloc {
-                insn: Some(InsnField {
+        let (site, addend) = match &self.site {
+            RefSite::Disp { word, addend } => (Site::Word(*word), addend + extra),
+            RefSite::Insn(insn) => (Site::Aarch64(insn.clone()), extra),
+            RefSite::AdrpOf(_) => (
+                Site::Aarch64(InsnField {
                     field: aarch64::Field::AdrpPage,
                     adrps: Vec::new(),
                 }),
-                ..crate::extractor::pcrel_reloc(self.offset as u64, 32, extra, target)
-            },
+                extra,
+            ),
+        };
+        ExtractedReloc {
+            offset_within_unit: self.offset as u64,
+            site,
+            addend,
+            target,
         }
     }
 }

@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
-use crate::arch::{Arch, RefSite, TextUnit, UnitScan, Unliftable};
+use crate::arch::{Arch, RefSite, Site, TextUnit, UnitScan, Unliftable, Word};
 use crate::elf_reader::MappedElf;
 use crate::types::{
     DATA_BLOB_ALIGNMENT, DataSectionCopy, ExtractedReloc, ExtractedUnit, GotSlotFixup,
@@ -542,27 +542,6 @@ struct UnitRelocs {
     got_fixups: Vec<(u64, String, bool)>,
 }
 
-/// A synthetic PC-relative relocation over a displacement the instruction
-/// scanner found, at `offset` bytes into the unit being extracted. Every
-/// scanned reference is patched the same way — only the displacement width,
-/// the addend and the target differ.
-pub(crate) fn pcrel_reloc(
-    offset: u64,
-    size: u8,
-    addend: i64,
-    target: RelocTarget,
-) -> ExtractedReloc {
-    ExtractedReloc {
-        offset_within_unit: offset,
-        kind: object::RelocationKind::Relative,
-        encoding: object::RelocationEncoding::Generic,
-        size,
-        addend,
-        target,
-        insn: None,
-    }
-}
-
 /// Reject relocation kinds that need a GOT we cannot reproduce. `ctx` names the
 /// symbol or section being extracted.
 fn reject_got_reloc(
@@ -630,9 +609,8 @@ fn describe_unliftable_reloc(arch: &Arch, r_type: u32) -> (String, &'static str)
 /// Refuse a dynamic relocation whose slot is not something solder can fill in
 /// by writing `S + A` into eight bytes.
 ///
-/// Everything lifted out of a library's `.rela.dyn`/`.rela.plt` ends up in
-/// `relocator::apply_one_reloc`, which computes `S + A` and truncates it into
-/// the field. For `R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT` and
+/// Everything lifted out of a library's `.rela.dyn`/`.rela.plt` is written as
+/// an `arch::Word`, which computes `S + A` and truncates it into the field. For `R_X86_64_GLOB_DAT`, `R_X86_64_JUMP_SLOT` and
 /// `R_X86_64_RELATIVE` that is exactly right — all three name a 64-bit slot
 /// holding the target's address, which is why `collect_dynamic_range_relocs`
 /// forces their reported width to 64 bits.
@@ -670,7 +648,7 @@ fn reject_unliftable_dynamic_reloc(
     lib: &Path,
 ) -> Result<()> {
     // Anything the `object` crate does name carries a real kind and width, and
-    // `apply_one_reloc` either implements that form or rejects it by name.
+    // `Word::of_object` either has a field for that form or it is refused.
     if kind != object::RelocationKind::Unknown {
         return Ok(());
     }
@@ -1038,12 +1016,12 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
                 let Some(blob_unit) = state.unit_mut(blob_id) else {
                     continue;
                 };
-                blob_unit.relocations.push(pcrel_reloc(
-                    entry_offset_in_blob,
-                    32,
+                blob_unit.relocations.push(ExtractedReloc {
+                    offset_within_unit: entry_offset_in_blob,
+                    site: Site::Word(Word::Pc32),
                     addend, // offset within target function, PC-relative
-                    RelocTarget::MergedUnit(id),
-                ));
+                    target: RelocTarget::MergedUnit(id),
+                });
             }
         }
     }
@@ -1980,16 +1958,19 @@ fn collect_dynamic_range_relocs(
         // the 0 sound: it is the only reason the unnamed types reaching here
         // are those three and not, say, a TLS offset.
         let reloc_size = if reloc.size == 0 { 64 } else { reloc.size };
+        let word = Word::of_object(kind, encoding, reloc_size).with_context(|| {
+            format!(
+                "'{ctx}' in {}: unsupported relocation kind {kind:?} (size={reloc_size})",
+                lib.path.display()
+            )
+        })?;
 
         occupied.insert(offset_within_unit);
         relocs.relocations.push(ExtractedReloc {
             offset_within_unit,
-            kind,
-            encoding,
-            size: reloc_size,
+            site: Site::Word(word),
             addend: resolved_addend.unwrap_or(reloc.addend),
             target,
-            insn: None,
         });
     }
     Ok(())
@@ -3224,8 +3205,8 @@ mod tests {
                             RelocTarget::External(name) => format!("extern '{name}'"),
                         };
                         format!(
-                            "{:#x}: {:?}/{:?} {} bits, addend {} -> {target}",
-                            r.offset_within_unit, r.kind, r.encoding, r.size, r.addend
+                            "{:#x}: {:?}, addend {} -> {target}",
+                            r.offset_within_unit, r.site, r.addend
                         )
                     })
                     .collect();
@@ -5306,9 +5287,9 @@ mod tests {
                             }
                             RelocTarget::External(name) => format!("extern {name}"),
                         };
-                        let site = match &r.insn {
-                            Some(insn) => format!("{:?}{:?}", insn.field, insn.adrps),
-                            None => format!("{:?}/{}", r.kind, r.size),
+                        let site = match &r.site {
+                            Site::Aarch64(insn) => format!("{:?}{:?}", insn.field, insn.adrps),
+                            Site::Word(word) => format!("{word:?}"),
                         };
                         format!(
                             "{:#x} {site} -> {target}+{}",
@@ -5424,7 +5405,10 @@ mod tests {
             let target = &units.iter().find(|u| u.id == id).expect("target").name;
             let at = reloc.offset_within_unit as usize;
             let word = u32::from_le_bytes(clamp.bytes[at..at + INSN_LEN].try_into().unwrap());
-            let field = reloc.insn.as_ref().expect("an instruction field").field;
+            let crate::arch::Site::Aarch64(insn) = &reloc.site else {
+                panic!("{reloc:?} is not an instruction field");
+            };
+            let field = insn.field;
             let patched = field
                 .patch(word, vaddr_of(target), reloc.addend, base + at as u64)
                 .expect("a b reaches 64 MiB");

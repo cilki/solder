@@ -239,47 +239,17 @@ pub enum RelocTarget {
 pub struct ExtractedReloc {
     /// Byte offset within `ExtractedUnit::bytes` where the patch is applied.
     pub offset_within_unit: u64,
-    pub kind: object::RelocationKind,
-    pub encoding: object::RelocationEncoding,
-    /// Width of the value to write, in bits (typically 32 or 64).
-    pub size: u8,
+    /// How the value is written there.
+    pub site: crate::arch::Site,
     pub addend: i64,
     pub target: RelocTarget,
-    /// Set when the site is a bit-field inside an aarch64 instruction word
-    /// rather than a little-endian field of `size` bits: the relocator then
-    /// re-encodes just those bits (see [`InsnField`]).
-    pub insn: Option<InsnField>,
-}
-
-/// An address kept in an aarch64 instruction word, and what has to agree with
-/// it once it is rewritten.
-#[derive(Debug, Clone)]
-pub struct InsnField {
-    /// Which bits of the word carry the address.
-    pub field: crate::arch::aarch64::Field,
-    /// For a `:lo12:` half, the unit offsets of the `adrp`s whose page it
-    /// completes. The `:lo12:` bits only say where in a page the target is;
-    /// the relocator checks that each of these `adrp`s was pointed at the
-    /// target's page, since one `adrp` is often shared by several objects
-    /// and the merge need not keep them on one page. Empty for every other
-    /// field.
-    pub adrps: Vec<u64>,
 }
 
 impl ExtractedReloc {
-    /// Whether this is a 64-bit absolute patch site. The value written there is
-    /// a VA inside the output image, so under PIE the dynamic loader has to
-    /// rebase it at startup — which both adds an `R_X86_64_RELATIVE` entry and
-    /// requires the containing page to be writable while it does so.
-    ///
-    /// (`Unknown` covers the GLOB_DAT/RELATIVE entries lifted from a library's
-    /// own `.rela.dyn`, which the relocator treats as absolute.)
+    /// Whether this is a 64-bit absolute patch site, which under PIE the
+    /// loader rebases (see [`Site::is_absolute64`](crate::arch::Site::is_absolute64)).
     pub fn is_absolute64(&self) -> bool {
-        self.size == 64
-            && matches!(
-                self.kind,
-                object::RelocationKind::Absolute | object::RelocationKind::Unknown
-            )
+        self.site.is_absolute64()
     }
 }
 

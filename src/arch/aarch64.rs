@@ -2,7 +2,7 @@
 //! how to rewrite one when the code or its target moves (#97, stage 3).
 //!
 //! An x86-64 reference is a little-endian rel8/rel32 displacement at the tail
-//! of the instruction, which `relocator::apply_one_reloc` overwrites whole. An
+//! of the instruction, which a [`Word`](super::Word) overwrites whole. An
 //! aarch64 reference is a bit-field inside a 32-bit instruction word, scaled
 //! by the instruction's granule and split in two for `adr`/`adrp`, so moving
 //! one means re-encoding just those bits and leaving the opcode and registers
@@ -24,8 +24,9 @@
 //! does not, which is where in the word that operand is kept.
 //!
 //! The extractor reads an aarch64 library's references and PLT stubs through
-//! [`AARCH64`]'s [`MachineCode`], the relocator writes [`Field`]s with this
-//! module, and the writer emits its trampolines through the descriptor.
+//! [`AARCH64`]'s [`MachineCode`], the relocator writes their [`InsnField`]s
+//! through [`Site::Aarch64`](super::Site::Aarch64), and the writer emits its
+//! trampolines through the descriptor.
 //! `arch::SUPPORTED` still refuses aarch64 executables.
 
 use std::collections::BTreeSet;
@@ -36,7 +37,7 @@ use super::{
     Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, RefSite, TextUnit, Trampoline,
     UnitScan, Unliftable,
 };
-use crate::types::{ExtractedReloc, InsnField};
+use crate::types::ExtractedReloc;
 use yaxpeax_arch::{Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::{InstDecoder, Instruction, Opcode, Operand, ShiftStyle, SizeCode};
 
@@ -185,6 +186,73 @@ impl Field {
             Field::Imm14 => word & !(0x3fff << 5) | imm << 5,
             Field::Lo12 => unreachable!("returned above"),
         })
+    }
+}
+
+/// An address kept in an aarch64 instruction word, and what has to agree with
+/// it once it is rewritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsnField {
+    /// Which bits of the word carry the address.
+    pub field: Field,
+    /// For a `:lo12:` half, the unit offsets of the `adrp`s whose page it
+    /// completes. The `:lo12:` bits only say where in a page the target is;
+    /// [`InsnField::check_placed`] checks that each of these `adrp`s was
+    /// pointed at the target's page, since one `adrp` is often shared by
+    /// several objects and the merge need not keep them on one page. Empty
+    /// for every other field.
+    pub adrps: Vec<u64>,
+}
+
+impl InsnField {
+    /// Rewrite the address the instruction word at `offset` of `bytes` keeps
+    /// to reach `S + A` from `P`, leaving the rest of the word alone.
+    pub fn write(&self, bytes: &mut [u8], offset: usize, s: u64, a: i64, p: u64) -> Result<()> {
+        let unit_len = bytes.len();
+        let site = offset
+            .checked_add(INSN_LEN)
+            .and_then(|end| bytes.get_mut(offset..end))
+            .with_context(|| {
+                format!("instruction at offset {offset} overflows unit of size {unit_len}")
+            })?;
+        let word = u32::from_le_bytes(site.try_into().expect("one word"));
+        site.copy_from_slice(&self.field.patch(word, s, a, p)?.to_le_bytes());
+        Ok(())
+    }
+
+    /// Check that each `adrp` this `:lo12:` half completes, in the unit at
+    /// `base` whose bytes are `bytes`, now takes the page of `target`, which
+    /// the instruction at `offset` was written to reach.
+    ///
+    /// The `:lo12:` bits were written from `target` and are right on their
+    /// own; what can be wrong is the page. One `adrp` serves every object its
+    /// function reaches in one 4 KiB page, but its relocation can only aim it
+    /// at one of them, and the merge is free to put the others somewhere else.
+    /// Patching on would make the instruction read or write the right offset
+    /// in the wrong page.
+    pub fn check_placed(&self, bytes: &[u8], base: u64, offset: usize, target: u64) -> Result<()> {
+        let want = target & !(ADRP_PAGE - 1);
+        for &adrp in &self.adrps {
+            let at = adrp as usize;
+            let word = bytes
+                .get(at..at + INSN_LEN)
+                .map(|w| u32::from_le_bytes(w.try_into().expect("one word")))
+                .with_context(|| {
+                    format!("adrp at offset {at} overflows unit of size {}", bytes.len())
+                })?;
+            let page = pc_relative_ref(word, base + adrp)?
+                .filter(|r| r.field == Field::AdrpPage)
+                .with_context(|| format!("0x{word:08x} at offset 0x{at:x} is not an adrp"))?
+                .target;
+            if page != want {
+                bail!(
+                    "the instruction at offset 0x{offset:x} reaches 0x{target:x}, but the adrp \
+                     at offset 0x{at:x} that supplies its page takes page 0x{page:x}: the merge \
+                     placed objects that share one adrp in different pages"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1171,7 +1239,7 @@ fn veneer_short_branches(
     sym: &str,
 ) -> Result<()> {
     for reloc in relocations.iter_mut() {
-        let Some(insn) = reloc.insn.as_mut() else {
+        let super::Site::Aarch64(insn) = &mut reloc.site else {
             continue;
         };
         if !matches!(insn.field, Field::Imm19 | Field::Imm14) {
@@ -1910,16 +1978,13 @@ mod tests {
         let mut bytes = TBNZ_W0_31.to_le_bytes().to_vec();
         bytes.resize(1 << 15, 0);
         let mut relocs = vec![ExtractedReloc {
-            insn: Some(InsnField {
+            offset_within_unit: 0,
+            site: crate::arch::Site::Aarch64(InsnField {
                 field: Field::Imm14,
                 adrps: Vec::new(),
             }),
-            ..crate::extractor::pcrel_reloc(
-                0,
-                32,
-                0,
-                crate::types::RelocTarget::External("far".into()),
-            )
+            addend: 0,
+            target: crate::types::RelocTarget::External("far".into()),
         }];
         let err = veneer_short_branches(&mut bytes, &mut relocs, "long")
             .expect_err("the end of the unit is 32 KiB away");

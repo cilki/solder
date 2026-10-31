@@ -11,8 +11,8 @@ use anyhow::{Result, bail};
 use iced_x86::Instruction;
 
 use super::{
-    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, RefSite, TextUnit, Trampoline,
-    UnitScan, Unliftable,
+    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, RefSite, Site, TextUnit, Trampoline,
+    UnitScan, Unliftable, Word,
 };
 use crate::types::ExtractedReloc;
 
@@ -303,15 +303,15 @@ fn scan_rip_relative_refs(instrs: &[Instruction], bytes: &[u8], base_vaddr: u64)
                     let is_rel8 = !is_rel32
                         && i8::try_from(rel).is_ok_and(|r| instr_bytes[instr.len() - 1] == r as u8);
                     if is_rel32 || is_rel8 {
-                        let disp_size: u8 = if is_rel32 { 4 } else { 1 };
+                        let word = if is_rel32 { Word::Pc32 } else { Word::Pc8 };
                         refs.push(CodeRef {
-                            offset: instr_offset + instr.len() - disp_size as usize,
+                            offset: instr_offset + instr.len() - word.width(),
                             target_vaddr: target,
                             is_code_ref: true,
                             access_len: None,
                             site: RefSite::Disp {
-                                size: disp_size,
-                                addend: -(disp_size as i64),
+                                word,
+                                addend: -(word.width() as i64),
                             },
                         });
                     }
@@ -344,7 +344,7 @@ fn scan_rip_relative_refs(instrs: &[Instruction], bytes: &[u8], base_vaddr: u64)
                                 is_code_ref: false,
                                 access_len: rip_access_len(instr),
                                 site: RefSite::Disp {
-                                    size: 4,
+                                    word: Word::Pc32,
                                     addend: -((instr.len() - pos) as i64),
                                 },
                             });
@@ -390,7 +390,7 @@ fn veneer_short_branches(
     sym: &str,
 ) -> Result<()> {
     for reloc in relocs.iter_mut() {
-        if reloc.size != 8 {
+        if reloc.site != Site::Word(Word::Pc8) {
             continue;
         }
         let disp_off = reloc.offset_within_unit as usize;
@@ -412,7 +412,7 @@ fn veneer_short_branches(
         };
         bytes[disp_off] = (veneer_off as i64 - (disp_off as i64 + 1)) as i8 as u8;
         reloc.offset_within_unit = veneer_off as u64 + 1;
-        reloc.size = 32;
+        reloc.site = Site::Word(Word::Pc32);
         // The addend of a scanned branch is -(displacement width) plus the
         // target's offset into its unit. Only the width changes here, from the
         // rel8 field to the veneer's rel32 one; the target offset must survive.

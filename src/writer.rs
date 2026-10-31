@@ -1276,12 +1276,9 @@ mod section_header_tests {
                 .enumerate()
                 .map(|(i, sym)| ExtractedReloc {
                     offset_within_unit: (i * 8) as u64,
-                    kind: object::RelocationKind::Relative,
-                    encoding: object::RelocationEncoding::Generic,
-                    size: 32,
+                    site: crate::arch::Site::Word(crate::arch::Word::Pc32),
                     addend: -4,
                     target: RelocTarget::External((*sym).to_owned()),
-                    insn: None,
                 })
                 .collect(),
         }

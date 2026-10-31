@@ -536,12 +536,9 @@ mod tests {
                 .enumerate()
                 .map(|(i, sym)| ExtractedReloc {
                     offset_within_unit: (i * 8) as u64,
-                    kind: object::RelocationKind::Relative,
-                    encoding: object::RelocationEncoding::Generic,
-                    size: 32,
+                    site: crate::arch::Site::Word(crate::arch::Word::Pc32),
                     addend: -4,
                     target: RelocTarget::External((*sym).to_owned()),
-                    insn: None,
                 })
                 .collect(),
         }
@@ -554,12 +551,9 @@ mod tests {
         let mut u = unit(id, name, SectionKind::ReadOnlyData, 16, &[]);
         u.relocations.push(ExtractedReloc {
             offset_within_unit: 0,
-            kind: object::RelocationKind::Absolute,
-            encoding: object::RelocationEncoding::Generic,
-            size: 64,
+            site: crate::arch::Site::Word(crate::arch::Word::Abs64),
             addend: 0,
             target: RelocTarget::MergedUnit(UnitId(0)),
-            insn: None,
         });
         u
     }
