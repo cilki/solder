@@ -40,6 +40,25 @@ pub struct DynRelocTypes {
     pub copy: u32,
 }
 
+/// The processor-specific GNU properties (`.note.gnu.property`) that describe
+/// the program as a whole and that the merge re-derives over the merged-in
+/// code; see `patcher::update_gnu_properties`.
+#[derive(Debug, Clone)]
+pub struct GnuProperties {
+    /// The `GNU_PROPERTY_*_FEATURE_1_AND` type: control-flow protection
+    /// features the loader turns on only when *every* object of the process
+    /// claims them, so a merged library lacking one withdraws the claim.
+    pub feature_1_and: u32,
+    /// What the features in `feature_1_and` are collectively called ("CET").
+    pub feature_1_family: &'static str,
+    /// The bits of `feature_1_and` with their names, for naming the ones
+    /// being dropped.
+    pub feature_1_bits: &'static [(u32, &'static str)],
+    /// The `GNU_PROPERTY_*_ISA_1_NEEDED` type, if the architecture has one:
+    /// ISA levels the code needs, the union of every object's.
+    pub isa_1_needed: Option<u32>,
+}
+
 /// One target architecture.
 #[derive(Debug, Clone)]
 pub struct Arch {
@@ -63,6 +82,8 @@ pub struct Arch {
     /// executable's `p_align` past it is a request for huge-page alignment
     /// rather than a page size; see `elf_reader::page_size`.
     pub max_page_size: u64,
+    /// The GNU properties the merge recomputes for the whole program.
+    pub gnu_properties: GnuProperties,
 }
 
 impl Arch {
@@ -80,9 +101,10 @@ pub static SUPPORTED: &[&Arch] = &[&X86_64];
 pub static X86_64: Arch = {
     use Unliftable::{Copy, Ifunc, Size, Tls};
     use object::elf::{
-        EM_X86_64, R_X86_64_COPY, R_X86_64_DTPMOD64, R_X86_64_DTPOFF32, R_X86_64_DTPOFF64,
-        R_X86_64_GLOB_DAT, R_X86_64_GOTPC32_TLSDESC, R_X86_64_GOTTPOFF, R_X86_64_IRELATIVE,
-        R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE, R_X86_64_SIZE32, R_X86_64_SIZE64, R_X86_64_TLSDESC,
+        EM_X86_64, GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_ISA_1_NEEDED, R_X86_64_COPY,
+        R_X86_64_DTPMOD64, R_X86_64_DTPOFF32, R_X86_64_DTPOFF64, R_X86_64_GLOB_DAT,
+        R_X86_64_GOTPC32_TLSDESC, R_X86_64_GOTTPOFF, R_X86_64_IRELATIVE, R_X86_64_JUMP_SLOT,
+        R_X86_64_RELATIVE, R_X86_64_SIZE32, R_X86_64_SIZE64, R_X86_64_TLSDESC,
         R_X86_64_TLSDESC_CALL, R_X86_64_TLSGD, R_X86_64_TLSLD, R_X86_64_TPOFF32, R_X86_64_TPOFF64,
     };
 
@@ -128,6 +150,17 @@ pub static X86_64: Arch = {
         // x86-64 pages are 4 KiB. A 2 MiB `p_align`, which binutils used as
         // the default `max-page-size` before 2.31, is for huge pages.
         max_page_size: 0x1000,
+        gnu_properties: GnuProperties {
+            feature_1_and: GNU_PROPERTY_X86_FEATURE_1_AND.0,
+            feature_1_family: "CET",
+            feature_1_bits: &[
+                (1 << 0, "IBT"),
+                (1 << 1, "SHSTK"),
+                (1 << 2, "LAM_U48"),
+                (1 << 3, "LAM_U57"),
+            ],
+            isa_1_needed: Some(GNU_PROPERTY_X86_ISA_1_NEEDED.0),
+        },
     }
 };
 

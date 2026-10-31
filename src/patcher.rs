@@ -2,10 +2,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use object::Endianness;
-use object::elf::{FileHeader64, GNU_PROPERTY_X86_FEATURE_1_AND, GNU_PROPERTY_X86_ISA_1_NEEDED};
+use object::elf::FileHeader64;
 use object::read::elf::{ElfFile64, NoteIterator, ProgramHeader};
 use tracing::warn;
 
+use crate::arch::GnuProperties;
 use crate::elf_reader::{
     DYN_ENTRY_SIZE, DynamicTable, MappedElf, SH_ADDR, SH_INFO, SH_OFFSET, SH_SIZE, SHDR_SIZE,
     SectionTable, VER_NDX_GLOBAL,
@@ -149,32 +150,25 @@ fn ensure_bind_now(bytes: &mut [u8]) -> Result<()> {
         .context("adding DT_FLAGS=DF_BIND_NOW")
 }
 
-/// The `GNU_PROPERTY_X86_FEATURE_1_*` bits, for naming the ones being dropped.
-const X86_FEATURE_1_BITS: [(u32, &str); 4] = [
-    (1 << 0, "IBT"),
-    (1 << 1, "SHSTK"),
-    (1 << 2, "LAM_U48"),
-    (1 << 3, "LAM_U57"),
-];
-
 /// The two GNU properties the merge re-derives, each as the file offset of its
 /// 4-byte value together with the value, when the object carries it.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct X86Properties {
-    /// `GNU_PROPERTY_X86_FEATURE_1_AND`: the CET features *every* object making
-    /// up the process has to support before the loader turns them on.
+struct ProgramProperties {
+    /// The architecture's `FEATURE_1_AND` property: the control-flow
+    /// protection features *every* object making up the process has to support
+    /// before the loader turns them on.
     features: Option<(usize, u32)>,
-    /// `GNU_PROPERTY_X86_ISA_1_NEEDED`: the x86-64 ISA levels the code needs,
-    /// which `ld.so` refuses to run on a CPU that lacks.
+    /// The architecture's `ISA_1_NEEDED` property: the ISA levels the code
+    /// needs, which `ld.so` refuses to run on a CPU that lacks.
     isa: Option<(usize, u32)>,
 }
 
-impl X86Properties {
+impl ProgramProperties {
     /// Read both properties out of the object's `PT_NOTE` segments in one walk.
     ///
     /// Only `PT_NOTE` segments are searched: those are the notes the loader
     /// itself reads, and a property note outside one would not reach it.
-    fn read(bytes: &[u8]) -> Result<Self> {
+    fn read(bytes: &[u8], types: &GnuProperties) -> Result<Self> {
         let elf = ElfFile64::<Endianness>::parse(bytes)
             .context("parsing the ELF header for GNU property notes")?;
         let endian = elf.endian();
@@ -183,7 +177,7 @@ impl X86Properties {
             // A segment that is not in the file, or whose `p_align` is neither
             // 4 nor 8 (binutils reads no other), has no notes to offer.
             if let Ok(Some(notes)) = ph.notes(endian, bytes) {
-                found.scan(bytes, endian, notes);
+                found.scan(bytes, endian, notes, types);
             }
         }
         Ok(found)
@@ -200,16 +194,20 @@ impl X86Properties {
         file: &[u8],
         endian: Endianness,
         notes: NoteIterator<'_, FileHeader64<Endianness>>,
+        types: &GnuProperties,
     ) {
         for note in notes.map_while(Result::ok) {
             let Some(properties) = note.gnu_properties(endian) else {
                 continue;
             };
             for property in properties.map_while(Result::ok) {
-                let slot = match property.pr_type() {
-                    GNU_PROPERTY_X86_FEATURE_1_AND => &mut self.features,
-                    GNU_PROPERTY_X86_ISA_1_NEEDED => &mut self.isa,
-                    _ => continue,
+                let pr_type = property.pr_type().0;
+                let slot = if pr_type == types.feature_1_and {
+                    &mut self.features
+                } else if Some(pr_type) == types.isa_1_needed {
+                    &mut self.isa
+                } else {
+                    continue;
                 };
                 let data = property.pr_data();
                 if slot.is_none()
@@ -226,20 +224,22 @@ impl X86Properties {
 }
 
 /// Re-derive the `.note.gnu.property` entries that describe the program as a
-/// whole, now that code from the merged libraries is part of it.
+/// whole, now that code from the merged libraries is part of it. Which
+/// property types those are is the architecture's; see `arch::GnuProperties`.
 ///
 /// Two properties stop being true the moment foreign code is merged in, and
 /// both are exactly what a static link recomputes across its inputs:
 ///
-///   * `GNU_PROPERTY_X86_FEATURE_1_AND` advertises the CET features — IBT and
-///     the shadow stack — that the whole program supports, and `ld.so` turns
-///     them on for the process when the executable claims them. Merging a
-///     library built without `-fcf-protection` leaves the claim standing over
-///     code that never got an `endbr64`, and solder routes calls into that code
-///     through GOT slots, i.e. as indirect branches — precisely what IBT
-///     faults on. The claim is the AND of every contributing object's, so each
-///     feature the merged library does not have is cleared here.
-///   * `GNU_PROPERTY_X86_ISA_1_NEEDED` is the union of the ISA levels the code
+///   * `FEATURE_1_AND` advertises the control-flow protection features the
+///     whole program supports, and `ld.so` turns them on for the process when
+///     the executable claims them. On x86-64 that is CET — IBT and the shadow
+///     stack. Merging a library built without `-fcf-protection` leaves the
+///     claim standing over code that never got an `endbr64`, and solder routes
+///     calls into that code through GOT slots, i.e. as indirect branches —
+///     precisely what IBT faults on. The claim is the AND of every
+///     contributing object's, so each feature the merged library does not
+///     have is cleared here.
+///   * `ISA_1_NEEDED` (x86-64 only) is the union of the ISA levels the code
 ///     requires. Without the merged library's levels folded in, a binary
 ///     carrying, say, AVX-512 library code looks runnable on a baseline CPU and
 ///     dies with SIGILL there instead of `ld.so`'s "CPU ISA level is lower than
@@ -250,10 +250,12 @@ impl X86Properties {
 /// without growing the note — there is nothing to grow into between the notes
 /// and the rest of the first mapping — so that case is reported instead.
 fn update_gnu_properties(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
-    let X86Properties {
+    let types = &plan.arch.gnu_properties;
+    let ProgramProperties {
         features: exe_features,
         isa: exe_isa,
-    } = X86Properties::read(bytes).context("reading the executable's .note.gnu.property")?;
+    } = ProgramProperties::read(bytes, types)
+        .context("reading the executable's .note.gnu.property")?;
     if exe_features.is_none() && exe_isa.is_none() {
         return Ok(());
     }
@@ -271,7 +273,7 @@ fn update_gnu_properties(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     for lib in libs {
         let mapped = MappedElf::open(lib)
             .with_context(|| format!("reading {} for its GNU property note", lib.display()))?;
-        let lib_props = X86Properties::read(mapped.bytes())
+        let lib_props = ProgramProperties::read(mapped.bytes(), types)
             .with_context(|| format!("reading .note.gnu.property of {}", lib.display()))?;
         let lib_features = lib_props.features.map_or(0, |(_, mask)| mask);
         let lib_isa = lib_props.isa.map_or(0, |(_, mask)| mask);
@@ -279,17 +281,19 @@ fn update_gnu_properties(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
         if features & !lib_features != 0 {
             warn!(
                 library = %lib.display(),
-                dropped = %feature_names(features & !lib_features),
-                "merged library does not support the CET features the executable \
-                 advertises; clearing them so the loader does not enable them over \
-                 code that cannot take them"
+                family = types.feature_1_family,
+                dropped = %feature_names(features & !lib_features, types),
+                "merged library does not support the control-flow protection features \
+                 the executable advertises; clearing them so the loader does not enable \
+                 them over code that cannot take them"
             );
         }
         if lib_isa & !isa != 0 && exe_isa.is_none() {
             warn!(
                 library = %lib.display(),
+                arch = plan.arch.name,
                 needed = format_args!("0x{:x}", lib_isa),
-                "merged library needs x86-64 ISA levels the executable's \
+                "merged library needs ISA levels the executable's \
                  .note.gnu.property has no entry to record; on a CPU without them \
                  the merged code will fault instead of being refused by ld.so"
             );
@@ -313,14 +317,18 @@ fn update_gnu_properties(bytes: &mut [u8], plan: &MergePlan) -> Result<()> {
     Ok(())
 }
 
-/// Name the `GNU_PROPERTY_X86_FEATURE_1_*` bits set in `mask`.
-fn feature_names(mask: u32) -> String {
-    let mut names: Vec<String> = X86_FEATURE_1_BITS
+/// Name the `FEATURE_1_AND` bits set in `mask`.
+fn feature_names(mask: u32, types: &GnuProperties) -> String {
+    let mut names: Vec<String> = types
+        .feature_1_bits
         .iter()
         .filter(|(bit, _)| mask & bit != 0)
         .map(|(_, name)| (*name).to_owned())
         .collect();
-    let known: u32 = X86_FEATURE_1_BITS.iter().fold(0, |acc, (bit, _)| acc | bit);
+    let known: u32 = types
+        .feature_1_bits
+        .iter()
+        .fold(0, |acc, (bit, _)| acc | bit);
     if mask & !known != 0 {
         names.push(format!("0x{:x}", mask & !known));
     }
@@ -1077,20 +1085,21 @@ mod gnu_property_tests {
     /// `NT_GNU_PROPERTY_TYPE_0`, the note type whose descriptor is the GNU
     /// property array.
     const NT_GNU_PROPERTY_TYPE_0: u32 = object::elf::NT_GNU_PROPERTY_TYPE_0.0;
-    const FEATURE_1_AND: u32 = GNU_PROPERTY_X86_FEATURE_1_AND.0;
-    const ISA_1_NEEDED: u32 = GNU_PROPERTY_X86_ISA_1_NEEDED.0;
+    const FEATURE_1_AND: u32 = object::elf::GNU_PROPERTY_X86_FEATURE_1_AND.0;
+    const ISA_1_NEEDED: u32 = object::elf::GNU_PROPERTY_X86_ISA_1_NEEDED.0;
+    const X86: &GnuProperties = &crate::arch::X86_64.gnu_properties;
 
     /// The properties in a bare note array laid out with `align`.
-    fn in_notes(notes: &[u8], align: u64) -> X86Properties {
-        let mut found = X86Properties::default();
+    fn in_notes(notes: &[u8], align: u64) -> ProgramProperties {
+        let mut found = ProgramProperties::default();
         let iter = NoteIterator::new(Endianness::Little, align, notes).expect("valid alignment");
-        found.scan(notes, Endianness::Little, iter);
+        found.scan(notes, Endianness::Little, iter, X86);
         found
     }
 
     /// The properties of a whole ELF image.
-    fn read(bytes: &[u8]) -> X86Properties {
-        X86Properties::read(bytes).expect("parse ELF")
+    fn read(bytes: &[u8]) -> ProgramProperties {
+        ProgramProperties::read(bytes, X86).expect("parse ELF")
     }
 
     /// One note: `namesz`/`descsz`/`n_type`, the name `GNU\0`, then `desc`
@@ -1136,9 +1145,51 @@ mod gnu_property_tests {
         // padding out to 8 — then 8 bytes into the feature property.
         assert_eq!(
             in_notes(&notes, 4),
-            X86Properties {
+            ProgramProperties {
                 features: Some((property_note_at + 16 + 16 + 8, IBT | SHSTK)),
                 isa: Some((property_note_at + 16 + 8, 0x4)),
+            }
+        );
+    }
+
+    /// The property types come from the architecture, not from x86-64: under
+    /// a descriptor shaped like aarch64's — a `FEATURE_1_AND` at `0xc0000000`
+    /// carrying BTI/PAC and no ISA property — the x86-64 properties are
+    /// someone else's and are skipped, and its own feature property is read.
+    #[test]
+    fn the_property_types_read_are_the_architectures() {
+        const BTI: u32 = 1 << 0;
+        const PAC: u32 = 1 << 1;
+        let aarch64_like = GnuProperties {
+            feature_1_and: object::elf::GNU_PROPERTY_AARCH64_FEATURE_1_AND.0,
+            feature_1_family: "BTI/PAC",
+            feature_1_bits: &[(BTI, "BTI"), (PAC, "PAC")],
+            isa_1_needed: None,
+        };
+
+        let mut desc = property(ISA_1_NEEDED, 0x4);
+        desc.extend_from_slice(&property(FEATURE_1_AND, IBT));
+        desc.extend_from_slice(&property(aarch64_like.feature_1_and, BTI | PAC));
+        let notes = note(NT_GNU_PROPERTY_TYPE_0, &desc, 8);
+
+        let mut found = ProgramProperties::default();
+        let iter = NoteIterator::new(Endianness::Little, 8, &notes).expect("valid alignment");
+        found.scan(&notes, Endianness::Little, iter, &aarch64_like);
+        assert_eq!(
+            found,
+            ProgramProperties {
+                features: Some((16 + 16 + 16 + 8, BTI | PAC)),
+                isa: None,
+            }
+        );
+        assert_eq!(feature_names(PAC, &aarch64_like), "PAC");
+
+        // And the same note under x86-64 yields the x86-64 pair.
+        assert_eq!(
+            in_notes(&notes, 8),
+            ProgramProperties {
+                features: Some((16 + 16 + 8, IBT)),
+                isa: Some((16 + 8, 0x4)),
             }
         );
     }
@@ -1155,7 +1206,7 @@ mod gnu_property_tests {
             let truncated = &whole[..whole.len() - cut];
             assert_eq!(
                 in_notes(truncated, 8),
-                X86Properties::default(),
+                ProgramProperties::default(),
                 "a note cut {cut} bytes short should not be read"
             );
         }
@@ -1163,7 +1214,7 @@ mod gnu_property_tests {
         // A nonsense namesz must not be trusted to stay in bounds either.
         let mut bogus = whole.clone();
         bogus[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(in_notes(&bogus, 8), X86Properties::default());
+        assert_eq!(in_notes(&bogus, 8), ProgramProperties::default());
     }
 
     /// Anchor the segment walk against a real binary: `test/grep` carries a
@@ -1174,14 +1225,14 @@ mod gnu_property_tests {
         let bytes = std::fs::read(GREP).expect("read test/grep");
         assert_eq!(
             read(&bytes),
-            X86Properties {
+            ProgramProperties {
                 features: None,
                 isa: Some((0x350, 1)),
             }
         );
         assert_eq!(
             read(&std::fs::read(PCRE2).expect("read libpcre2")),
-            X86Properties::default()
+            ProgramProperties::default()
         );
     }
 
@@ -1302,7 +1353,7 @@ mod gnu_property_tests {
 
     #[test]
     fn dropped_features_are_named_in_the_warning() {
-        assert_eq!(feature_names(IBT | SHSTK), "IBT, SHSTK");
-        assert_eq!(feature_names(1 << 9), "0x200");
+        assert_eq!(feature_names(IBT | SHSTK, X86), "IBT, SHSTK");
+        assert_eq!(feature_names(1 << 9, X86), "0x200");
     }
 }
