@@ -8,9 +8,10 @@
 //! and handed to every stage that reads one, so that supporting a second
 //! architecture is adding a descriptor rather than finding every literal.
 //!
-//! What is *not* here yet is the machine code itself — instruction decoding,
-//! PLT stub recognition, trampolines, jump tables. The extractor still only
-//! decodes x86-64, which is why [`SUPPORTED`] lists nothing else even though
+//! What is *not* here is the machine code itself — instruction decoding,
+//! PLT stub recognition, trampolines, jump tables. The extractor reads
+//! aarch64 code as well as x86-64 now, but the writer still only emits x86-64
+//! trampolines, which is why [`SUPPORTED`] lists nothing else even though
 //! [`AARCH64`] is described.
 
 /// Why a dynamic relocation type cannot be lifted into the merged executable:
@@ -168,10 +169,10 @@ pub static X86_64: Arch = {
 /// aarch64 (`EM_AARCH64`), LP64, per the ARM ELF ABI (AAELF64) and glibc's
 /// `sysdeps/aarch64`.
 ///
-/// Not in [`SUPPORTED`] yet: the extractor cannot decode aarch64 code, so an
-/// aarch64 executable is still refused at the gate. Until then this is what
-/// the per-architecture tables of the search, the reader and the patcher are
-/// tested against.
+/// Not in [`SUPPORTED`] yet: the writer cannot emit aarch64 trampolines, so
+/// an aarch64 executable is still refused at the gate. Until then this is
+/// what the per-architecture tables of the search, the reader, the extractor
+/// and the patcher are tested against.
 #[cfg_attr(not(test), allow(dead_code))]
 pub static AARCH64: Arch = {
     use Unliftable::{Copy, Ifunc, Tls};

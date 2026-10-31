@@ -1215,6 +1215,7 @@ mod section_header_tests {
                     size: 32,
                     addend: -4,
                     target: RelocTarget::External((*sym).to_owned()),
+                    insn: None,
                 })
                 .collect(),
         }

@@ -536,6 +536,7 @@ mod tests {
                     size: 32,
                     addend: -4,
                     target: RelocTarget::External((*sym).to_owned()),
+                    insn: None,
                 })
                 .collect(),
         }
@@ -553,6 +554,7 @@ mod tests {
             size: 64,
             addend: 0,
             target: RelocTarget::MergedUnit(UnitId(0)),
+            insn: None,
         });
         u
     }

@@ -23,8 +23,10 @@
 //! where its PC-relative operand points; this module adds what the decoder
 //! does not, which is where in the word that operand is kept.
 //!
-//! Nothing outside the tests calls this yet: the extractor still decodes with
-//! iced-x86 only, and `arch::SUPPORTED` still refuses aarch64 executables.
+//! The extractor reads an aarch64 library's references and PLT stubs through
+//! this module, and the relocator writes [`Field`]s with it. The trampolines
+//! are not wired in yet, and `arch::SUPPORTED` still refuses aarch64
+//! executables.
 
 use std::collections::BTreeSet;
 
@@ -439,6 +441,19 @@ fn operand_registers(operand: &Operand) -> Vec<usize> {
         .map(|&r| r as usize)
         .filter(|&r| r < GPRS)
         .collect()
+}
+
+/// How many bytes the `:lo12:` instruction `word` reads or writes at the
+/// address its pair forms: the access size of a load or store, and `None` for
+/// an `add`, which only takes the address, and for a `prfm`, which touches
+/// nothing. The aarch64 counterpart of `extractor::rip_access_len`.
+pub fn lo12_access_len(word: u32) -> Option<u64> {
+    let is_add = word & 0x7fc0_0000 == 0x1100_0000;
+    let is_prfm = word & (1 << 26) == 0 && word >> 30 == 3 && (word >> 22) & 0b11 == 0b10;
+    if is_add || is_prfm {
+        return None;
+    }
+    lo12_scale(word).map(|scale| 1 << scale)
 }
 
 /// What a `:lo12:`-shaped word does with its registers.

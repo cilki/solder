@@ -7,11 +7,12 @@ use iced_x86::Instruction;
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
+use crate::aarch64;
 use crate::arch::{Arch, Unliftable};
 use crate::elf_reader::MappedElf;
 use crate::types::{
     DATA_BLOB_ALIGNMENT, DataSectionCopy, ExtractedReloc, ExtractedUnit, GotSlotFixup,
-    InitFiniArrays, InitFiniEntry, RelocTarget, SectionKind, UnboundedEnd, UnitId,
+    InitFiniArrays, InitFiniEntry, InsnField, RelocTarget, SectionKind, UnboundedEnd, UnitId,
 };
 
 /// The map the extractor's own caches are kept in.
@@ -555,6 +556,7 @@ fn pcrel_reloc(offset: u64, size: u8, addend: i64, target: RelocTarget) -> Extra
         size,
         addend,
         target,
+        insn: None,
     }
 }
 
@@ -853,117 +855,144 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
     // on, and the extent, the RIP-relative scan and the jump-table detector all
     // want the same instruction stream, so it is decoded once here and shared
     // rather than re-derived by each of the three.
-    let code = if section_kind == SectionKind::Text {
-        decode_unit_code(&bytes, sym_vaddr, lib.index)
-    } else {
-        UnitCode {
+    //
+    // aarch64 code is read a word at a time by `aarch64`'s own scanners, so
+    // there is no stream to share; and its references come from two of them,
+    // one per instruction and one pairing each `adrp` with what completes it.
+    let is_aarch64 = state.arch.e_machine == object::elf::EM_AARCH64.0;
+    let (code, code_refs) = if section_kind != SectionKind::Text {
+        let code = UnitCode {
             instrs: Vec::new(),
             len: bytes.len(),
-        }
+        };
+        (code, Vec::new())
+    } else if is_aarch64 {
+        let len = aarch64_code_len(&bytes, sym_vaddr, lib.index);
+        let refs = scan_aarch64_refs(&bytes[..len], sym_vaddr)?;
+        let code = UnitCode {
+            instrs: Vec::new(),
+            len,
+        };
+        (code, refs)
+    } else {
+        let code = decode_unit_code(&bytes, sym_vaddr, lib.index);
+        let refs = scan_rip_relative_refs(&code.instrs, &bytes, sym_vaddr);
+        (code, refs)
     };
     let code_len = code.len;
 
-    // Scan for RIP-relative references (calls, jumps, and data accesses).
-    // Create synthetic relocations for each reference so they get patched correctly.
-    if section_kind == SectionKind::Text {
-        let rip_refs = scan_rip_relative_refs(&code.instrs, &bytes, sym_vaddr);
-        for rip_ref in rip_refs {
-            let target_addr = rip_ref.target_vaddr;
+    // What each aarch64 `:lo12:` instruction resolved to, by its offset, for
+    // the `adrp` that supplies its page (see `RefSite::AdrpOf`).
+    let mut lo12_resolved: FastMap<usize, (i64, RelocTarget)> = FastMap::default();
 
-            // Skip references within our own function
-            if target_addr >= sym_vaddr && target_addr < sym_vaddr + sym_size as u64 {
-                continue;
+    // Create synthetic relocations for each reference the scan found (calls,
+    // jumps, and data accesses) so they get patched correctly.
+    for code_ref in code_refs {
+        let target_addr = code_ref.target_vaddr;
+
+        if let RefSite::AdrpOf(lo12) = code_ref.site {
+            // `scan_aarch64_refs` puts every `:lo12:` ahead of the `adrp`s.
+            // One that resolved nowhere was warned about already, and leaves
+            // nothing for its page to agree with.
+            if let Some((extra, target)) = lo12_resolved.get(&lo12) {
+                relocs
+                    .relocations
+                    .push(code_ref.reloc(*extra, target.clone()));
             }
+            continue;
+        }
 
-            if rip_ref.is_code_ref {
-                // rel8 (short jump) displacements get an 8-bit relocation; the
-                // relocator verifies the final offset still fits.
-                let reloc_size: u8 = if rip_ref.disp_size == 1 { 8 } else { 32 };
-                // First check if this is a PLT call (call to external symbol)
-                if let Some(target) = plt_reference(lib, target_addr, state) {
-                    relocs.relocations.push(pcrel_reloc(
-                        rip_ref.offset as u64,
-                        reloc_size,
-                        rip_ref.addend,
-                        target,
-                    ));
-                } else {
-                    // Direct call/jmp to an internal address. Prefer a named
-                    // symbol; otherwise synthesize an anonymous unit for a
-                    // symbol-less local helper. Stripped libraries routinely
-                    // reach such helpers via a plain `call` with no symbol of
-                    // their own — e.g. OpenSSL's md5_block_asm_data_order, which
-                    // MD5_Update/MD5_Final call directly. Without this, the call
-                    // bytes were copied verbatim and the stale displacement
-                    // pointed into unmapped memory, crashing at runtime.
-                    let mut dep = reserve_unit_at(lib, target_addr, state);
-                    if dep.is_none() && anon_target_is_extractable(lib, target_addr) {
-                        dep = Some(UnitRef {
-                            id: state.reserve(UnitKey {
-                                lib: key.lib,
-                                sym: anon_unit_name(target_addr),
-                            }),
-                            offset: 0,
-                        });
-                    }
-                    if let Some(dep) = dep {
-                        // The relocator computes S + A - P against the unit's
-                        // base, so an interior target is reached through the
-                        // addend.
-                        relocs.relocations.push(pcrel_reloc(
-                            rip_ref.offset as u64,
-                            reloc_size,
-                            rip_ref.addend + dep.offset as i64,
-                            RelocTarget::MergedUnit(dep.id),
-                        ));
-                    } else {
-                        warn!(
-                            symbol = key.sym,
-                            offset = format_args!("{:#x}", rip_ref.offset),
-                            target = format_args!("{:#x}", target_addr),
-                            "direct code ref to an unresolved internal target; \
-                             merged binary may crash if this path executes"
-                        );
-                    }
-                }
+        // A reference within our own function. Most survive the move as they
+        // are; the ones that do not are relocated against this very unit.
+        if target_addr >= sym_vaddr && target_addr < sym_vaddr + sym_size as u64 {
+            if !code_ref.moves_with_its_unit() {
+                let extra = (target_addr - sym_vaddr) as i64;
+                lo12_resolved.insert(code_ref.offset, (extra, RelocTarget::MergedUnit(id)));
+                relocs
+                    .relocations
+                    .push(code_ref.reloc(extra, RelocTarget::MergedUnit(id)));
+            }
+            continue;
+        }
+
+        if code_ref.is_code_ref {
+            // A rel8 (short jump) displacement gets an 8-bit relocation; the
+            // relocator verifies the final offset still fits. First check if
+            // this is a PLT call (call to external symbol).
+            if let Some(target) = plt_reference(lib, target_addr, state) {
+                relocs.relocations.push(code_ref.reloc(0, target));
             } else {
-                // Data reference (LEA/MOV) — could be loading the address of
-                // data or of code (e.g. LEA of a function pointer, or of a
-                // label inside the function doing the load). Resolve it to an
-                // owning unit first; anything else falls through to the blob
-                // path below.
-                if let Some(dep) = reserve_unit_at(lib, target_addr, state) {
-                    relocs.relocations.push(pcrel_reloc(
-                        rip_ref.offset as u64,
-                        32,
-                        rip_ref.addend + dep.offset as i64,
-                        RelocTarget::MergedUnit(dep.id),
-                    ));
-                    continue;
+                // Direct call/jmp to an internal address. Prefer a named
+                // symbol; otherwise synthesize an anonymous unit for a
+                // symbol-less local helper. Stripped libraries routinely
+                // reach such helpers via a plain `call` with no symbol of
+                // their own — e.g. OpenSSL's md5_block_asm_data_order, which
+                // MD5_Update/MD5_Final call directly. Without this, the call
+                // bytes were copied verbatim and the stale displacement
+                // pointed into unmapped memory, crashing at runtime.
+                let mut dep = reserve_unit_at(lib, target_addr, state);
+                if dep.is_none() && anon_target_is_extractable(lib, target_addr) {
+                    dep = Some(UnitRef {
+                        id: state.reserve(UnitKey {
+                            lib: key.lib,
+                            sym: anon_unit_name(target_addr),
+                        }),
+                        offset: 0,
+                    });
                 }
-                // Otherwise try to extract the data section
-                if let Some((blob_id, blob_base)) = ensure_data_blob_extracted(
-                    lib,
-                    &key.sym,
-                    target_addr,
-                    rip_ref.access_len,
-                    state,
-                )? {
-                    let offset_in_blob = target_addr - blob_base;
-                    relocs.relocations.push(pcrel_reloc(
-                        rip_ref.offset as u64,
-                        32,
-                        rip_ref.addend,
-                        RelocTarget::DataBlobOffset(blob_id, offset_in_blob),
-                    ));
+                if let Some(dep) = dep {
+                    // The relocator computes S + A - P against the unit's
+                    // base, so an interior target is reached through the
+                    // addend.
+                    relocs.relocations.push(
+                        code_ref.reloc(dep.offset as i64, RelocTarget::MergedUnit(dep.id)),
+                    );
                 } else {
                     warn!(
                         symbol = key.sym,
-                        offset = format_args!("{:#x}", rip_ref.offset),
+                        offset = format_args!("{:#x}", code_ref.offset),
                         target = format_args!("{:#x}", target_addr),
-                        "RIP-relative data ref target not found"
+                        "direct code ref to an unresolved internal target; \
+                         merged binary may crash if this path executes"
                     );
                 }
+            }
+        } else {
+            // Data reference (LEA/MOV) — could be loading the address of
+            // data or of code (e.g. LEA of a function pointer, or of a
+            // label inside the function doing the load). Resolve it to an
+            // owning unit first; anything else falls through to the blob
+            // path below.
+            let resolved = if let Some(dep) = reserve_unit_at(lib, target_addr, state) {
+                Some((dep.offset as i64, RelocTarget::MergedUnit(dep.id)))
+            } else {
+                // Otherwise try to extract the data section
+                ensure_data_blob_extracted(
+                    lib,
+                    &key.sym,
+                    target_addr,
+                    code_ref.access_len,
+                    state,
+                )?
+                .map(|(blob_id, blob_base)| {
+                    (
+                        0,
+                        RelocTarget::DataBlobOffset(blob_id, target_addr - blob_base),
+                    )
+                })
+            };
+            if let Some((extra, target)) = resolved {
+                if is_aarch64 {
+                    lo12_resolved.insert(code_ref.offset, (extra, target.clone()));
+                }
+                relocs.relocations.push(code_ref.reloc(extra, target));
+            } else {
+                warn!(
+                    symbol = key.sym,
+                    offset = format_args!("{:#x}", code_ref.offset),
+                    target = format_args!("{:#x}", target_addr),
+                    "RIP-relative data ref target not found"
+                );
             }
         }
     }
@@ -1199,6 +1228,15 @@ struct LibIndex {
     dyn_relocs: Vec<DynReloc>,
 }
 
+/// Whether `name` is an aarch64 mapping symbol (AAELF64 "Mapping symbols"):
+/// `$x` or `$d`, optionally followed by `.` and anything, which the assembler
+/// puts at the start of every run of code and of data in a section. They
+/// name no object. Taken for one, `$x` shadows the function at its address
+/// and a `$d` inside `.text` cuts the function holding a literal pool short.
+fn is_mapping_symbol(name: &str) -> bool {
+    matches!(name.as_bytes(), [b'$', b'x' | b'd'] | [b'$', b'x' | b'd', b'.', ..])
+}
+
 impl LibIndex {
     fn build(elf: &object::read::elf::ElfFile64<'_>, path: &Path, arch: &Arch) -> Result<Self> {
         let mut by_name: FastMap<String, SymInfo> = FastMap::default();
@@ -1212,6 +1250,9 @@ impl LibIndex {
             let object::SymbolSection::Section(si) = sym.section() else {
                 continue;
             };
+            if sym.name().is_ok_and(is_mapping_symbol) {
+                continue;
+            }
             let addr = sym.address();
             addrs_by_section.push((addr, si.0));
             if sym.size() > 0 {
@@ -1699,6 +1740,80 @@ fn ends_the_function(instrs: &[Instruction], end: u64) -> bool {
     })
 }
 
+/// How many of an aarch64 text unit's leading bytes are its function's code:
+/// as far as the function's FDE claims, if [`aarch64::ends_the_function`]
+/// agrees that the code stops there, and the whole unit otherwise. See
+/// [`decode_unit_code`] for why the tail is worth cutting off and why the
+/// claim has to be checked.
+fn aarch64_code_len(bytes: &[u8], vaddr: u64, index: &LibIndex) -> usize {
+    index
+        .fdes
+        .containing(vaddr)
+        .filter(|&(start, _)| start == vaddr)
+        .and_then(|(_, end)| end.checked_sub(vaddr))
+        .map(|len| len as usize)
+        .filter(|&len| len < bytes.len() && aarch64::ends_the_function(&bytes[..len]))
+        .unwrap_or(bytes.len())
+}
+
+/// Every address the aarch64 function in `code`, loaded at `vaddr`, keeps in
+/// its instructions: each branch, `adr` and literal load
+/// ([`aarch64::scan_pc_relative_refs`]), and each `adrp` pair
+/// ([`aarch64::pair_lo12_refs`]).
+///
+/// A pair is two references to one address. The `:lo12:` half carries it
+/// whole and comes first; each `adrp` follows as a [`RefSite::AdrpOf`] the
+/// first `:lo12:` it pairs with, which is the only place its full target is
+/// known. An `adrp` nothing completes reaches no address and is left alone.
+///
+/// A reference the scanners cannot account for — a page used other than as a
+/// `:lo12:` base, a PC-relative form with no field to rewrite — fails the
+/// extraction, since copying it as it is would leave it aimed at wherever the
+/// old offset lands.
+fn scan_aarch64_refs(code: &[u8], vaddr: u64) -> Result<Vec<CodeRef>> {
+    let mut refs = Vec::new();
+    let pairs = aarch64::pair_lo12_refs(code, vaddr)?;
+    for pair in &pairs {
+        let word = u32::from_le_bytes(
+            code[pair.offset..pair.offset + aarch64::INSN_LEN]
+                .try_into()
+                .expect("one word"),
+        );
+        refs.push(CodeRef {
+            offset: pair.offset,
+            target_vaddr: pair.target,
+            is_code_ref: false,
+            access_len: aarch64::lo12_access_len(word),
+            site: RefSite::Insn(InsnField {
+                field: aarch64::Field::Lo12,
+                adrps: pair.adrps.iter().map(|&a| a as u64).collect(),
+            }),
+        });
+    }
+    for (offset, r) in aarch64::scan_pc_relative_refs(code, vaddr)? {
+        let (site, target_vaddr) = if r.field == aarch64::Field::AdrpPage {
+            let Some(pair) = pairs.iter().find(|p| p.adrps.contains(&offset)) else {
+                continue;
+            };
+            (RefSite::AdrpOf(pair.offset), pair.target)
+        } else {
+            let site = RefSite::Insn(InsnField {
+                field: r.field,
+                adrps: Vec::new(),
+            });
+            (site, r.target)
+        };
+        refs.push(CodeRef {
+            offset,
+            target_vaddr,
+            is_code_ref: r.is_code_ref,
+            access_len: None,
+            site,
+        });
+    }
+    Ok(refs)
+}
+
 /// Find a run of at least `need` bytes of alignment padding starting at
 /// `start`: nop-family instructions or int3 fill emitted between functions,
 /// which is never executed and can be overwritten by a branch veneer.
@@ -1721,29 +1836,83 @@ fn find_padding_slot(bytes: &[u8], start: usize, need: usize) -> Option<usize> {
     (run >= need).then_some(start)
 }
 
-/// A RIP-relative reference found in machine code.
+/// An address found in machine code: an x86-64 RIP-relative displacement, or
+/// an aarch64 instruction field.
 #[derive(Debug, Clone)]
-struct RipRelativeRef {
-    /// Byte offset within the code where the displacement starts.
+struct CodeRef {
+    /// Byte offset within the code of the patch site: where the displacement
+    /// starts, or the instruction word that holds the field.
     offset: usize,
     /// Target virtual address this reference points to.
     target_vaddr: u64,
     /// Whether this is a code reference (call/jmp) vs data reference (lea/mov).
     is_code_ref: bool,
-    /// Size of the encoded displacement in bytes: 4 (rel32) or 1 (rel8, short
-    /// jumps only).
-    disp_size: u8,
-    /// Relocation addend: -(bytes from displacement start to instruction end).
-    /// This is -4 when the displacement is the final field, but instructions
-    /// like `cmpb $imm, [rip+d]` carry an immediate after the displacement,
-    /// which shifts next_ip further and makes the addend more negative.
-    addend: i64,
     /// How many bytes at `target_vaddr` the instruction reads or writes, where
     /// the instruction says: that bounds the object the reference reaches, and
     /// so bounds how much of a data section has to be copied for it (see
     /// [`needed_prefix`]). `None` for a code reference, and for the
     /// instructions that take an address without saying what is at it.
     access_len: Option<u64>,
+    /// How the address is written into the code.
+    site: RefSite,
+}
+
+#[derive(Debug, Clone)]
+enum RefSite {
+    /// An x86-64 little-endian displacement.
+    Disp {
+        /// Size of the encoded displacement in bytes: 4 (rel32) or 1 (rel8,
+        /// short jumps only).
+        size: u8,
+        /// Relocation addend: -(bytes from displacement start to instruction
+        /// end). This is -4 when the displacement is the final field, but
+        /// instructions like `cmpb $imm, [rip+d]` carry an immediate after the
+        /// displacement, which shifts next_ip further and makes the addend
+        /// more negative.
+        addend: i64,
+    },
+    /// An aarch64 instruction field.
+    Insn(InsnField),
+    /// The `adrp` half of an aarch64 pair. It is relocated against whatever
+    /// the `:lo12:` instruction at this unit offset resolved to: the page is
+    /// all an `adrp` encodes, so that is the only way to know which object it
+    /// is for.
+    AdrpOf(usize),
+}
+
+impl CodeRef {
+    /// Whether the reference stays right when the unit moves as a whole and
+    /// its target moves with it. A displacement, or an aarch64 branch or `adr`,
+    /// to somewhere inside the same function is; an `adrp` pair is not, since
+    /// it names a 4 KiB page and the low twelve bits of an absolute address,
+    /// and the unit is not placed at the same offset into a page.
+    fn moves_with_its_unit(&self) -> bool {
+        match &self.site {
+            RefSite::Disp { .. } => true,
+            RefSite::Insn(insn) => insn.field != aarch64::Field::Lo12,
+            RefSite::AdrpOf(_) => false,
+        }
+    }
+
+    /// The relocation writing `target`, `extra` bytes into it, at this site.
+    fn reloc(&self, extra: i64, target: RelocTarget) -> ExtractedReloc {
+        match &self.site {
+            RefSite::Disp { size, addend } => {
+                pcrel_reloc(self.offset as u64, size * 8, addend + extra, target)
+            }
+            RefSite::Insn(insn) => ExtractedReloc {
+                insn: Some(insn.clone()),
+                ..pcrel_reloc(self.offset as u64, 32, extra, target)
+            },
+            RefSite::AdrpOf(_) => ExtractedReloc {
+                insn: Some(InsnField {
+                    field: aarch64::Field::AdrpPage,
+                    adrps: Vec::new(),
+                }),
+                ..pcrel_reloc(self.offset as u64, 32, extra, target)
+            },
+        }
+    }
 }
 
 /// How many bytes `instr` touches at its RIP-relative memory operand, or
@@ -1808,7 +1977,7 @@ fn scan_rip_relative_refs(
     instrs: &[Instruction],
     bytes: &[u8],
     base_vaddr: u64,
-) -> Vec<RipRelativeRef> {
+) -> Vec<CodeRef> {
     use iced_x86::{FlowControl, OpKind};
 
     let mut refs = Vec::new();
@@ -1835,13 +2004,15 @@ fn scan_rip_relative_refs(
                         && i8::try_from(rel).is_ok_and(|r| instr_bytes[instr.len() - 1] == r as u8);
                     if is_rel32 || is_rel8 {
                         let disp_size: u8 = if is_rel32 { 4 } else { 1 };
-                        refs.push(RipRelativeRef {
+                        refs.push(CodeRef {
                             offset: instr_offset + instr.len() - disp_size as usize,
                             target_vaddr: target,
                             is_code_ref: true,
-                            disp_size,
-                            addend: -(disp_size as i64),
                             access_len: None,
+                            site: RefSite::Disp {
+                                size: disp_size,
+                                addend: -(disp_size as i64),
+                            },
                         });
                     }
                 }
@@ -1867,13 +2038,15 @@ fn scan_rip_relative_refs(
                         // Search backwards — the displacement is near the end
                         let disp_pos = instr_bytes.windows(4).rposition(|w| w == disp_bytes);
                         if let Some(pos) = disp_pos {
-                            refs.push(RipRelativeRef {
+                            refs.push(CodeRef {
                                 offset: instr_offset + pos,
                                 target_vaddr: target,
                                 is_code_ref: false,
-                                disp_size: 4,
-                                addend: -((instr.len() - pos) as i64),
                                 access_len: rip_access_len(instr),
+                                site: RefSite::Disp {
+                                    size: 4,
+                                    addend: -((instr.len() - pos) as i64),
+                                },
                             });
                         }
                         break; // Only one memory operand per instruction
@@ -1896,10 +2069,28 @@ fn scan_rip_relative_refs(
 /// PLT entries, GLOB_DAT for .plt.got-style stubs like `__cxa_finalize@plt` —
 /// names the symbol. Both halves of that lookup come out of the library's
 /// [`LibIndex`], built once per library.
+///
+/// An aarch64 library's stubs are read by [`aarch64::plt_stub_slot`] instead.
 fn plt_target(lib: Lib<'_, '_>, addr: u64) -> Option<String> {
     let (sec_addr, section) = lib.index.plt_span_at(addr)?;
     let sec_data = lib.elf.section_by_index(section).ok()?.data().ok()?;
 
+    let got_va = if lib.elf.architecture() == object::Architecture::Aarch64 {
+        aarch64::plt_stub_slot(sec_data.get((addr - sec_addr) as usize..)?, addr)?
+    } else {
+        x86_64_plt_stub_slot(sec_data, sec_addr, addr)?
+    };
+
+    if let Some(name) = lib.index.got_to_name.get(&got_va) {
+        return Some(name.clone());
+    }
+    // Fallback: a symbol defined at this exact address.
+    find_symbol_at_address(lib.index, addr)
+}
+
+/// The GOT slot the x86-64 PLT stub at `addr` in a PLT section loaded at
+/// `sec_addr` jumps through; see [`plt_target`].
+fn x86_64_plt_stub_slot(sec_data: &[u8], sec_addr: u64, addr: u64) -> Option<u64> {
     let mut off = (addr - sec_addr) as usize;
     if sec_data.len() >= off + 4 && sec_data[off..off + 4] == [0xf3, 0x0f, 0x1e, 0xfa] {
         off += 4; // endbr64
@@ -1911,13 +2102,7 @@ fn plt_target(lib: Lib<'_, '_>, addr: u64) -> Option<String> {
         return None; // not an indirect-jump stub (e.g. the PLT0 resolver)
     }
     let disp = i32::from_le_bytes(sec_data[off + 2..off + 6].try_into().expect("4 bytes"));
-    let got_va = (sec_addr + off as u64 + 6).wrapping_add(disp as i64 as u64);
-
-    if let Some(name) = lib.index.got_to_name.get(&got_va) {
-        return Some(name.clone());
-    }
-    // Fallback: a symbol defined at this exact address.
-    find_symbol_at_address(lib.index, addr)
+    Some((sec_addr + off as u64 + 6).wrapping_add(disp as i64 as u64))
 }
 
 /// The target a call to the PLT stub at `addr` gets, or `None` when `addr` is
@@ -2288,6 +2473,7 @@ fn collect_dynamic_range_relocs(
             size: reloc_size,
             addend: resolved_addend.unwrap_or(reloc.addend),
             target,
+            insn: None,
         });
     }
     Ok(())
@@ -5670,5 +5856,107 @@ mod tests {
                 reloc.offset_within_unit
             );
         }
+    }
+
+    /// `test/aarch64/libpages.so.1`, built from the `libpages.c` beside it.
+    fn aarch64_lib() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/aarch64/libpages.so.1"
+        ))
+    }
+
+    /// Extract `seed` and everything it reaches from the aarch64 fixture,
+    /// with each unit's relocations spelled out as `offset field -> target`.
+    fn extract_aarch64(seed: &str) -> BTreeMap<String, Vec<String>> {
+        let mut state = test_state();
+        state.arch = &crate::arch::AARCH64;
+        let key = key_in(&mut state, &aarch64_lib(), seed);
+        state.reserve(key);
+        while let Some((key, id)) = state.worklist.pop_front() {
+            process_symbol(&key, id, &mut state)
+                .unwrap_or_else(|e| panic!("extract '{}': {e:#}", key.sym));
+        }
+        let name_of: BTreeMap<u32, String> =
+            state.units.iter().map(|u| (u.id.0, u.name.clone())).collect();
+        state
+            .units
+            .iter()
+            .map(|u| {
+                let relocs = u
+                    .relocations
+                    .iter()
+                    .map(|r| {
+                        let target = match &r.target {
+                            RelocTarget::MergedUnit(id) => name_of[&id.0].clone(),
+                            RelocTarget::DataBlobOffset(id, off) => {
+                                format!("{}+{off:#x}", name_of[&id.0])
+                            }
+                            RelocTarget::External(name) => format!("extern {name}"),
+                        };
+                        let site = match &r.insn {
+                            Some(insn) => format!("{:?}{:?}", insn.field, insn.adrps),
+                            None => format!("{:?}/{}", r.kind, r.size),
+                        };
+                        format!("{:#x} {site} -> {target}+{}", r.offset_within_unit, r.addend)
+                    })
+                    .collect();
+                (u.name.clone(), relocs)
+            })
+            .collect()
+    }
+
+    /// An aarch64 function's addresses are found in its instruction fields:
+    /// the `b` tail call to a local helper, and an `adrp` shared by the load
+    /// and the store that complete it. All three halves of the pair are
+    /// relocated against `counter`, and the `:lo12:` ones say which `adrp`
+    /// supplies their page.
+    ///
+    /// ```text
+    /// 6d0: adrp x2, 0x20000
+    /// 6d8: ldr  w1, [x2, #0x24]     ; counter
+    /// 6e4: str  w1, [x2, #0x24]
+    /// 6e8: b    helper
+    /// ```
+    #[test]
+    fn an_aarch64_function_is_relocated_through_its_instruction_fields() {
+        let units = extract_aarch64("bump");
+        assert_eq!(
+            units["bump"],
+            [
+                "0xc Lo12[4] -> counter+0",
+                "0x18 Lo12[4] -> counter+0",
+                "0x4 AdrpPage[] -> counter+0",
+                "0x1c Imm26[] -> helper+0",
+            ]
+        );
+        // `helper` came along with what it reads: `table` through an `add`
+        // and an indexed load, `counter` through a `:lo12:` load.
+        assert_eq!(
+            units["helper"],
+            [
+                "0x8 Lo12[4] -> table+0",
+                "0x20 Lo12[24] -> counter+0",
+                "0x4 AdrpPage[] -> table+0",
+                "0x18 AdrpPage[] -> counter+0",
+            ]
+        );
+        assert!(units["counter"].is_empty() && units["table"].is_empty());
+    }
+
+    /// A branch into the PLT reaches the symbol the stub's GOT slot names,
+    /// which stays external; the string it passes is reached through an
+    /// `adrp`/`add` pair.
+    #[test]
+    fn an_aarch64_call_through_the_plt_stays_external() {
+        let units = extract_aarch64("shout");
+        assert_eq!(
+            units["shout"],
+            [
+                "0x8 Lo12[4] -> banner+0",
+                "0x4 AdrpPage[] -> banner+0",
+                "0x14 Imm26[] -> extern puts+0",
+            ]
+        );
     }
 }
