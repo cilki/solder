@@ -13,6 +13,12 @@
 //! the low twelve bits is an ordinary instruction with an ordinary immediate,
 //! so [`pair_lo12_refs`] finds it by following the `adrp`'s register.
 //!
+//! Calls into a library's PLT, and the trampolines the merge puts in their
+//! place, are `adrp`/`ldr`/`br` sequences through a GOT slot:
+//! [`plt_stub_slot`] reads the slot out of a stub, and [`trampoline`] writes
+//! one. [`ends_the_function`] checks the claim unwind info makes about where
+//! a function stops.
+//!
 //! The decoder is `yaxpeax-arm`. It says which instruction a word is and
 //! where its PC-relative operand points; this module adds what the decoder
 //! does not, which is where in the word that operand is kept.
@@ -768,6 +774,164 @@ pub fn pair_lo12_refs(bytes: &[u8], vaddr: u64) -> Result<Vec<Lo12Ref>> {
     Ok(pairs)
 }
 
+/// `bti c`: the landing pad an indirect call, or a `br` through `x16`/`x17`,
+/// may branch to on a page the loader mapped `PROT_BTI`.
+const BTI_C: u32 = 0xd503_245f;
+/// `autia1716`/`autib1716`: authenticate `x17` with `x16` as the modifier,
+/// which `ld -z pac-plt` puts in front of a stub's `br`.
+const AUTIA1716: u32 = 0xd503_219f;
+const AUTIB1716: u32 = 0xd503_21df;
+/// `adrp x16, 0`.
+const ADRP_X16: u32 = 0x9000_0010;
+/// `ldr x17, [x16, #0]` and `add x16, x16, #0`, with the immediate masked
+/// off by [`IMM12_MASK`] where a stub is matched.
+const LDR_X17_X16: u32 = 0xf940_0211;
+const ADD_X16_X16: u32 = 0x9100_0210;
+const IMM12_MASK: u32 = 0xfff << 10;
+/// `br x17`.
+const BR_X17: u32 = 0xd61f_0220;
+
+/// The GOT slot the PLT stub at the start of `bytes`, loaded at `vaddr`,
+/// jumps through, or `None` when `bytes` does not start with one — the PLT0
+/// header that calls the lazy resolver, for one.
+///
+/// Every stub GNU ld writes is one shape, give or take two optional words:
+///
+/// ```text
+/// [bti c]                        ; -z force-bti, in an executable's PLT
+/// adrp x16, slot
+/// ldr  x17, [x16, :lo12:slot]
+/// add  x16, x16, :lo12:slot      ; the slot's address, for the lazy resolver
+/// [autia1716 | autib1716]        ; -z pac-plt
+/// br   x17
+/// ```
+///
+/// There is no `.plt.got` or `.plt.sec` on aarch64: a function only ever
+/// called through a GLOB_DAT slot (`__cxa_finalize`) gets an ordinary stub,
+/// so the slot found here is looked up the same way whichever relocation
+/// fills it. A stub whose `ldr` and `add` name different slots is not one
+/// the linker wrote, and is not taken for one.
+///
+/// Like `extractor::plt_target`, this is only asked about an address code
+/// branches to. PLT0 from its `adrp` on is stub-shaped too — it jumps to the
+/// resolver through the slot `ld.so` reserves for it — but nothing branches
+/// into the middle of PLT0.
+pub fn plt_stub_slot(bytes: &[u8], vaddr: u64) -> Option<u64> {
+    let mut words = bytes
+        .chunks_exact(INSN_LEN)
+        .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact")));
+    let mut word = words.next()?;
+    let mut pc = vaddr;
+    if word == BTI_C {
+        word = words.next()?;
+        pc += INSN_LEN as u64;
+    }
+    if !Field::AdrpPage.fits(word) || word & 31 != 16 {
+        return None;
+    }
+    let page = pc_relative_ref(word, pc).ok()??.target;
+
+    let ldr = words.next()?;
+    let add = words.next()?;
+    if ldr & !IMM12_MASK != LDR_X17_X16 || add & !IMM12_MASK != ADD_X16_X16 {
+        return None;
+    }
+    // The load's immediate counts eight-byte words, the add's bytes.
+    let lo12 = u64::from((ldr & IMM12_MASK) >> 10) << 3;
+    if u64::from((add & IMM12_MASK) >> 10) != lo12 {
+        return None;
+    }
+
+    let mut word = words.next()?;
+    if word == AUTIA1716 || word == AUTIB1716 {
+        word = words.next()?;
+    }
+    (word == BR_X17).then_some(page + lo12)
+}
+
+/// Size of a trampoline: see [`trampoline`].
+pub const TRAMPOLINE_LEN: usize = 16;
+
+/// The trampoline at `vaddr` that jumps to the function whose address the
+/// loader writes into the GOT slot at `slot`: the aarch64 counterpart of the
+/// x86-64 `jmp [rip+disp32]` the writer emits for a symbol the merged code
+/// still reaches at runtime.
+///
+/// ```text
+/// bti c
+/// adrp x16, slot
+/// ldr  x17, [x16, :lo12:slot]
+/// br   x17
+/// ```
+///
+/// It is a PLT stub without the `add` only the lazy resolver reads, and it
+/// branches through `x17` for the same reason a stub does: a `br` through
+/// `x16` or `x17` is one a `bti c` accepts, and `bti c` is the pad a
+/// function built for BTI starts with. Through any other register the
+/// target would need a `bti j` it does not have and the branch would fault.
+/// The leading `bti c` is the trampoline's own pad, in case the merged code
+/// takes its address rather than calling it; on a core without BTI it is a
+/// `nop`.
+///
+/// `slot` has to be within ±4 GiB of `vaddr` and eight-byte aligned, which a
+/// GOT slot always is; anything else is an error rather than a trampoline
+/// that loads from somewhere else.
+pub fn trampoline(vaddr: u64, slot: u64) -> Result<[u8; TRAMPOLINE_LEN]> {
+    let adrp = Field::AdrpPage
+        .patch(ADRP_X16, slot, 0, vaddr + INSN_LEN as u64)
+        .with_context(|| format!("trampoline at 0x{vaddr:x} for the GOT slot at 0x{slot:x}"))?;
+    let ldr = Field::Lo12
+        .patch(LDR_X17_X16, slot, 0, vaddr + 2 * INSN_LEN as u64)
+        .with_context(|| format!("trampoline at 0x{vaddr:x} for the GOT slot at 0x{slot:x}"))?;
+    let mut out = [0; TRAMPOLINE_LEN];
+    for (dst, word) in out
+        .chunks_exact_mut(INSN_LEN)
+        .zip([BTI_C, adrp, ldr, BR_X17])
+    {
+        dst.copy_from_slice(&word.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Whether `code`, the bytes of a function as far as its unwind info claims
+/// it runs, ends the way a function does: in whole instructions, the last
+/// of which does not fall through to whatever follows.
+///
+/// The aarch64 counterpart of `extractor::ends_the_function`. Instructions
+/// are all one size, so the only way a bound can cut one is by not being a
+/// multiple of it; what is left to check is the last word. A `bl` to a
+/// `noreturn` function does not count, as a `call` does not on x86-64: the
+/// decode cannot tell it from a call that returns.
+pub fn ends_the_function(code: &[u8]) -> bool {
+    use Opcode::*;
+
+    if code.is_empty() || !code.len().is_multiple_of(INSN_LEN) {
+        return false;
+    }
+    let last = &code[code.len() - INSN_LEN..];
+    let word = u32::from_le_bytes(last.try_into().expect("one word"));
+    decode(word).is_some_and(|insn| {
+        matches!(
+            insn.opcode,
+            B | BR
+                | BRAA
+                | BRAAZ
+                | BRAB
+                | BRABZ
+                | RET
+                | RETAA
+                | RETAB
+                | RETAASPPC
+                | RETABSPPC
+                | RETAASPPCR
+                | RETABSPPCR
+                | UDF
+                | BRK
+                | HLT
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1234,6 +1398,202 @@ mod tests {
         .unwrap();
         // The second case overwrote x19 before its load.
         assert_eq!(pairs, [lo12(0x08, &[0x00], 0x41_4020)]);
+    }
+
+    /// The `.plt` of a shared library GCC built and GNU ld 2.46 linked with no
+    /// options, at 0x580, as `objdump -d` shows it. Its JUMP_SLOTs are
+    /// `__cxa_finalize` (0x20000), `malloc`, `__gmon_start__` and `puts`.
+    const LIB_PLT: u64 = 0x580;
+    const LIB_PLT_WORDS: &[u32] = &[
+        0xa9bf_7bf0, // stp x16, x30, [sp, #-16]!
+        0xf000_00f0, // adrp x16, 1f000
+        0xf947_fe11, // ldr x17, [x16, #4088]
+        0x913f_e210, // add x16, x16, #0xff8
+        0xd61f_0220, // br x17
+        0xd503_201f, // nop
+        0xd503_201f, // nop
+        0xd503_201f, // nop
+        0x9000_0110, // __cxa_finalize@plt: adrp x16, 20000
+        0xf940_0211, // ldr x17, [x16]
+        0x9100_0210, // add x16, x16, #0x0
+        0xd61f_0220, // br x17
+        0x9000_0110, // malloc@plt
+        0xf940_0611, // ldr x17, [x16, #8]
+        0x9100_2210, // add x16, x16, #0x8
+        0xd61f_0220,
+        0x9000_0110, // __gmon_start__@plt
+        0xf940_0a11,
+        0x9100_4210,
+        0xd61f_0220,
+        0x9000_0110, // puts@plt
+        0xf940_0e11,
+        0x9100_6210,
+        0xd61f_0220,
+    ];
+
+    #[test]
+    fn every_plt_stub_is_matched_to_the_slot_its_jump_slot_fills() {
+        let plt = code(LIB_PLT_WORDS);
+        // Where the symbol table says each entry starts, PLT0 first.
+        let slots: Vec<_> = [0x00, 0x20, 0x30, 0x40, 0x50]
+            .into_iter()
+            .map(|off: usize| plt_stub_slot(&plt[off..], LIB_PLT + off as u64))
+            .collect();
+        assert_eq!(
+            slots,
+            [
+                None,
+                Some(0x2_0000),
+                Some(0x2_0008),
+                Some(0x2_0010),
+                Some(0x2_0018)
+            ]
+        );
+    }
+
+    /// The optional words: `-z force-bti` puts a `bti c` in front of an
+    /// executable's stubs, `-z pac-plt` an `autia1716` before the `br`; and in
+    /// a PIE the slots are in the page below, with a nonzero `:lo12:`.
+    #[test]
+    fn every_stub_flavor_the_linker_writes_is_recognised() {
+        for (vaddr, words, slot) in [
+            // -z force-bti, a non-PIE executable: abort@plt's neighbour.
+            (
+                0x40_0648u64,
+                &[
+                    0xd503_245f,
+                    0x9000_0110,
+                    0xf940_0611,
+                    0x9100_2210,
+                    0xd61f_0220,
+                ][..],
+                0x42_0008u64,
+            ),
+            // -z pac-plt, a shared library: malloc@plt.
+            (
+                0x5b8,
+                &[
+                    0x9000_0110,
+                    0xf940_0611,
+                    0x9100_2210,
+                    0xd503_219f,
+                    0xd61f_0220,
+                ],
+                0x2_0008,
+            ),
+            // Both, the authentication with the B key.
+            (
+                0x5b8,
+                &[
+                    0xd503_245f,
+                    0x9000_0110,
+                    0xf940_0611,
+                    0x9100_2210,
+                    0xd503_21df,
+                    0xd61f_0220,
+                ],
+                0x2_0008,
+            ),
+            // A PIE linked with -z now: __cxa_finalize@plt.
+            (
+                0x6e0,
+                &[0xf000_00f0, 0xf947_da11, 0x913e_c210, 0xd61f_0220],
+                0x1_ffb0,
+            ),
+        ] {
+            assert_eq!(plt_stub_slot(&code(words), vaddr), Some(slot), "{vaddr:x}");
+        }
+    }
+
+    #[test]
+    fn what_is_not_a_stub_is_not_taken_for_one() {
+        let malloc = [0x9000_0110, 0xf940_0611, 0x9100_2210, 0xd61f_0220];
+        let with = |i: usize, word: u32| {
+            let mut words = malloc;
+            words[i] = word;
+            code(&words)
+        };
+        for (what, bytes) in [
+            ("PLT0", code(&LIB_PLT_WORDS[..8])),
+            ("cut short", code(&malloc[..3])),
+            ("adrp x17", with(0, 0x9000_0111)),
+            ("ldr x16", with(1, 0xf940_0610)),
+            ("ldr w17", with(1, 0xb940_0a11)),
+            ("add of another slot", with(2, 0x9100_4210)),
+            ("br x16", with(3, 0xd61f_0200)),
+            ("blr x17", with(3, 0xd63f_0220)),
+        ] {
+            assert_eq!(plt_stub_slot(&bytes, 0x5b0), None, "{what}");
+        }
+    }
+
+    /// What GNU as and ld make of the same four instructions with `slot` at
+    /// 0x534448 and the trampoline at 0x400000.
+    #[test]
+    fn a_trampoline_is_what_the_assembler_writes_for_it() {
+        assert_eq!(
+            trampoline(BASE, 0x53_4448).unwrap(),
+            code(&[0xd503_245f, 0x9000_09b0, 0xf942_2611, 0xd61f_0220])[..]
+        );
+    }
+
+    /// A trampoline is a stub without the `add`, so putting it back gives a
+    /// stub that `plt_stub_slot` reads the same slot out of, wherever the two
+    /// are within reach.
+    #[test]
+    fn a_trampoline_loads_from_the_slot_it_was_given() {
+        let vaddr = 0x2_0000_0000u64;
+        for slot in [
+            vaddr + 0x40,
+            vaddr - 0x1000,
+            vaddr + 0xffff_f000,
+            vaddr - 0x1_0000_0000,
+            vaddr + 0x1234_5678,
+        ] {
+            let t = trampoline(vaddr, slot).unwrap();
+            let ldr = u32::from_le_bytes(t[8..12].try_into().unwrap());
+            let add = ADD_X16_X16 | (ldr & IMM12_MASK) << 3;
+            let mut stub = t[..12].to_vec();
+            stub.extend_from_slice(&add.to_le_bytes());
+            stub.extend_from_slice(&t[12..]);
+            assert_eq!(plt_stub_slot(&stub, vaddr), Some(slot), "{slot:x}");
+        }
+    }
+
+    #[test]
+    fn a_trampoline_to_a_slot_it_cannot_load_is_refused() {
+        let vaddr = 0x2_0000_0000u64;
+        // Past adrp's reach, and not a pointer-aligned slot.
+        assert!(trampoline(vaddr, vaddr + 0x1_0000_0000).is_err());
+        assert!(trampoline(vaddr, vaddr + 0x44).is_err());
+    }
+
+    #[test]
+    fn a_function_ends_on_a_word_that_does_not_fall_through() {
+        for (what, last) in [
+            ("ret", 0xd65f_03c0u32),
+            ("retaa", 0xd65f_0bff),
+            ("b", 0x17ff_ffff),
+            ("br x16", 0xd61f_0200),
+            ("brk #1000", 0xd420_7d00),
+            ("udf #0", 0x0000_0000),
+        ] {
+            assert!(ends_the_function(&code(&[0xd503_201f, last])), "{what}");
+        }
+        for (what, bytes) in [
+            ("bl", code(&[0xd65f_03c0, 0x97ff_ffff])),
+            ("b.ne", code(&[0xd65f_03c0, 0x54ff_ffe1])),
+            ("cbz", code(&[0xd65f_03c0, 0xb4ff_ffe0])),
+            ("blr x1", code(&[0xd65f_03c0, 0xd63f_0020])),
+            ("nop", code(&[0xd65f_03c0, 0xd503_201f])),
+            ("empty", Vec::new()),
+        ] {
+            assert!(!ends_the_function(&bytes), "{what}");
+        }
+        // A bound that cuts the last word.
+        let mut cut = code(&[RET]);
+        cut.extend_from_slice(&[0xc0, 0x03]);
+        assert!(!ends_the_function(&cut));
     }
 
     #[test]
