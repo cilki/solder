@@ -306,9 +306,21 @@ pub fn interpreter<'a>(elf: &'a ElfFile64<'a>) -> Option<&'a str> {
         })
 }
 
+/// Whether `.dynamic` marks the object a position-independent executable
+/// (`DF_1_PIE` in `DT_FLAGS_1`). A table that cannot be read says nothing
+/// either way, and reading it properly is left to the steps that need it.
+fn has_df_1_pie(bytes: &[u8]) -> bool {
+    use goblin::elf::dynamic::{DF_1_PIE, DT_FLAGS_1};
+
+    DynamicTable::parse(bytes)
+        .ok()
+        .and_then(|dynamic| dynamic.value_of(DT_FLAGS_1))
+        .is_some_and(|flags| flags & DF_1_PIE != 0)
+}
+
 /// Validate that the input ELF is a supported target:
 /// - 64-bit ELF
-/// - ET_EXEC or ET_DYN (PIE)
+/// - ET_EXEC or ET_DYN (PIE), and not a shared library
 /// - built for an architecture in [`arch::SUPPORTED`](crate::arch::SUPPORTED)
 /// - Has PT_DYNAMIC (dynamically linked)
 /// - Has a section header table the merge can read and keep in sync
@@ -353,6 +365,23 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<(&'static
     if !has_dynamic {
         bail!(
             "{}: statically linked binary — nothing to merge",
+            path.display()
+        );
+    }
+
+    // `ET_DYN` is a PIE executable and a shared library alike, and the merge
+    // only works for the first: the merged libraries' constructors go into a
+    // `DT_PREINIT_ARRAY`, which ld.so runs for the main program alone (and
+    // which `ld` refuses to put in a DSO at all). Merging into a shared
+    // library therefore wrote out a library whose merged constructors never
+    // run, with nothing said about it. A PIE asks for its loader through
+    // `PT_INTERP`, and modern linkers also mark it `DF_1_PIE`; a shared
+    // library has neither.
+    if is_pie && interpreter(elf).is_none() && !has_df_1_pie(elf.data()) {
+        bail!(
+            "{}: a shared library, not an executable (ET_DYN without PT_INTERP or DF_1_PIE). \
+             solder merges libraries into the program that loads them: point it at the \
+             executable instead",
             path.display()
         );
     }
@@ -1573,6 +1602,57 @@ mod executable_tests {
         );
         assert!(err.contains("section header"), "{err}");
         assert!(err.contains("/test/grep"), "{err}");
+    }
+
+    /// A shared library is `ET_DYN` like a PIE, and used to be taken for one
+    /// and merged into, though the `DT_PREINIT_ARRAY` the merged constructors
+    /// go into is run by ld.so for the main program only.
+    #[test]
+    fn a_shared_library_is_refused() {
+        for name in ["libtinfo.so.6", "libpcre2-8.so.0", "libcrypto.so.3"] {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test/libs/").to_string() + name;
+            let bytes = std::fs::read(&path).expect("test library");
+            let err = format!(
+                "{:#}",
+                validate(&bytes).expect_err("a shared library must be refused")
+            );
+            assert!(err.contains("shared library"), "{name}: {err}");
+        }
+    }
+
+    /// Either marker alone is enough to take an `ET_DYN` for an executable:
+    /// linkers before binutils 2.33 never set `DF_1_PIE`, and a PIE built with
+    /// `--no-dynamic-linker` has no `PT_INTERP`.
+    #[test]
+    fn a_pie_with_only_one_of_its_markers_is_accepted() {
+        use goblin::elf::dynamic::{DF_1_PIE, DT_FLAGS_1};
+
+        let grep = std::fs::read(GREP).expect("read test/grep");
+
+        let mut no_df_1_pie = grep.clone();
+        let mut dynamic = DynamicTable::parse(&no_df_1_pie).expect("parse .dynamic");
+        let flags = dynamic.value_of(DT_FLAGS_1).expect("grep has DT_FLAGS_1");
+        assert_ne!(flags & DF_1_PIE, 0, "grep is marked DF_1_PIE");
+        dynamic
+            .set_or_append(&mut no_df_1_pie, DT_FLAGS_1, flags & !DF_1_PIE)
+            .expect("clear DF_1_PIE");
+        assert!(!has_df_1_pie(&no_df_1_pie));
+        assert!(validate(&no_df_1_pie).expect("a PIE without DF_1_PIE"));
+
+        // Turn PT_INTERP into PT_NULL, which the loader skips.
+        let mut no_interp = grep;
+        let phoff = u64::from_le_bytes(no_interp[0x20..0x28].try_into().unwrap()) as usize;
+        let phentsize = u16::from_le_bytes([no_interp[0x36], no_interp[0x37]]) as usize;
+        let phnum = u16::from_le_bytes([no_interp[0x38], no_interp[0x39]]) as usize;
+        let interp = (0..phnum)
+            .map(|i| phoff + i * phentsize)
+            .find(|&at| no_interp[at..at + 4] == object::elf::PT_INTERP.0.to_le_bytes())
+            .expect("grep has PT_INTERP");
+        no_interp[interp..interp + 4].fill(0);
+        let elf =
+            object::read::elf::ElfFile64::<object::Endianness>::parse(&*no_interp).expect("parse");
+        assert!(interpreter(&elf).is_none());
+        assert!(validate(&no_interp).expect("a PIE without PT_INTERP"));
     }
 }
 
