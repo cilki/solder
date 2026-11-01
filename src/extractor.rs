@@ -7,7 +7,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
-use crate::arch::{Arch, CodeRef, RefSite, Site, TextUnit, TlsSlot, UnitScan, Unliftable, Word};
+use crate::arch::{
+    Arch, Callee, CodeRef, NORETURN_IMPORTS, RefSite, Site, TextUnit, TlsSlot, UnitScan,
+    Unliftable, Word,
+};
 use crate::elf_reader::MappedElf;
 use crate::tls::TlsBlock;
 use crate::types::{
@@ -963,12 +966,18 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
     // instructions keep, and the jump tables it indexes. See
     // `arch::MachineCode::scan`.
     let scan = if section_kind == SectionKind::Text {
-        (state.arch.code.scan)(&TextUnit {
+        let arch = state.arch;
+        (arch.code.scan)(&TextUnit {
             bytes: &bytes,
             vaddr: sym_vaddr,
             fde_end: function_fde_end(lib.index, sym_vaddr),
             sym: &key.sym,
             elf: lib.elf,
+            callee: &|addr| match plt_target(lib, arch, addr) {
+                None => Callee::Local,
+                Some(name) if NORETURN_IMPORTS.contains(&name.as_str()) => Callee::NoReturn,
+                Some(_) => Callee::External,
+            },
         })?
     } else {
         UnitScan {

@@ -251,7 +251,66 @@ pub struct TextUnit<'a, 'data> {
     /// The library, for what the code reads out of other sections (a jump
     /// table's entries).
     pub elf: &'a object::read::elf::ElfFile64<'data>,
+    /// What a direct call to an address calls. A scanner that follows values
+    /// along the code's paths needs it to know what survives the call, and
+    /// whether the path goes on past it at all.
+    pub callee: &'a dyn Fn(u64) -> Callee,
 }
+
+/// What a call calls, as far as the registers the caller may rely on across
+/// it go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Callee {
+    /// One of the library's own functions. GCC's `-fipa-ra` lets the caller
+    /// keep values in caller-saved registers that a callee it compiled is
+    /// known to leave alone, so any of them may survive.
+    Local,
+    /// A function only known at run time: an import, called through its PLT
+    /// stub, or the target of an indirect call. Nothing the caller-saved
+    /// registers held survives in them as far as the compiler knows, and
+    /// `x0`/`x1` hold whatever it returns.
+    External,
+    /// One of the [`NORETURN_IMPORTS`]: the path ends at the call.
+    NoReturn,
+}
+
+/// Functions a library imports that never return to their caller, which
+/// glibc, libgcc and libstdc++ declare `noreturn`. A compiler takes them at
+/// their word and places unrelated code straight after the call, so code
+/// following the call is only reached through some other branch.
+///
+/// Only imports are listed, as a PLT stub names the function it calls; a
+/// library's own `noreturn` functions are not known by any mark in the
+/// binary, and a call to one is taken to return, which is what the
+/// scanners assumed for every call before.
+pub const NORETURN_IMPORTS: &[&str] = &[
+    "abort",
+    "exit",
+    "_exit",
+    "_Exit",
+    "quick_exit",
+    "__stack_chk_fail",
+    "__chk_fail",
+    "__fortify_fail",
+    "__assert_fail",
+    "__assert_perror_fail",
+    "longjmp",
+    "_longjmp",
+    "siglongjmp",
+    "__longjmp_chk",
+    "pthread_exit",
+    "err",
+    "errx",
+    "verr",
+    "verrx",
+    "_Unwind_Resume",
+    "__cxa_throw",
+    "__cxa_rethrow",
+    "__cxa_bad_cast",
+    "__cxa_bad_typeid",
+    "__cxa_throw_bad_array_new_length",
+    "_ZSt9terminatev",
+];
 
 /// What [`MachineCode::scan`] found in a text unit.
 #[derive(Debug, Default)]

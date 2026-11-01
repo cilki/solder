@@ -35,8 +35,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::{
-    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, Reach, RefSite, TextUnit, TlsAbi,
-    TlsLayout, TlsSlot, Trampoline, UnitScan, Unliftable,
+    Arch, Callee, CodeRef, DynRelocTypes, GnuProperties, MachineCode, Reach, RefSite, TextUnit,
+    TlsAbi, TlsLayout, TlsSlot, Trampoline, UnitScan, Unliftable,
 };
 use crate::types::ExtractedReloc;
 use yaxpeax_arch::{Decoder, U8Reader};
@@ -414,6 +414,14 @@ fn holds_page(origins: &Origins) -> bool {
     origins.iter().any(Option::is_some)
 }
 
+/// One bit per register of `regs`, set where it [`holds_page`].
+fn page_mask(regs: &Regs) -> u32 {
+    regs.iter()
+        .enumerate()
+        .filter(|(_, origins)| holds_page(origins))
+        .fold(0, |mask, (r, _)| mask | 1 << r)
+}
+
 /// Join `from` into `into`, reporting whether `into` grew.
 fn join(into: &mut Regs, from: &Regs) -> bool {
     let mut grew = false;
@@ -475,6 +483,11 @@ struct PageState {
     /// The slots that may hold a page, by the offset of their first byte
     /// from the entry `sp`. A slot not in here holds no page on any path.
     slots: BTreeMap<i64, Origins>,
+    /// One bit per register that holds a page only where a call since its
+    /// `adrp` may have replaced it with what the callee returns: on every
+    /// path that brings a page here, it passed through a call while in `x0`
+    /// or `x1`. Clear for a register that holds no page.
+    returned: u32,
 }
 
 impl PageState {
@@ -485,6 +498,7 @@ impl PageState {
             sp: Frame::At(0),
             fp: Frame::Unknown,
             slots: BTreeMap::new(),
+            returned: 0,
         }
     }
 
@@ -495,6 +509,7 @@ impl PageState {
             sp: Frame::Unreached,
             fp: Frame::Unreached,
             slots: BTreeMap::new(),
+            returned: 0,
         }
     }
 
@@ -507,7 +522,14 @@ impl PageState {
             *self = from.clone();
             return true;
         }
+        // A register stays one whose page a call may have replaced only if
+        // every side that brings a page in it says so.
+        let (into_pages, from_pages) = (page_mask(&self.regs), page_mask(&from.regs));
         let mut grew = join(&mut self.regs, &from.regs);
+        let returned =
+            (self.returned | !into_pages) & (from.returned | !from_pages) & page_mask(&self.regs);
+        grew |= returned != self.returned;
+        self.returned = returned;
         grew |= self.sp.join(from.sp);
         grew |= self.fp.join(from.fp);
         // A slot one side has no page in holds something else there.
@@ -849,20 +871,43 @@ struct PageFlow {
     words: Vec<u32>,
     insns: Vec<Option<Instruction>>,
     vaddr: u64,
+    /// Per word, what it calls, if it is a call.
+    calls: Vec<Option<Callee>>,
 }
 
 impl PageFlow {
     /// The function `bytes`, loaded at `vaddr`, decoded a word at a time. A
-    /// trailing partial word is not code.
-    fn new(bytes: &[u8], vaddr: u64) -> PageFlow {
+    /// trailing partial word is not code. `callee` says what a `bl` to an
+    /// address calls (see [`TextUnit::callee`]); an indirect call's target
+    /// is not known until run time.
+    fn new(bytes: &[u8], vaddr: u64, callee: &dyn Fn(u64) -> Callee) -> PageFlow {
         let words: Vec<u32> = bytes
             .chunks_exact(INSN_LEN)
             .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact")))
             .collect();
+        let insns: Vec<Option<Instruction>> = words.iter().map(|&w| decode(w)).collect();
+        let calls = insns
+            .iter()
+            .enumerate()
+            .map(|(i, insn)| {
+                let insn = insn.as_ref().filter(|insn| is_call(insn.opcode))?;
+                let pc = vaddr + (i * INSN_LEN) as u64;
+                Some(
+                    insn.operands
+                        .iter()
+                        .find_map(|op| match op {
+                            Operand::PCOffset(off) => Some(callee(pc.wrapping_add(*off as u64))),
+                            _ => None,
+                        })
+                        .unwrap_or(Callee::External),
+                )
+            })
+            .collect();
         PageFlow {
-            insns: words.iter().map(|&w| decode(w)).collect(),
+            insns,
             words,
             vaddr,
+            calls,
         }
     }
 
@@ -888,11 +933,15 @@ impl PageFlow {
 
     /// Where control can go after instruction `i`, and whether it leaves
     /// through an indirect branch. A word that is not an instruction goes
-    /// nowhere, and a branch target outside this code is a tail call.
+    /// nowhere, nor does a call to a function that never returns, and a
+    /// branch target outside this code is a tail call.
     fn successors(&self, i: usize) -> (Vec<usize>, bool) {
         let Some(insn) = &self.insns[i] else {
             return (Vec::new(), false);
         };
+        if self.calls[i] == Some(Callee::NoReturn) {
+            return (Vec::new(), false);
+        }
         let pc = self.pc(i);
         let next = (i + 1 < self.words.len()).then_some(i + 1);
         let branch_target = || {
@@ -1000,7 +1049,7 @@ impl PageFlow {
                 return Ok(out);
             }
         }
-        out.regs = self.step_regs(i, insn, &state.regs)?;
+        (out.regs, out.returned) = self.step_regs(i, insn, &state.regs, state.returned)?;
         self.track_frame(insn, word, state, &mut out);
         Ok(out)
     }
@@ -1035,6 +1084,7 @@ impl PageFlow {
         let Some(frame) = frame else {
             if access.load {
                 for &r in access.regs.iter().filter(|&&r| access.gpr && r < GPRS) {
+                    out.returned &= !(1 << r);
                     out.regs[r] = if state.slots.is_empty() {
                         BTreeSet::from([None])
                     } else {
@@ -1079,6 +1129,7 @@ impl PageFlow {
                 };
                 if access.gpr && r < GPRS {
                     out.regs[r] = value;
+                    out.returned &= !(1 << r);
                 }
             } else {
                 for slot in overlapping {
@@ -1086,6 +1137,11 @@ impl PageFlow {
                 }
                 if page_in(r) {
                     if access.len != 8 {
+                        // Part of what a call returned, if a call may have
+                        // replaced the page: no page is stored by halves.
+                        if state.returned & (1 << r) != 0 {
+                            continue;
+                        }
                         return Err(self.refuse(i, &state.regs, r, "stores part of"));
                     }
                     out.slots.insert(at, state.regs[r].clone());
@@ -1195,21 +1251,39 @@ impl PageFlow {
         )
     }
 
-    /// Run instruction `insn`, word `i`, on `regs`: the registers after it.
-    /// An instruction that reads a page in a way this module does not rewrite
-    /// is an error.
-    fn step_regs(&self, i: usize, insn: &Instruction, regs: &Regs) -> Result<Regs> {
+    /// Run instruction `insn`, word `i`, on `regs`, where `returned` marks
+    /// the registers whose page a call may have replaced (see
+    /// [`PageState::returned`]): the registers after it, and the mark after
+    /// it. An instruction that reads a page in a way this module does not
+    /// rewrite is an error.
+    ///
+    /// A register a call may have returned into, read any way but as a
+    /// `:lo12:` base, is read for what the call returned. A page is never
+    /// used that way, which is why such a read of a page is refused, so code
+    /// that does it after a call is not using the page. As a base it could
+    /// be either, and stays refused.
+    fn step_regs(
+        &self,
+        i: usize,
+        insn: &Instruction,
+        regs: &Regs,
+        returned: u32,
+    ) -> Result<(Regs, u32)> {
         let word = self.words[i];
         let mut out = regs.clone();
+        let mut out_returned = returned;
         let refuse = |r: usize, what: &str| self.refuse(i, regs, r, what);
+        let uses_page = |r: usize| holds_page(&regs[r]) && returned & (1 << r) == 0;
 
         if Field::AdrpPage.fits(word) {
-            out[(word & 31) as usize] = BTreeSet::from([Some(i)]);
-            return Ok(out);
+            let rd = (word & 31) as usize;
+            out[rd] = BTreeSet::from([Some(i)]);
+            out_returned &= !(1 << rd);
+            return Ok((out, out_returned));
         }
 
         if let Some(form) = lo12_form(word) {
-            if let Some(r) = form.stores.filter(|&r| holds_page(&regs[r])) {
+            if let Some(r) = form.stores.filter(|&r| uses_page(r)) {
                 return Err(refuse(r, "stores"));
             }
             let base = &regs[form.base];
@@ -1221,8 +1295,9 @@ impl PageFlow {
             }
             if let Some(r) = form.writes {
                 out[r] = BTreeSet::from([None]);
+                out_returned &= !(1 << r);
             }
-            return Ok(out);
+            return Ok((out, out_returned));
         }
 
         // `mov xd, xs` (`orr xd, xzr, xs`): the page, if any, moves with it.
@@ -1238,13 +1313,15 @@ impl PageFlow {
         {
             let (d, s) = (*d as usize, *s as usize);
             if d < GPRS {
+                out_returned &= !(1 << d);
                 out[d] = if s < GPRS {
+                    out_returned |= (returned >> s & 1) << d;
                     regs[s].clone()
                 } else {
                     BTreeSet::from([None])
                 };
             }
-            return Ok(out);
+            return Ok((out, out_returned));
         }
 
         // Every register the instruction names, with whether that operand is
@@ -1261,7 +1338,7 @@ impl PageFlow {
             named.push((r, false));
         }
         for &(r, _) in &named {
-            if !holds_page(&regs[r]) {
+            if !uses_page(r) {
                 continue;
             }
             // A page is only dropped by an instruction that overwrites its
@@ -1273,10 +1350,11 @@ impl PageFlow {
         for &(r, written) in &named {
             if written {
                 out[r] = BTreeSet::from([None]);
+                out_returned &= !(1 << r);
             }
         }
 
-        if is_call(insn.opcode) {
+        if let Some(callee) = self.calls[i] {
             // The call writes the return address. The callee may overwrite
             // the caller-saved registers too, but it need not: GCC's -fipa-ra
             // keeps values in the ones a local callee is known to leave
@@ -1284,17 +1362,32 @@ impl PageFlow {
             // something overwrites it here.
             //
             // Except in x0 and x1, which hold what the callee returns if it
-            // returns anything. Whether a page there survived is not knowable
-            // from here, so either answer is kept: using it afterwards is
-            // then refused rather than paired by a guess.
+            // returns anything. Whether a page there survived a local callee
+            // is not knowable from here, so either answer is kept: using it
+            // as a base afterwards is then refused rather than paired by a
+            // guess, and it is marked as one the call may have replaced, so
+            // a read that only makes sense of a value is taken for the
+            // return value. Past a callee only known at run time, which the
+            // compiler knows nothing about, no page survives there.
             for r in [0, 1] {
-                out[r].insert(None);
+                if callee == Callee::Local {
+                    out[r].insert(None);
+                } else {
+                    out[r] = BTreeSet::from([None]);
+                }
+                if holds_page(&out[r]) {
+                    out_returned |= 1 << r;
+                } else {
+                    out_returned &= !(1 << r);
+                }
             }
             out[30] = BTreeSet::from([None]);
+            out_returned &= !(1 << 30);
         } else if insn.opcode == Opcode::SVC {
             out[0] = BTreeSet::from([None]);
+            out_returned &= !1;
         }
-        Ok(out)
+        Ok((out, out_returned))
     }
 }
 
@@ -1429,11 +1522,15 @@ impl PageFlow {
         for r in written.into_iter().filter(|&r| r < GPRS) {
             out[r] = BTreeSet::from([None]);
         }
-        if is_call(insn.opcode) {
+        if let Some(callee) = self.calls[i] {
             // As in `step`: a value may survive a call, except in the
             // registers it returns in and the link register.
             for r in [0, 1] {
-                out[r].insert(None);
+                if callee == Callee::Local {
+                    out[r].insert(None);
+                } else {
+                    out[r] = BTreeSet::from([None]);
+                }
             }
             out[30] = BTreeSet::from([None]);
         } else if insn.opcode == Opcode::SVC {
@@ -1460,6 +1557,15 @@ fn is_call(opcode: Opcode) -> bool {
 /// (see the call in `PageFlow::step_regs`). Code only a jump table reaches is
 /// followed too; see `PageFlow::solve`.
 ///
+/// `callee` says what a `bl` to an address calls. A page in `x0` or `x1`
+/// does not survive a call to an import, which the compiler cannot know the
+/// register use of. A call to one that never returns is where its path ends,
+/// so the code after it is not taken to be reached from it. GCC puts what it
+/// likes after a call to `__stack_chk_fail` or `abort`, typically another
+/// block that a branch elsewhere reaches with a page in a register the path
+/// to the call had already restored, and following the call into it would
+/// make that block look reached without the page.
+///
 /// A page GCC spills to the stack under register pressure is followed there
 /// and back. `sp`, and `x29` once it is set from `sp`, are tracked as
 /// offsets from the `sp` the function was entered with, so a 64-bit store
@@ -1477,8 +1583,12 @@ fn is_call(opcode: Opcode) -> bool {
 /// on others, or the pages of two `adrp`s that disagree; and a `:lo12:`
 /// offset of 4 KiB or more. A merge that moves the code with such a
 /// reference in it would leave it pointing at the wrong address.
-pub fn pair_lo12_refs(bytes: &[u8], vaddr: u64) -> Result<Vec<Lo12Ref>> {
-    let flow = PageFlow::new(bytes, vaddr);
+pub fn pair_lo12_refs(
+    bytes: &[u8],
+    vaddr: u64,
+    callee: &dyn Fn(u64) -> Callee,
+) -> Result<Vec<Lo12Ref>> {
+    let flow = PageFlow::new(bytes, vaddr, callee);
     let context = |i: usize| {
         format!(
             "pairing adrp pages in code at 0x{vaddr:x}, offset 0x{:x}",
@@ -1583,10 +1693,15 @@ type Use = (usize, i64, Option<u64>);
 /// has, which reaches as far as the object there goes. So is every offset of
 /// a register past [`MAX_ADDRS`] of them at a join.
 ///
-/// Calls are handled the way [`pair_lo12_refs`] handles them, and so is code
-/// only a jump table reaches.
-pub fn address_reaches(bytes: &[u8], vaddr: u64, formers: &[usize]) -> BTreeMap<usize, Vec<Reach>> {
-    let flow = PageFlow::new(bytes, vaddr);
+/// Calls are handled the way [`pair_lo12_refs`] handles them, by what
+/// `callee` says they call, and so is code only a jump table reaches.
+pub fn address_reaches(
+    bytes: &[u8],
+    vaddr: u64,
+    formers: &[usize],
+    callee: &dyn Fn(u64) -> Callee,
+) -> BTreeMap<usize, Vec<Reach>> {
+    let flow = PageFlow::new(bytes, vaddr, callee);
     let formers: BTreeSet<usize> = formers.iter().map(|&off| off / INSN_LEN).collect();
     if formers.is_empty() {
         return BTreeMap::new();
@@ -1934,7 +2049,7 @@ pub static AARCH64: Arch = {
 fn scan(unit: &TextUnit<'_, '_>) -> Result<UnitScan> {
     let len = code_len(unit.bytes, unit.vaddr, unit.fde_end);
     Ok(UnitScan {
-        refs: scan_refs(&unit.bytes[..len], unit.vaddr)?,
+        refs: scan_refs(&unit.bytes[..len], unit.vaddr, unit.callee)?,
         jump_tables: Vec::new(),
     })
 }
@@ -1964,9 +2079,9 @@ fn code_len(bytes: &[u8], vaddr: u64, fde_end: Option<u64>) -> usize {
 /// `:lo12:` base, a PC-relative form with no field to rewrite — fails the
 /// extraction, since copying it as it is would leave it aimed at wherever the
 /// old offset lands.
-fn scan_refs(code: &[u8], vaddr: u64) -> Result<Vec<CodeRef>> {
+fn scan_refs(code: &[u8], vaddr: u64, callee: &dyn Fn(u64) -> Callee) -> Result<Vec<CodeRef>> {
     let mut refs = Vec::new();
-    let pairs = pair_lo12_refs(code, vaddr)?;
+    let pairs = pair_lo12_refs(code, vaddr, callee)?;
     let pc_rel = scan_pc_relative_refs(code, vaddr)?;
     let word_at = |offset: usize| {
         u32::from_le_bytes(
@@ -1990,7 +2105,7 @@ fn scan_refs(code: &[u8], vaddr: u64) -> Result<Vec<CodeRef>> {
                 .map(|&(offset, _)| offset),
         )
         .collect();
-    let mut reaches = address_reaches(code, vaddr, &formers);
+    let mut reaches = address_reaches(code, vaddr, &formers, callee);
 
     for pair in &pairs {
         let word = word_at(pair.offset);
@@ -2402,7 +2517,7 @@ mod tests {
 
     #[test]
     fn every_lo12_half_is_paired_with_the_adrp_the_assembler_meant() {
-        let pairs = pair_lo12_refs(&code(PAIRS), BASE).unwrap();
+        let pairs = pair_lo12_refs(&code(PAIRS), BASE, &|_| Callee::Local).unwrap();
         assert_eq!(
             pairs,
             [
@@ -2432,7 +2547,7 @@ mod tests {
     /// the words the linker wrote.
     #[test]
     fn a_pair_patched_with_its_target_reproduces_both_words() {
-        for pair in pair_lo12_refs(&code(PAIRS), BASE).unwrap() {
+        for pair in pair_lo12_refs(&code(PAIRS), BASE, &|_| Callee::Local).unwrap() {
             let word = PAIRS[pair.offset / INSN_LEN];
             assert_eq!(Field::Lo12.patch(word, pair.target, 0, 0).unwrap(), word);
             for adrp in pair.adrps {
@@ -2447,7 +2562,10 @@ mod tests {
     }
 
     fn pairing_error(words: &[u32]) -> String {
-        format!("{:#}", pair_lo12_refs(&code(words), BASE).unwrap_err())
+        format!(
+            "{:#}",
+            pair_lo12_refs(&code(words), BASE, &|_| Callee::Local).unwrap_err()
+        )
     }
 
     const ADRP_X0: u32 = 0x9000_0080; // adrp x0, 0x410000
@@ -2478,7 +2596,7 @@ mod tests {
     /// What `address_reaches` says of the address the instruction at
     /// `former` forms in `words`, as `(offset, access_len)`.
     fn reaches_of(words: &[u32], former: usize) -> Vec<(i64, Option<u64>)> {
-        address_reaches(&code(words), BASE, &[former])
+        address_reaches(&code(words), BASE, &[former], &|_| Callee::Local)
             .remove(&former)
             .unwrap_or_default()
             .into_iter()
@@ -2564,7 +2682,10 @@ mod tests {
             0xa940_07e0, // ldp x0, x1, [sp]
         ] {
             assert_eq!(
-                pair_lo12_refs(&code(&[ADRP_X0, kill, ADD_X0_LO12, RET]), BASE).unwrap(),
+                pair_lo12_refs(&code(&[ADRP_X0, kill, ADD_X0_LO12, RET]), BASE, &|_| {
+                    Callee::Local
+                })
+                .unwrap(),
                 [],
                 "{kill:08x}"
             );
@@ -2585,6 +2706,7 @@ mod tests {
                 RET,
             ]),
             BASE,
+            &|_| Callee::Local,
         )
         .unwrap();
         assert_eq!(pairs, [lo12(0x0c, &[0x00], 0x41_0ff0)]);
@@ -2601,6 +2723,95 @@ mod tests {
             RET,
         ]);
         assert!(err.contains("both with and without a page in x0"), "{err}");
+    }
+
+    /// Where the `bl` at 0x0c in the words below goes.
+    const CALLEE: u64 = BASE + 0x1000;
+
+    /// The words after a call that never returns are not reached from it.
+    /// GCC put the `add` straight after a call to `__stack_chk_fail` in
+    /// libcrypto's `CONF_modules_load`, reached only by a branch that brings
+    /// the page.
+    #[test]
+    fn a_call_that_never_returns_ends_its_path() {
+        let words = [
+            0xb400_0062, // 0x00  cbz  x2, 0x0c
+            ADRP_X0,     // 0x04  adrp x0, 0x410000
+            0x1400_0002, // 0x08  b    0x10
+            0x9400_03fd, // 0x0c  bl   CALLEE
+            ADD_X0_LO12, // 0x10  add  x0, x0, #0xff0
+            RET,
+        ];
+        let callee = |at: u64| {
+            assert_eq!(at, CALLEE);
+            Callee::NoReturn
+        };
+        assert_eq!(
+            pair_lo12_refs(&code(&words), BASE, &callee).unwrap(),
+            [lo12(0x10, &[0x04], 0x41_0ff0)]
+        );
+        // Taken to return, the call falls into the `add` without the page.
+        let err = pairing_error(&words);
+        assert!(err.contains("both with and without a page in x0"), "{err}");
+    }
+
+    /// The compiler knows nothing of what an import or an indirect call
+    /// leaves in x0, so no page survives either there: the load after it is
+    /// through what the call returned.
+    #[test]
+    fn a_page_in_a_return_register_does_not_survive_an_external_call() {
+        for call in [
+            0x9400_03ff, // bl  CALLEE
+            0xd63f_00a0, // blr x5
+        ] {
+            let words = [ADRP_X0, call, 0xf940_0402 /* ldr x2, [x0, #8] */, RET];
+            let callee = |at: u64| {
+                assert_eq!(at, CALLEE);
+                Callee::External
+            };
+            assert_eq!(
+                pair_lo12_refs(&code(&words), BASE, &callee).unwrap(),
+                [],
+                "{call:08x}"
+            );
+        }
+    }
+
+    /// After a local call x0 may still hold the page, but compared, or
+    /// stored by halves, it is the return value: a page is never used that
+    /// way.
+    #[test]
+    fn a_return_register_read_as_a_value_after_a_call_is_the_return_value() {
+        let pairs = pair_lo12_refs(
+            &code(&[
+                ADRP_X0,     // 0x00  adrp x0, 0x410000
+                0x913f_c003, // 0x04  add  x3, x0, #0xff0
+                0x9400_0000, // 0x08  bl   .
+                0xf100_001f, // 0x0c  cmp  x0, #0
+                0xb900_0fe0, // 0x10  str  w0, [sp, #12]
+                RET,
+            ]),
+            BASE,
+            &|_| Callee::Local,
+        )
+        .unwrap();
+        assert_eq!(pairs, [lo12(0x04, &[0x00], 0x41_0ff0)]);
+    }
+
+    /// Only where every path that brings the page passed through the call:
+    /// down the other one, the compare reads the page itself.
+    #[test]
+    fn a_page_reaching_a_read_past_no_call_is_still_refused() {
+        let err = pairing_error(&[
+            0xb400_0082, // 0x00  cbz  x2, 0x10
+            ADRP_X0,     // 0x04  adrp x0, 0x410000
+            0x9400_0000, // 0x08  bl   .
+            0x1400_0002, // 0x0c  b    0x14
+            ADRP_X0,     // 0x10  adrp x0, 0x410000
+            0xf100_001f, // 0x14  cmp  x0, #0
+            RET,
+        ]);
+        assert!(err.contains("reads x0"), "{err}");
     }
 
     /// `add` takes the page in x0 down one path and another value down the
@@ -2652,6 +2863,7 @@ mod tests {
                 RET,
             ]),
             BASE,
+            &|_| Callee::Local,
         )
         .unwrap();
         // The second case overwrote x19 before its load.
@@ -2689,6 +2901,7 @@ mod tests {
                 RET,
             ]),
             BASE,
+            &|_| Callee::Local,
         )
         .unwrap();
         assert_eq!(
@@ -2754,7 +2967,7 @@ mod tests {
             ],
         ] {
             assert_eq!(
-                pair_lo12_refs(&code(words), BASE).unwrap(),
+                pair_lo12_refs(&code(words), BASE, &|_| Callee::Local).unwrap(),
                 [],
                 "{words:08x?}"
             );
@@ -2799,7 +3012,10 @@ mod tests {
                 RET,
             ],
         ] {
-            let err = format!("{:#}", pair_lo12_refs(&code(words), BASE).unwrap_err());
+            let err = format!(
+                "{:#}",
+                pair_lo12_refs(&code(words), BASE, &|_| Callee::Local).unwrap_err()
+            );
             assert!(
                 err.contains("both with and without a page in x0"),
                 "{words:08x?}: {err}"
