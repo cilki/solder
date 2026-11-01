@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -1303,9 +1304,13 @@ impl LibIndex {
         let mut addr_to_name: FastMap<u64, String> = FastMap::default();
         let mut addrs_by_section: Vec<(u64, usize)> = Vec::new();
         let mut object_addrs_by_section: Vec<(u64, usize)> = Vec::new();
+        // Addresses that hold a global definition, which is what lets a global
+        // take a name over from a local but not from another global or alias.
+        let mut global_at: FastSet<u64> = FastSet::default();
 
         // Iterate .symtab first, then .dynsym, so first-writer-wins matches the
         // ".symtab preferred" order of the original linear scans.
+        let mut named: Vec<(&str, SymInfo)> = Vec::new();
         for sym in elf.symbols().chain(elf.dynamic_symbols()) {
             let object::SymbolSection::Section(si) = sym.section() else {
                 continue;
@@ -1324,14 +1329,50 @@ impl LibIndex {
                 continue;
             }
 
+            let info = SymInfo {
+                vaddr: addr,
+                size: sym.size(),
+                section: si,
+            };
             if !sym.is_undefined() {
-                by_name.entry(name.to_string()).or_insert(SymInfo {
-                    vaddr: addr,
-                    size: sym.size(),
-                    section: si,
-                });
+                // The plain name is what the executable imports, and an import
+                // binds to the library's global definition. `.symtab` lists
+                // its locals first, so a `static` of the same name elsewhere in
+                // the library would otherwise take the name over.
+                match by_name.entry(name.to_string()) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(info.clone());
+                    }
+                    Entry::Occupied(mut slot) => {
+                        if sym.is_global() && !global_at.contains(&slot.get().vaddr) {
+                            slot.insert(info.clone());
+                        }
+                    }
+                }
+                if sym.is_global() {
+                    global_at.insert(addr);
+                }
             }
-            addr_to_name.entry(addr).or_insert_with(|| name.to_string());
+            named.push((name, info));
+        }
+
+        // A unit is extracted under the name its address resolves to, and the
+        // name is looked up again to find its bytes. Two `static` functions of
+        // the same name in different translation units — liblzma has a
+        // `coder_find` for its encoders and another for its decoders — share
+        // one name, and resolving the second one's address to it extracted the
+        // first in its place (#124). Every definition the plain name does not
+        // lead back to is keyed by a name that also carries its address.
+        for (name, info) in named {
+            let addr = info.vaddr;
+            let key = if by_name.get(name).is_some_and(|s| s.vaddr == addr) {
+                name.to_string()
+            } else {
+                let key = shadowed_unit_name(name, addr);
+                by_name.entry(key.clone()).or_insert(info);
+                key
+            };
+            addr_to_name.entry(addr).or_insert(key);
         }
 
         addrs_by_section.sort_unstable();
@@ -1606,6 +1647,14 @@ const ANON_UNIT_PREFIX: &str = ".solder.anon.";
 
 fn anon_unit_name(addr: u64) -> String {
     format!("{ANON_UNIT_PREFIX}{addr:#x}")
+}
+
+/// The name a definition is extracted under when another definition in the
+/// same library already goes by `name` (see [`LibIndex::build`]): typically a
+/// second `static` function or object of that name. It still reads as the
+/// symbol in a log line, and the address keeps it from meeting a real name.
+fn shadowed_unit_name(name: &str, addr: u64) -> String {
+    format!("{name} at {addr:#x}")
 }
 
 /// Resolve `addr` to the unit that owns it: the name to extract that unit
@@ -5822,6 +5871,68 @@ mod tests {
                 "{reloc:?} is not to `first` in the copy"
             );
         }
+    }
+
+    /// `test/aarch64/libstatics.so.1`, built from `libstatics-a.c` and
+    /// `libstatics-b.c`, which each define a `static` function `pick`.
+    fn statics_lib() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/aarch64/libstatics.so.1"
+        ))
+    }
+
+    /// The code `.symtab` says the `which`-th (0-based, in table order)
+    /// definition named `name` in the statics fixture holds.
+    fn statics_code(name: &str, which: usize) -> Vec<u8> {
+        let bytes = std::fs::read(statics_lib()).expect("read the fixture");
+        let elf = parse_lib(&bytes);
+        let sym = elf
+            .symbols()
+            .filter(|s| s.name() == Ok(name))
+            .nth(which)
+            .unwrap_or_else(|| panic!("no definition #{which} of '{name}'"));
+        let text = elf.section_by_name(".text").expect(".text");
+        let at = (sym.address() - text.address()) as usize;
+        text.data().expect(".text bytes")[at..at + sym.size() as usize].to_vec()
+    }
+
+    /// `second` calls the `pick` of its own translation unit, which is the
+    /// second `static` of that name in the library. Its address used to
+    /// resolve to the name `pick`, and the name back to the first `pick`, so
+    /// the merged `second` called the other file's function: what liblzma's
+    /// decoder memory usage did with the encoders' `coder_find` (#124).
+    ///
+    /// ```text
+    /// 680: pick:   add w0, w0, #0x1     ; libstatics-a.c
+    /// 700: pick:   sub w0, w0, #0x7     ; libstatics-b.c
+    /// 748: second: bl  700 <pick>
+    /// ```
+    #[test]
+    fn a_static_that_shares_its_name_is_extracted_from_its_own_address() {
+        let units = extract_aarch64_from(&statics_lib(), "second").units;
+        let second = units.iter().find(|u| u.name == "second").expect("second");
+        let [reloc] = &second.relocations[..] else {
+            panic!("second has one call: {:?}", second.relocations);
+        };
+        let RelocTarget::MergedUnit(callee) = reloc.target else {
+            panic!("the call is not to a merged unit: {reloc:?}");
+        };
+        let callee = units.iter().find(|u| u.id == callee).expect("the callee");
+        assert_eq!(callee.name, "pick at 0x700");
+        assert_eq!(callee.bytes, statics_code("pick", 1));
+        assert_ne!(callee.bytes, statics_code("pick", 0));
+    }
+
+    /// The executable imports `scale` by name, and the library's global
+    /// `scale` is what it binds to, even though `.symtab` lists the local
+    /// `scale` of the other file first.
+    #[test]
+    fn an_imported_name_resolves_to_the_global_over_a_local_listed_first() {
+        let units = extract_aarch64_from(&statics_lib(), "scale").units;
+        let scale = units.iter().find(|u| u.name == "scale").expect("scale");
+        assert_eq!(scale.bytes, statics_code("scale", 1));
+        assert_ne!(scale.bytes, statics_code("scale", 0));
     }
 
     /// A branch into the PLT reaches the symbol the stub's GOT slot names,

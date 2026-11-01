@@ -39,3 +39,11 @@ from `libanchors.c`:
 ```sh
 cc -O2 -fPIC -shared -Wl,-soname,libanchors.so.1 -o libanchors.so.1 libanchors.c
 ```
+
+`libstatics.so.1` has two `static` functions of the same name, one in each of
+`libstatics-a.c` and `libstatics-b.c`, and a local and a global `scale`:
+
+```sh
+cc -O2 -fPIC -fno-section-anchors -shared -Wl,-soname,libstatics.so.1 \
+   -o libstatics.so.1 libstatics-a.c libstatics-b.c
+```
