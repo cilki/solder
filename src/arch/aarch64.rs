@@ -29,13 +29,14 @@
 //! trampolines through the descriptor.
 //! `arch::SUPPORTED` still refuses aarch64 executables.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::{
-    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, RefSite, TextUnit, TlsAbi, TlsLayout,
-    TlsSlot, Trampoline, UnitScan, Unliftable,
+    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, Reach, RefSite, TextUnit, TlsAbi,
+    TlsLayout, TlsSlot, Trampoline, UnitScan, Unliftable,
 };
 use crate::types::ExtractedReloc;
 use yaxpeax_arch::{Decoder, U8Reader};
@@ -536,12 +537,18 @@ fn operand_registers(operand: &Operand) -> Vec<usize> {
 /// an `add`, which only takes the address, and for a `prfm`, which touches
 /// nothing. The aarch64 counterpart of `extractor::rip_access_len`.
 pub fn lo12_access_len(word: u32) -> Option<u64> {
-    let is_add = word & 0x7fc0_0000 == 0x1100_0000;
+    let is_add = is_lo12_add(word);
     let is_prfm = word & (1 << 26) == 0 && word >> 30 == 3 && (word >> 22) & 0b11 == 0b10;
     if is_add || is_prfm {
         return None;
     }
     lo12_scale(word).map(|scale| 1 << scale)
+}
+
+/// Whether `word` is an `add xd, xn, #imm12` (32- or 64-bit, unshifted): the
+/// `:lo12:` form that takes an address rather than accessing it.
+fn is_lo12_add(word: u32) -> bool {
+    word & 0x7fc0_0000 == 0x1100_0000
 }
 
 /// What a `:lo12:`-shaped word does with its registers.
@@ -591,6 +598,20 @@ struct PageFlow {
 }
 
 impl PageFlow {
+    /// The function `bytes`, loaded at `vaddr`, decoded a word at a time. A
+    /// trailing partial word is not code.
+    fn new(bytes: &[u8], vaddr: u64) -> PageFlow {
+        let words: Vec<u32> = bytes
+            .chunks_exact(INSN_LEN)
+            .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact")))
+            .collect();
+        PageFlow {
+            insns: words.iter().map(|&w| decode(w)).collect(),
+            words,
+            vaddr,
+        }
+    }
+
     fn pc(&self, i: usize) -> u64 {
         self.vaddr + (i * INSN_LEN) as u64
     }
@@ -611,16 +632,104 @@ impl PageFlow {
             .join(", ")
     }
 
-    /// Run instruction `i` on `regs`: the registers after it, the
-    /// instructions control can go to next, and whether it is an indirect
-    /// branch. An instruction that reads a page in a way this module does not
-    /// rewrite is an error.
-    fn step(&self, i: usize, regs: &Regs) -> Result<(Regs, Vec<usize>, bool)> {
+    /// Where control can go after instruction `i`, and whether it leaves
+    /// through an indirect branch. A word that is not an instruction goes
+    /// nowhere, and a branch target outside this code is a tail call.
+    fn successors(&self, i: usize) -> (Vec<usize>, bool) {
+        let Some(insn) = &self.insns[i] else {
+            return (Vec::new(), false);
+        };
+        let pc = self.pc(i);
+        let next = (i + 1 < self.words.len()).then_some(i + 1);
+        let branch_target = || {
+            insn.operands.iter().find_map(|op| match op {
+                Operand::PCOffset(off) => self.index_of(pc.wrapping_add(*off as u64)),
+                _ => None,
+            })
+        };
+        use Opcode::*;
+        match insn.opcode {
+            B => (branch_target().into_iter().collect(), false),
+            Bcc(_) | BCcc(_) | CBZ | CBNZ | TBZ | TBNZ => {
+                (next.into_iter().chain(branch_target()).collect(), false)
+            }
+            BR | BRAA | BRAAZ | BRAB | BRABZ => (Vec::new(), true),
+            RET | RETAA | RETAB | RETAASPPC | RETABSPPC | RETAASPPCR | RETABSPPCR | ERET
+            | ERETAA | ERETAB | DRPS | UDF | BRK | HLT | Invalid => (Vec::new(), false),
+            _ => (next.into_iter().collect(), false),
+        }
+    }
+
+    /// Run a forward dataflow over the code: `entry` is the state on entry,
+    /// `empty` the state no path has reached yet, `step` runs one instruction
+    /// on the state before it, and `join` merges a state into the one already
+    /// at word `at` (`None` for what indirect branches carry), reporting
+    /// whether it grew. Returns the state before each word, `None` for a word
+    /// nothing reaches.
+    ///
+    /// Code control never falls or branches into from the entry (a switch case
+    /// only its jump table reaches, or a local function only ever called) is
+    /// still followed: it starts from what the function's indirect branches
+    /// carried, which is where a jump table sends it.
+    fn solve<S: Clone>(
+        &self,
+        entry: S,
+        empty: S,
+        mut step: impl FnMut(usize, &S) -> Result<S>,
+        mut join: impl FnMut(Option<usize>, &mut S, &S) -> bool,
+    ) -> Result<Vec<Option<S>>> {
+        let n = self.words.len();
+        let mut ins: Vec<Option<S>> = vec![None; n];
+        let mut indirect = empty;
+        let mut roots: Vec<usize> = Vec::new();
+        let mut work: Vec<usize> = Vec::new();
+        if n > 0 {
+            ins[0] = Some(entry);
+            work.push(0);
+        }
+        loop {
+            while let Some(i) = work.pop() {
+                let out = step(i, ins[i].as_ref().expect("queued with a state"))?;
+                let (succs, is_indirect) = self.successors(i);
+                if is_indirect && join(None, &mut indirect, &out) {
+                    for &root in &roots {
+                        if join(Some(root), ins[root].as_mut().expect("seeded"), &indirect) {
+                            work.push(root);
+                        }
+                    }
+                }
+                for s in succs {
+                    match &mut ins[s] {
+                        Some(state) => {
+                            if join(Some(s), state, &out) {
+                                work.push(s);
+                            }
+                        }
+                        slot @ None => {
+                            *slot = Some(out.clone());
+                            work.push(s);
+                        }
+                    }
+                }
+            }
+            let Some(root) = (0..n).find(|&i| ins[i].is_none() && self.insns[i].is_some()) else {
+                break;
+            };
+            roots.push(root);
+            ins[root] = Some(indirect.clone());
+            work.push(root);
+        }
+        Ok(ins)
+    }
+
+    /// Run instruction `i` on `regs`: the registers after it. An instruction
+    /// that reads a page in a way this module does not rewrite is an error.
+    fn step(&self, i: usize, regs: &Regs) -> Result<Regs> {
         let word = self.words[i];
         let pc = self.pc(i);
         let Some(insn) = &self.insns[i] else {
             // Not an instruction, so nothing runs past it.
-            return Ok((regs.clone(), Vec::new(), false));
+            return Ok(regs.clone());
         };
         let mut out = regs.clone();
         let refuse = |r: usize, what: &str| {
@@ -631,11 +740,10 @@ impl PageFlow {
                 self.describe(&regs[r])
             )
         };
-        let next = (i + 1 < self.words.len()).then_some(i + 1);
 
         if Field::AdrpPage.fits(word) {
             out[(word & 31) as usize] = BTreeSet::from([Some(i)]);
-            return Ok((out, next.into_iter().collect(), false));
+            return Ok(out);
         }
 
         if let Some(form) = lo12_form(word) {
@@ -652,7 +760,7 @@ impl PageFlow {
             if let Some(r) = form.writes {
                 out[r] = BTreeSet::from([None]);
             }
-            return Ok((out, next.into_iter().collect(), false));
+            return Ok(out);
         }
 
         // `mov xd, xs` (`orr xd, xzr, xs`): the page, if any, moves with it.
@@ -674,7 +782,7 @@ impl PageFlow {
                     BTreeSet::from([None])
                 };
             }
-            return Ok((out, next.into_iter().collect(), false));
+            return Ok(out);
         }
 
         // Every register the instruction names, with whether that operand is
@@ -706,47 +814,177 @@ impl PageFlow {
             }
         }
 
-        let branch_target = || {
-            insn.operands.iter().find_map(|op| match op {
-                Operand::PCOffset(off) => self.index_of(pc.wrapping_add(*off as u64)),
-                _ => None,
-            })
-        };
-        use Opcode::*;
-        let (succs, indirect) = match insn.opcode {
-            // A target outside this code is a tail call.
-            B => (branch_target().into_iter().collect(), false),
-            Bcc(_) | BCcc(_) | CBZ | CBNZ | TBZ | TBNZ => {
-                (next.into_iter().chain(branch_target()).collect(), false)
+        if is_call(insn.opcode) {
+            // The call writes the return address. The callee may overwrite
+            // the caller-saved registers too, but it need not: GCC's -fipa-ra
+            // keeps values in the ones a local callee is known to leave
+            // alone, pages included, so a page survives the call until
+            // something overwrites it here.
+            //
+            // Except in x0 and x1, which hold what the callee returns if it
+            // returns anything. Whether a page there survived is not knowable
+            // from here, so either answer is kept: using it afterwards is
+            // then refused rather than paired by a guess.
+            for r in [0, 1] {
+                out[r].insert(None);
             }
-            BL | BLR | BLRAA | BLRAAZ | BLRAB | BLRABZ => {
-                // The call writes the return address. The callee may
-                // overwrite the caller-saved registers too, but it need not:
-                // GCC's -fipa-ra keeps values in the ones a local callee is
-                // known to leave alone, pages included, so a page survives
-                // the call until something overwrites it here.
-                //
-                // Except in x0 and x1, which hold what the callee returns if
-                // it returns anything. Whether a page there survived is not
-                // knowable from here, so either answer is kept: using it
-                // afterwards is then refused rather than paired by a guess.
-                for r in [0, 1] {
-                    out[r].insert(None);
-                }
-                out[30] = BTreeSet::from([None]);
-                (next.into_iter().collect(), false)
-            }
-            BR | BRAA | BRAAZ | BRAB | BRABZ => (Vec::new(), true),
-            RET | RETAA | RETAB | RETAASPPC | RETABSPPC | RETAASPPCR | RETABSPPCR | ERET
-            | ERETAA | ERETAB | DRPS | UDF | BRK | HLT | Invalid => (Vec::new(), false),
-            SVC => {
-                out[0] = BTreeSet::from([None]);
-                (next.into_iter().collect(), false)
-            }
-            _ => (next.into_iter().collect(), false),
-        };
-        Ok((out, succs, indirect))
+            out[30] = BTreeSet::from([None]);
+        } else if insn.opcode == Opcode::SVC {
+            out[0] = BTreeSet::from([None]);
+        }
+        Ok(out)
     }
+}
+
+impl PageFlow {
+    /// Run instruction `i` on `regs` for [`address_reaches`]: the registers
+    /// after it, with each use it makes of a formed address added to `uses`.
+    fn address_step(
+        &self,
+        i: usize,
+        regs: &AddrRegs,
+        formers: &BTreeSet<usize>,
+        uses: &mut BTreeSet<Use>,
+    ) -> AddrRegs {
+        let word = self.words[i];
+        let Some(insn) = &self.insns[i] else {
+            return regs.clone();
+        };
+        let mut out = regs.clone();
+        let addrs = |r: usize| regs[r].iter().flatten().copied().collect::<Vec<_>>();
+        let moved = |r: usize, by: i64| -> AddrOrigins {
+            if r >= GPRS {
+                return BTreeSet::from([None]);
+            }
+            regs[r]
+                .iter()
+                .map(|o| o.map(|(a, off)| (a, off.wrapping_add(by))))
+                .collect()
+        };
+
+        // An `adr` or `:lo12:` `add` puts its address in its destination.
+        if formers.contains(&i) {
+            let rd = (word & 31) as usize;
+            if rd < GPRS {
+                out[rd] = BTreeSet::from([Some((i, 0))]);
+            }
+            return out;
+        }
+
+        // `add`/`sub xd, xn, #imm`: the address moves on, offset adjusted.
+        if let (
+            op @ (Opcode::ADD | Opcode::SUB),
+            [
+                Operand::RegisterOrSP(SizeCode::X, d),
+                Operand::RegisterOrSP(SizeCode::X, n),
+                imm @ (Operand::Immediate(_) | Operand::ImmShift(..)),
+                Operand::Nothing,
+            ],
+        ) = (insn.opcode, &insn.operands)
+        {
+            let imm = match *imm {
+                Operand::Immediate(v) => i64::from(v),
+                Operand::ImmShift(v, shift) => i64::from(v) << shift,
+                _ => unreachable!("matched above"),
+            };
+            if (*d as usize) < GPRS {
+                out[*d as usize] = moved(*n as usize, if op == Opcode::SUB { -imm } else { imm });
+            }
+            return out;
+        }
+
+        // `mov xd, xs` (`orr xd, xzr, xs`).
+        if let (
+            Opcode::ORR,
+            [
+                Operand::Register(SizeCode::X, d),
+                Operand::Register(SizeCode::X, 31),
+                Operand::RegShift(ShiftStyle::LSL, 0, SizeCode::X, s),
+                _,
+            ],
+        ) = (insn.opcode, &insn.operands)
+        {
+            if (*d as usize) < GPRS {
+                out[*d as usize] = moved(*s as usize, 0);
+            }
+            return out;
+        }
+
+        // A load or store's access size, where its encoding gives one.
+        let access_len = lo12_scale(word)
+            .filter(|_| word & 0x3b00_0000 == 0x3900_0000)
+            .map(|scale| 1u64 << scale);
+        let mut written = Vec::new();
+        let mut writeback = Vec::new();
+        for (k, operand) in insn.operands.iter().enumerate() {
+            match *operand {
+                Operand::RegPreIndex(r, imm, wb) => {
+                    let r = r as usize;
+                    if r < GPRS {
+                        for (a, off) in addrs(r) {
+                            uses.insert((a, off.wrapping_add(imm.into()), access_len));
+                        }
+                        if wb {
+                            writeback.push((r, i64::from(imm)));
+                        }
+                    }
+                }
+                Operand::RegPostIndex(r, imm) => {
+                    let r = r as usize;
+                    if r < GPRS {
+                        for (a, off) in addrs(r) {
+                            uses.insert((a, off, access_len));
+                        }
+                        writeback.push((r, i64::from(imm)));
+                    }
+                }
+                _ => {
+                    let writes = (k == 0 && writes_first_operand(insn.opcode))
+                        || (k == 1 && writes_second_operand(insn.opcode));
+                    for r in operand_registers(operand) {
+                        if writes {
+                            written.push(r);
+                        } else {
+                            for (a, off) in addrs(r) {
+                                uses.insert((a, off, None));
+                            }
+                        }
+                    }
+                    if let Operand::RegPostIndexReg(base, _) = *operand {
+                        written.push(base as usize);
+                    }
+                }
+            }
+        }
+        for &r in implicit_registers(insn.opcode) {
+            for (a, off) in addrs(r) {
+                uses.insert((a, off, None));
+            }
+        }
+        for (r, by) in writeback {
+            out[r] = moved(r, by);
+        }
+        for r in written.into_iter().filter(|&r| r < GPRS) {
+            out[r] = BTreeSet::from([None]);
+        }
+        if is_call(insn.opcode) {
+            // As in `step`: a value may survive a call, except in the
+            // registers it returns in and the link register.
+            for r in [0, 1] {
+                out[r].insert(None);
+            }
+            out[30] = BTreeSet::from([None]);
+        } else if insn.opcode == Opcode::SVC {
+            out[0] = BTreeSet::from([None]);
+        }
+        out
+    }
+}
+
+/// Whether `opcode` is a call: a branch that writes the return address.
+fn is_call(opcode: Opcode) -> bool {
+    use Opcode::*;
+    matches!(opcode, BL | BLR | BLRAA | BLRAAZ | BLRAB | BLRABZ)
 }
 
 /// Pair every `:lo12:` instruction in one function's code with the `adrp`s
@@ -757,12 +995,8 @@ impl PageFlow {
 /// loops, until it is overwritten; an `add #imm` or unsigned-offset load or
 /// store that takes it as the base is the other half of the pair. A 64-bit
 /// `mov` carries the page to its destination, and a call does not end it
-/// (see the `BL` arm of `PageFlow::step`).
-///
-/// Code control never falls or branches into from the entry (a switch case
-/// only its jump table reaches, or a local function only ever called) is
-/// still followed: it starts from what the function's indirect branches
-/// carried, which is where a jump table sends it.
+/// (see the call in `PageFlow::step`). Code only a jump table reaches is
+/// followed too; see `PageFlow::solve`.
 ///
 /// Anything this cannot account for is an error, not a guess: a page that is
 /// stored (spilled to the stack included), compared, truncated, or used any
@@ -772,16 +1006,7 @@ impl PageFlow {
 /// code with such a reference in it would leave it pointing at the wrong
 /// address.
 pub fn pair_lo12_refs(bytes: &[u8], vaddr: u64) -> Result<Vec<Lo12Ref>> {
-    let words: Vec<u32> = bytes
-        .chunks_exact(INSN_LEN)
-        .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact")))
-        .collect();
-    let flow = PageFlow {
-        insns: words.iter().map(|&w| decode(w)).collect(),
-        words,
-        vaddr,
-    };
-    let n = flow.words.len();
+    let flow = PageFlow::new(bytes, vaddr);
     let context = |i: usize| {
         format!(
             "pairing adrp pages in code at 0x{vaddr:x}, offset 0x{:x}",
@@ -789,49 +1014,13 @@ pub fn pair_lo12_refs(bytes: &[u8], vaddr: u64) -> Result<Vec<Lo12Ref>> {
         )
     };
 
-    let mut ins: Vec<Option<Regs>> = vec![None; n];
-    // What indirect branches carry: the state code reached only through one
-    // starts from.
-    let mut indirect: Regs = vec![Origins::new(); GPRS];
-    let mut roots: Vec<usize> = Vec::new();
-    let mut work: Vec<usize> = Vec::new();
-    if n > 0 {
-        // On entry no register holds a page this function's adrps took.
-        ins[0] = Some(vec![BTreeSet::from([None]); GPRS]);
-        work.push(0);
-    }
-    loop {
-        while let Some(i) = work.pop() {
-            let regs = ins[i].as_ref().expect("queued with a state");
-            let (out, succs, is_indirect) = flow.step(i, regs).with_context(|| context(i))?;
-            if is_indirect && join(&mut indirect, &out) {
-                for &root in &roots {
-                    if join(ins[root].as_mut().expect("seeded"), &indirect) {
-                        work.push(root);
-                    }
-                }
-            }
-            for s in succs {
-                match &mut ins[s] {
-                    Some(state) => {
-                        if join(state, &out) {
-                            work.push(s);
-                        }
-                    }
-                    slot @ None => {
-                        *slot = Some(out.clone());
-                        work.push(s);
-                    }
-                }
-            }
-        }
-        let Some(root) = (0..n).find(|&i| ins[i].is_none() && flow.insns[i].is_some()) else {
-            break;
-        };
-        roots.push(root);
-        ins[root] = Some(indirect.clone());
-        work.push(root);
-    }
+    // On entry no register holds a page this function's adrps took.
+    let ins = flow.solve(
+        vec![BTreeSet::from([None]); GPRS],
+        vec![Origins::new(); GPRS],
+        |i, regs| flow.step(i, regs).with_context(|| context(i)),
+        |_, into, from| join(into, from),
+    )?;
 
     let mut pairs = Vec::new();
     for (i, regs) in ins.iter().enumerate() {
@@ -875,6 +1064,112 @@ pub fn pair_lo12_refs(bytes: &[u8], vaddr: u64) -> Result<Vec<Lo12Ref>> {
         });
     }
     Ok(pairs)
+}
+
+/// Where an address one of the function's own instructions formed may be in
+/// one register, over every path that reaches an instruction: `Some((i,
+/// off))` is the address the instruction at word `i` formed plus `off`,
+/// `None` anything else. Empty means no path has reached it yet.
+type AddrOrigins = BTreeSet<Option<(usize, i64)>>;
+type AddrRegs = Vec<AddrOrigins>;
+
+/// How many addresses one register may hold where paths meet before its
+/// offsets stop being followed there. A pointer stepped through a loop takes
+/// a new offset on every trip round it, so without a bound the offsets would
+/// never stop growing.
+const MAX_ADDRS: usize = 8;
+
+/// One use of a formed address: the instruction that formed it (by word),
+/// the constant added to it, and how many bytes were accessed there.
+type Use = (usize, i64, Option<u64>);
+
+/// Follow the addresses the instructions at `formers` (byte offsets of `adr`s
+/// and `:lo12:` `add`s in `bytes`, loaded at `vaddr`) form through the code,
+/// and report for each one the constant offsets from it that the code reads,
+/// writes or otherwise uses ([`Reach`]).
+///
+/// This is what GCC's section anchors need. With them, which aarch64 GCC
+/// turns on by default at `-O1` and above, a function that touches several
+/// static objects of one section takes the address of the first (the
+/// anchor) once and reaches the others as constant offsets from it:
+///
+/// ```text
+/// adrp x2, .LANCHOR0
+/// add  x3, x2, :lo12:.LANCHOR0   ; a
+/// ldr  w5, [x3, #48]             ; c, 48 bytes on
+/// add  x2, x3, #0x10             ; b, indexed below
+/// ldr  w6, [x2, w5, sxtw #2]
+/// ```
+///
+/// Nothing in the `add` says that it reaches past `a`; only following its
+/// register does. An `add`/`sub` of an immediate or a `mov` carries the
+/// address on with the offset adjusted; a load or store through it with an
+/// immediate offset is a use at that offset, of the access size where the
+/// encoding gives it (an unsigned-offset form); with writeback the base moves
+/// by the offset. Any other read — an index register added to it, the address
+/// passed on, stored, compared — is a use of unknown length at the offset it
+/// has, which reaches as far as the object there goes. So is every offset of
+/// a register past [`MAX_ADDRS`] of them at a join.
+///
+/// Calls are handled the way [`pair_lo12_refs`] handles them, and so is code
+/// only a jump table reaches.
+pub fn address_reaches(bytes: &[u8], vaddr: u64, formers: &[usize]) -> BTreeMap<usize, Vec<Reach>> {
+    let flow = PageFlow::new(bytes, vaddr);
+    let formers: BTreeSet<usize> = formers.iter().map(|&off| off / INSN_LEN).collect();
+    if formers.is_empty() {
+        return BTreeMap::new();
+    }
+    let uses: RefCell<BTreeSet<Use>> = RefCell::default();
+    // Per word, and one more for what indirect branches carry, the registers
+    // whose offsets are no longer followed there.
+    let widened = RefCell::new(vec![0u32; flow.words.len() + 1]);
+
+    let solved = flow.solve(
+        vec![BTreeSet::from([None]); GPRS],
+        vec![AddrOrigins::new(); GPRS],
+        |i, regs| Ok(flow.address_step(i, regs, &formers, &mut uses.borrow_mut())),
+        |at, into, from| {
+            let mask = &mut widened.borrow_mut()[at.unwrap_or(flow.words.len())];
+            let mut uses = uses.borrow_mut();
+            let mut grew = false;
+            for (r, (into, from)) in into.iter_mut().zip(from).enumerate() {
+                if *mask & (1 << r) == 0 {
+                    let before = into.len();
+                    into.extend(from.iter().copied());
+                    grew |= into.len() != before;
+                    if into.iter().flatten().count() <= MAX_ADDRS {
+                        continue;
+                    }
+                    *mask |= 1 << r;
+                }
+                // Widened: every address arriving here is used from here on
+                // in ways no longer followed.
+                for &(a, off) in into.iter().chain(from).flatten() {
+                    uses.insert((a, off, None));
+                }
+                if into.len() != 1 || !into.contains(&None) {
+                    *into = BTreeSet::from([None]);
+                    grew = true;
+                }
+            }
+            grew
+        },
+    );
+    debug_assert!(solved.is_ok(), "address_step does not fail");
+
+    let mut reaches: BTreeMap<usize, Vec<Reach>> = BTreeMap::new();
+    for (a, offset, access_len) in uses.into_inner() {
+        // The formed address itself, used some way or other: what the
+        // reference says on its own already.
+        if offset == 0 && access_len.is_none() {
+            continue;
+        }
+        reaches
+            .entry(a * INSN_LEN)
+            .or_default()
+            .push(Reach { offset, access_len });
+    }
+    reaches
 }
 
 /// `bti c`: the landing pad an indirect call, or a `br` through `x16`/`x17`,
@@ -1051,12 +1346,11 @@ fn plt_stub_slot_at(sec_data: &[u8], sec_addr: u64, addr: u64) -> Option<u64> {
 /// aarch64 (`EM_AARCH64`), LP64, per the ARM ELF ABI (AAELF64) and glibc's
 /// `sysdeps/aarch64`.
 ///
-/// Not in [`SUPPORTED`](super::SUPPORTED) yet, so an aarch64 executable is still refused at the
-/// gate: the extractor follows a section-anchor reference (`adrp`/`add` of an
-/// anchor, then `add #offset`) to the anchor object rather than the one it
-/// reaches. Until then this is what the per-architecture
-/// tables of the search, the reader, the extractor, the patcher and the
-/// writer are tested against.
+/// Not in [`SUPPORTED`](super::SUPPORTED) yet, so an aarch64 executable is
+/// still refused at the gate; opening it, and turning round the tests that
+/// check it refuses aarch64, is the step left. Until then this is what the
+/// per-architecture tables of the search, the reader, the extractor, the
+/// patcher and the writer are tested against.
 #[cfg_attr(not(test), allow(dead_code))]
 pub static AARCH64: Arch = {
     use Unliftable::{Copy, Ifunc};
@@ -1154,6 +1448,9 @@ pub static AARCH64: Arch = {
             plt_stub_slot: plt_stub_slot_at,
             veneer_short_branches,
         },
+        // GCC's `-fsection-anchors`, on by default at `-O1` and above: see
+        // `address_reaches`.
+        anchored_data: true,
     }
 };
 
@@ -1198,12 +1495,33 @@ fn code_len(bytes: &[u8], vaddr: u64, fde_end: Option<u64>) -> usize {
 fn scan_refs(code: &[u8], vaddr: u64) -> Result<Vec<CodeRef>> {
     let mut refs = Vec::new();
     let pairs = pair_lo12_refs(code, vaddr)?;
-    for pair in &pairs {
-        let word = u32::from_le_bytes(
-            code[pair.offset..pair.offset + INSN_LEN]
+    let pc_rel = scan_pc_relative_refs(code, vaddr)?;
+    let word_at = |offset: usize| {
+        u32::from_le_bytes(
+            code[offset..offset + INSN_LEN]
                 .try_into()
                 .expect("one word"),
-        );
+        )
+    };
+
+    // The instructions that put a whole address in a register: a `:lo12:`
+    // `add` and an `adr` of data. What the code adds to that address is how
+    // far past the object at it the reference reaches.
+    let formers: Vec<usize> = pairs
+        .iter()
+        .map(|pair| pair.offset)
+        .filter(|&offset| is_lo12_add(word_at(offset)))
+        .chain(
+            pc_rel
+                .iter()
+                .filter(|(_, r)| r.field == Field::Adr && !r.is_code_ref)
+                .map(|&(offset, _)| offset),
+        )
+        .collect();
+    let mut reaches = address_reaches(code, vaddr, &formers);
+
+    for pair in &pairs {
+        let word = word_at(pair.offset);
         refs.push(CodeRef {
             offset: pair.offset,
             target_vaddr: pair.target,
@@ -1213,9 +1531,10 @@ fn scan_refs(code: &[u8], vaddr: u64) -> Result<Vec<CodeRef>> {
                 field: Field::Lo12,
                 adrps: pair.adrps.iter().map(|&a| a as u64).collect(),
             }),
+            reaches: reaches.remove(&pair.offset).unwrap_or_default(),
         });
     }
-    for (offset, r) in scan_pc_relative_refs(code, vaddr)? {
+    for (offset, r) in pc_rel {
         let (site, target_vaddr) = if r.field == Field::AdrpPage {
             let Some(pair) = pairs.iter().find(|p| p.adrps.contains(&offset)) else {
                 continue;
@@ -1234,6 +1553,7 @@ fn scan_refs(code: &[u8], vaddr: u64) -> Result<Vec<CodeRef>> {
             is_code_ref: r.is_code_ref,
             access_len: None,
             site,
+            reaches: reaches.remove(&offset).unwrap_or_default(),
         });
     }
     Ok(refs)
@@ -1681,6 +2001,86 @@ mod tests {
             assert!(err.contains(&format!("{what} x0")), "{use_:08x}: {err}");
             assert!(err.contains("adrp at 0x400000"), "{use_:08x}: {err}");
         }
+    }
+
+    /// What `address_reaches` says of the address the instruction at
+    /// `former` forms in `words`, as `(offset, access_len)`.
+    fn reaches_of(words: &[u32], former: usize) -> Vec<(i64, Option<u64>)> {
+        address_reaches(&code(words), BASE, &[former])
+            .remove(&former)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.offset, r.access_len))
+            .collect()
+    }
+
+    /// A section anchor: the `add` takes the address of the first object,
+    /// and the code reaches the rest at constant offsets from it, directly,
+    /// through a derived pointer it indexes, and below it. Handing the address
+    /// on to a store is a use of the anchor itself, which the reference says
+    /// already.
+    #[test]
+    fn the_offsets_code_adds_to_a_formed_address_are_its_reaches() {
+        let words = [
+            0x9000_0002, // adrp x2, 0x400000
+            0x913f_c043, // add  x3, x2, #0xff0
+            0xb940_3065, // ldr  w5, [x3, #48]
+            0x9100_4062, // add  x2, x3, #0x10
+            0xb865_d846, // ldr  w6, [x2, w5, sxtw #2]
+            0xd100_2067, // sub  x7, x3, #0x8
+            0xa940_24e8, // ldp  x8, x9, [x7]
+            0xaa03_03ea, // mov  x10, x3
+            0xf900_07ea, // str  x10, [sp, #8]
+            RET,
+        ];
+        assert_eq!(
+            reaches_of(&words, 0x4),
+            [(-8, None), (16, None), (48, Some(4))]
+        );
+    }
+
+    /// An `adr` forms an address too. Writeback moves the base on, and the
+    /// address survives a call in a register the callee is taken to leave
+    /// alone.
+    #[test]
+    fn a_writeback_moves_the_base_and_a_call_keeps_it() {
+        let words = [
+            0x1000_0004, // adr  x4, .
+            0xf841_0c80, // ldr  x0, [x4, #16]!
+            0x3940_0c81, // ldrb w1, [x4, #3]
+            0x97ff_fffd, // bl   .-12
+            0xb840_1081, // ldur w1, [x4, #1]
+            RET,
+        ];
+        assert_eq!(
+            reaches_of(&words, 0x0),
+            [(16, None), (17, None), (19, Some(1))]
+        );
+    }
+
+    /// A pointer stepped through a loop takes a new offset every trip round
+    /// it. The offsets stop being followed once there are too many of them
+    /// at the loop head, so the analysis ends, and every one it saw is still
+    /// reported as reached.
+    #[test]
+    fn a_pointer_stepped_through_a_loop_is_widened() {
+        let words = [
+            0x9000_0002, // adrp x2, 0x400000
+            0x913f_c043, // add  x3, x2, #0xff0
+            0xb840_4460, // ldr  w0, [x3], #4      <- loop
+            0x35ff_ffe0, // cbnz w0, loop
+            RET,
+        ];
+        let reaches = reaches_of(&words, 0x4);
+        let offsets: Vec<i64> = reaches.iter().map(|&(off, _)| off).collect();
+        let bound = 4 * (MAX_ADDRS as i64 + 1);
+        assert!(offsets.contains(&4) && offsets.len() > 1, "{reaches:?}");
+        assert!(
+            offsets
+                .iter()
+                .all(|&off| off > 0 && off <= bound && off % 4 == 0),
+            "{reaches:?}"
+        );
     }
 
     /// Overwriting the register ends the page, which is not a use of it.

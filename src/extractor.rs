@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
-use crate::arch::{Arch, RefSite, Site, TextUnit, TlsSlot, UnitScan, Unliftable, Word};
+use crate::arch::{Arch, CodeRef, RefSite, Site, TextUnit, TlsSlot, UnitScan, Unliftable, Word};
 use crate::elf_reader::MappedElf;
 use crate::tls::TlsBlock;
 use crate::types::{
@@ -1062,13 +1062,22 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
                 Some((dep.offset as i64, RelocTarget::MergedUnit(dep.id)))
             } else {
                 // Otherwise try to extract the data section
-                ensure_data_blob_extracted(lib, &key.sym, target_addr, code_ref.access_len, state)?
-                    .map(|(blob_id, blob_base)| {
-                        (
-                            0,
-                            RelocTarget::DataBlobOffset(blob_id, target_addr - blob_base),
-                        )
-                    })
+                let blob = ensure_data_blob_extracted(
+                    lib,
+                    &key.sym,
+                    target_addr,
+                    code_ref.access_len,
+                    state,
+                )?;
+                if let Some((blob_id, _)) = blob {
+                    extend_over_reaches(lib, &key.sym, &code_ref, blob_id, state)?;
+                }
+                blob.map(|(blob_id, blob_base)| {
+                    (
+                        0,
+                        RelocTarget::DataBlobOffset(blob_id, target_addr - blob_base),
+                    )
+                })
             };
             if let Some((extra, target)) = resolved {
                 if code_ref.completes_a_page() {
@@ -1650,6 +1659,18 @@ fn resolve_owning_unit(lib: Lib<'_, '_>, addr: u64) -> Option<(String, u64)> {
 fn reserve_unit_at(lib: Lib<'_, '_>, addr: u64, state: &mut ExtractionState) -> Option<UnitRef> {
     if let Some(&hit) = state.units_at.get(&(lib.id, addr)) {
         return hit;
+    }
+    // Where code reaches one static object as an offset from another, the
+    // objects of a data section only stay where that code expects them in the
+    // section's one copy (see `Arch::anchored_data`). An object extracted on
+    // its own as well would be a second copy, which the code reaching it by
+    // name would write and the code reaching it through an anchor would not
+    // see.
+    if state.arch.anchored_data
+        && find_section_for_address(lib.elf, addr).is_some_and(|sec| sec.kind != SectionKind::Text)
+    {
+        state.units_at.insert((lib.id, addr), None);
+        return None;
     }
     let resolved = resolve_owning_unit(lib, addr).map(|(name, offset)| UnitRef {
         id: state.reserve(UnitKey {
@@ -2270,6 +2291,16 @@ fn needed_prefix(
     end.saturating_sub(sec.vaddr).min(sec.size)
 }
 
+/// The size the library gives the object it names at exactly `addr`, if it
+/// names one there and gives it a size.
+fn sized_object_at(lib: Lib<'_, '_>, addr: u64) -> Option<u64> {
+    let name = find_symbol_at_address(lib.index, addr)?;
+    find_symbol(lib, &name)
+        .ok()
+        .map(|sym| sym.size)
+        .filter(|&size| size > 0)
+}
+
 /// Extract the data holding `target_addr` if it has not been extracted already.
 /// Returns the blob's UnitId and the address its first byte had in the library.
 ///
@@ -2296,6 +2327,17 @@ fn ensure_data_blob_extracted(
     if sec.kind == SectionKind::Text {
         return Ok(None);
     }
+
+    // A reference to an object the library names and sizes reaches that
+    // object, however little its instruction says. Only an architecture whose
+    // data objects all go through the section's copy (`Arch::anchored_data`)
+    // gets here with one; elsewhere `resolve_owning_unit` extracts such an
+    // object as a unit of its own. Bounding the reference by the next object
+    // instead dragged the rest of the section in after the last one.
+    let access_len = match access_len {
+        None if state.arch.anchored_data => sized_object_at(lib, target_addr),
+        given => given,
+    };
 
     // What to copy: one GOT slot, or a long enough prefix of the section for
     // everything else.
@@ -2447,6 +2489,57 @@ fn ensure_data_blob_extracted(
     }
 
     Ok(Some((info.id, info.base_vaddr)))
+}
+
+/// Grow the copy `blob` that `code_ref` resolved to over every address the
+/// code goes on to reach from its target ([`CodeRef::reaches`]).
+///
+/// This is what keeps a section anchor working. GCC takes the address of one
+/// static object and reaches the others it laid out after it as constant
+/// offsets from that address, so the reference names the first object and
+/// nothing else. With the section copied whole from its first byte, each of
+/// those objects sits at the same distance from the first as in the library,
+/// as long as the copy reaches far enough to hold it: copying only up to the
+/// next object, which is all the reference says by itself, left the others
+/// out, and the code read and wrote whatever the merge put after the copy.
+///
+/// Only an address inside the target's own section counts. An anchor does not
+/// reach across sections, and following a pointer stepped through a loop can
+/// give offsets past the end that the code compares against but never reads.
+/// A GOT is copied a slot at a time, and nothing anchors into one.
+fn extend_over_reaches(
+    lib: Lib<'_, '_>,
+    ctx: &str,
+    code_ref: &CodeRef,
+    blob: UnitId,
+    state: &mut ExtractionState,
+) -> Result<()> {
+    if code_ref.reaches.is_empty() {
+        return Ok(());
+    }
+    let Some(sec) = find_section_for_address(lib.elf, code_ref.target_vaddr) else {
+        return Ok(());
+    };
+    if got_slot_at(&sec, code_ref.target_vaddr).is_some() {
+        return Ok(());
+    }
+    let section = sec.vaddr..sec.vaddr.saturating_add(sec.size);
+    for reach in &code_ref.reaches {
+        let Some(addr) = code_ref
+            .target_vaddr
+            .checked_add_signed(reach.offset)
+            .filter(|addr| section.contains(addr))
+        else {
+            continue;
+        };
+        let grown = ensure_data_blob_extracted(lib, ctx, addr, reach.access_len, state)?;
+        debug_assert_eq!(
+            grown.map(|(id, _)| id),
+            Some(blob),
+            "an address in the same section resolves to the same copy"
+        );
+    }
+    Ok(())
 }
 
 /// Copy enough of `sec` into the blob `key` names that it holds `needed` bytes
@@ -5645,7 +5738,8 @@ mod tests {
     /// the `b` tail call to a local helper, and an `adrp` shared by the load
     /// and the store that complete it. All three halves of the pair are
     /// relocated against `counter`, and the `:lo12:` ones say which `adrp`
-    /// supplies their page.
+    /// supplies their page. `counter` is reached in the copy of its section,
+    /// where every object keeps its place (see `Arch::anchored_data`).
     ///
     /// ```text
     /// 6d0: adrp x2, 0x20000
@@ -5659,9 +5753,9 @@ mod tests {
         assert_eq!(
             units["bump"],
             [
-                "0xc Lo12[4] -> counter+0",
-                "0x18 Lo12[4] -> counter+0",
-                "0x4 AdrpPage[] -> counter+0",
+                "0xc Lo12[4] -> libpages.so.1:.bss+0x4+0",
+                "0x18 Lo12[4] -> libpages.so.1:.bss+0x4+0",
+                "0x4 AdrpPage[] -> libpages.so.1:.bss+0x4+0",
                 "0x1c Imm26[] -> helper+0",
             ]
         );
@@ -5670,13 +5764,64 @@ mod tests {
         assert_eq!(
             units["helper"],
             [
-                "0x8 Lo12[4] -> table+0",
-                "0x20 Lo12[24] -> counter+0",
-                "0x4 AdrpPage[] -> table+0",
-                "0x18 AdrpPage[] -> counter+0",
+                "0x8 Lo12[4] -> libpages.so.1:.rodata+0x8+0",
+                "0x20 Lo12[24] -> libpages.so.1:.bss+0x4+0",
+                "0x4 AdrpPage[] -> libpages.so.1:.rodata+0x8+0",
+                "0x18 AdrpPage[] -> libpages.so.1:.bss+0x4+0",
             ]
         );
-        assert!(units["counter"].is_empty() && units["table"].is_empty());
+        assert!(!units.contains_key("counter") && !units.contains_key("table"));
+    }
+
+    /// `get` in `test/aarch64/libanchors.so.1` reaches all three objects of
+    /// its `.data` through one section anchor, the `add` that takes the
+    /// address of `first`:
+    ///
+    /// ```text
+    /// 644: adrp x2, 0x20000
+    /// 648: add  x3, x2, #0x20           ; first
+    /// 664: add  x2, x3, #0x10           ; table, indexed below
+    /// 668: ldr  w0, [x2, w0, sxtw #2]
+    /// 670: ldr  w0, [x3, #48]           ; last
+    /// ```
+    ///
+    /// Every reference resolves into the one copy of `.data`, where the
+    /// objects keep the distances the code adds, and the copy reaches as far
+    /// as `last`. Neither `table` nor `last` is named anywhere in the code, so
+    /// the copy used to stop at the end of `first` and the merged `get` read
+    /// whatever came after it.
+    #[test]
+    fn objects_an_aarch64_section_anchor_reaches_are_copied_in_place() {
+        let lib = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/aarch64/libanchors.so.1"
+        ));
+        let units = extract_aarch64_from(&lib, "get").units;
+        for object in ["first", "table", "last"] {
+            assert!(
+                !units.iter().any(|u| u.name == object),
+                "'{object}' was extracted apart from the copy of its section"
+            );
+        }
+        let data = units
+            .iter()
+            .find(|u| u.name == "libanchors.so.1:.data")
+            .expect("a copy of .data");
+        // `.data` starts at 0x20010: `first` is at 0x10 into it, `table` at
+        // 0x20 and `last` at 0x40.
+        let word = |off: usize| u32::from_le_bytes(data.bytes[off..off + 4].try_into().unwrap());
+        assert!(data.bytes.len() >= 0x44, "{} bytes", data.bytes.len());
+        assert_eq!(
+            (word(0x10), word(0x20), word(0x3c), word(0x40)),
+            (1, 10, 80, 3)
+        );
+        let get = units.iter().find(|u| u.name == "get").expect("get");
+        for reloc in &get.relocations {
+            assert!(
+                matches!(reloc.target, RelocTarget::DataBlobOffset(id, 0x10) if id == data.id),
+                "{reloc:?} is not to `first` in the copy"
+            );
+        }
     }
 
     /// A branch into the PLT reaches the symbol the stub's GOT slot names,
@@ -5688,8 +5833,8 @@ mod tests {
         assert_eq!(
             units["shout"],
             [
-                "0x8 Lo12[4] -> banner+0",
-                "0x4 AdrpPage[] -> banner+0",
+                "0x8 Lo12[4] -> libpages.so.1:.rodata+0x0+0",
+                "0x4 AdrpPage[] -> libpages.so.1:.rodata+0x0+0",
                 "0x14 Imm26[] -> extern puts+0",
             ]
         );

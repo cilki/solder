@@ -188,6 +188,13 @@ pub struct Arch {
     pub trampoline: Trampoline,
     /// How the extractor reads and rewrites this architecture's code.
     pub code: MachineCode,
+    /// Whether its compilers reach a static object as an offset from another
+    /// one in the same section, as GCC's section anchors do (on by default for
+    /// aarch64). Every object in a library's data section then has to keep its
+    /// place relative to the others, so the extractor resolves an address in
+    /// one to the section's single copy, never to the object's own unit, and
+    /// grows the copy over every [`CodeRef::reaches`].
+    pub anchored_data: bool,
 }
 
 impl Arch {
@@ -287,6 +294,24 @@ pub struct CodeRef {
     pub access_len: Option<u64>,
     /// How the address is written into the code.
     pub site: RefSite,
+    /// The further addresses the code reaches from `target_vaddr` by adding
+    /// constants to it, for an architecture whose compilers do that across
+    /// objects (see [`Arch::anchored_data`]). Empty everywhere else.
+    pub reaches: Vec<Reach>,
+}
+
+/// An address code goes on to reach from a [`CodeRef`]'s target by adding a
+/// constant to it. GCC's section anchors take the address of one static
+/// object and reach the objects after it in its section at constant offsets
+/// from it, so this is what says how much of the section the reference needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Reach {
+    /// How far from the reference's target, in bytes.
+    pub offset: i64,
+    /// How many bytes are read or written there, where the instruction says.
+    /// `None` for any other use of the address (indexed, passed on, stored),
+    /// which reaches as far as the object at it goes.
+    pub access_len: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
