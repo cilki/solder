@@ -425,6 +425,260 @@ fn join(into: &mut Regs, from: &Regs) -> bool {
     grew
 }
 
+/// Where `sp` or a frame pointer in `x29` points, as a byte offset from the
+/// `sp` the function was entered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Frame {
+    /// No path has reached here yet.
+    Unreached,
+    /// The same offset on every path.
+    At(i64),
+    /// Moved by an amount not followed, or by different amounts on different
+    /// paths.
+    Unknown,
+}
+
+impl Frame {
+    fn known(self) -> Option<i64> {
+        match self {
+            Frame::At(at) => Some(at),
+            _ => None,
+        }
+    }
+
+    /// Join `from` into `self`, reporting whether `self` changed.
+    fn join(&mut self, from: Frame) -> bool {
+        let joined = match (*self, from) {
+            (Frame::Unreached, other) | (other, Frame::Unreached) => other,
+            (Frame::At(a), Frame::At(b)) if a == b => Frame::At(a),
+            _ => Frame::Unknown,
+        };
+        let changed = joined != *self;
+        *self = joined;
+        changed
+    }
+}
+
+/// What [`PageFlow::step`] knows before an instruction: which registers may
+/// hold a page, and which eight-byte stack slots a page was spilled to.
+#[derive(Debug, Clone)]
+struct PageState {
+    /// Whether any path has reached here. The state that indirect branches
+    /// carry starts out unreached.
+    reached: bool,
+    regs: Regs,
+    /// `sp`, which the function is entered with at offset 0.
+    sp: Frame,
+    /// `x29`, once the function makes it a frame pointer by setting it from
+    /// `sp`.
+    fp: Frame,
+    /// The slots that may hold a page, by the offset of their first byte
+    /// from the entry `sp`. A slot not in here holds no page on any path.
+    slots: BTreeMap<i64, Origins>,
+}
+
+impl PageState {
+    fn entry() -> PageState {
+        PageState {
+            reached: true,
+            regs: vec![BTreeSet::from([None]); GPRS],
+            sp: Frame::At(0),
+            fp: Frame::Unknown,
+            slots: BTreeMap::new(),
+        }
+    }
+
+    fn unreached() -> PageState {
+        PageState {
+            reached: false,
+            regs: vec![Origins::new(); GPRS],
+            sp: Frame::Unreached,
+            fp: Frame::Unreached,
+            slots: BTreeMap::new(),
+        }
+    }
+
+    /// Join `from` into `self`, reporting whether `self` grew.
+    fn join(&mut self, from: &PageState) -> bool {
+        if !from.reached {
+            return false;
+        }
+        if !self.reached {
+            *self = from.clone();
+            return true;
+        }
+        let mut grew = join(&mut self.regs, &from.regs);
+        grew |= self.sp.join(from.sp);
+        grew |= self.fp.join(from.fp);
+        // A slot one side has no page in holds something else there.
+        let keys: BTreeSet<i64> = self
+            .slots
+            .keys()
+            .chain(from.slots.keys())
+            .copied()
+            .collect();
+        for key in keys {
+            let slot = self
+                .slots
+                .entry(key)
+                .or_insert_with(|| BTreeSet::from([None]));
+            let before = slot.len();
+            match from.slots.get(&key) {
+                Some(origins) => slot.extend(origins.iter().copied()),
+                None => {
+                    slot.insert(None);
+                }
+            }
+            grew |= slot.len() != before;
+        }
+        grew
+    }
+
+    /// Every page any slot may hold, and `None`: what a load from a slot
+    /// that cannot be placed may bring back.
+    fn any_slot(&self) -> Origins {
+        let mut any: Origins = self.slots.values().flatten().copied().collect();
+        any.insert(None);
+        any
+    }
+
+    /// The slot facts once something may have overwritten any of them: each
+    /// may still hold its page, or may not, so a reload of one is refused if
+    /// it is used as a page.
+    fn clobber_slots(&mut self) {
+        for slot in self.slots.values_mut() {
+            slot.insert(None);
+        }
+    }
+
+    /// Move `sp` to `to`. The slots it leaves behind, below it, are free for
+    /// any callee or signal handler to reuse.
+    fn set_sp(&mut self, to: Frame) {
+        if let Frame::At(at) = to {
+            self.slots.retain(|&slot, _| slot >= at);
+        }
+        self.sp = to;
+    }
+}
+
+/// A load or store whose address is a base register plus an immediate: the
+/// forms through which code spills a register to the stack and reloads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImmAccess {
+    load: bool,
+    /// The base register; 31 is `sp`.
+    base: usize,
+    /// Where the access starts, from the base before any writeback.
+    offset: i64,
+    /// How far writeback moves the base, if the form has it.
+    writeback: Option<i64>,
+    /// The registers transferred, in the order they occupy memory, each
+    /// `len` bytes; register 31 is `xzr`/`wzr` in a general-purpose access.
+    regs: Vec<usize>,
+    len: i64,
+    /// Whether `regs` are general-purpose registers rather than SIMD&FP ones.
+    gpr: bool,
+}
+
+/// The [`ImmAccess`] `word` makes, if it is a single or pair load or store
+/// with an immediate offset. Prefetches, which touch nothing, are an access
+/// of no registers.
+fn imm_access(word: u32) -> Option<ImmAccess> {
+    let field = |lo: u32, bits: u32| (word >> lo) & ((1 << bits) - 1);
+    let signed = |lo: u32, bits: u32| i64::from(((word << (32 - lo - bits)) as i32) >> (32 - bits));
+    let rt = field(0, 5) as usize;
+    let base = field(5, 5) as usize;
+    let simd = word & (1 << 26) != 0;
+
+    // Single register: the unsigned-offset form, and the unscaled, post-,
+    // unprivileged and pre-indexed ones with a signed nine-bit offset.
+    let unsigned = word & 0x3b00_0000 == 0x3900_0000;
+    let imm9 = word & 0x3b20_0000 == 0x3800_0000;
+    if unsigned || imm9 {
+        let size = field(30, 2);
+        let opc = field(22, 2);
+        let scale = if simd && size == 0 && opc & 0b10 != 0 {
+            4
+        } else {
+            size
+        };
+        if simd && scale == size && opc & 0b10 != 0 {
+            // No SIMD&FP access other than the 128-bit one sets opc<1>.
+            return None;
+        }
+        let len = 1i64 << scale;
+        let load = if simd { opc & 1 != 0 } else { opc != 0 };
+        let prfm = !simd && size == 3 && opc == 0b10;
+        let (offset, writeback) = if unsigned {
+            (i64::from(field(10, 12)) << scale, None)
+        } else {
+            let imm = signed(12, 9);
+            match field(10, 2) {
+                0b01 => (0, Some(imm)),
+                0b11 => (imm, Some(imm)),
+                _ => (imm, None),
+            }
+        };
+        return Some(ImmAccess {
+            load,
+            base,
+            offset,
+            writeback,
+            regs: if prfm { Vec::new() } else { vec![rt] },
+            len,
+            gpr: !simd,
+        });
+    }
+
+    // Register pair, with a signed seven-bit offset scaled by the size.
+    if word & 0x3a00_0000 == 0x2800_0000 {
+        let opc = field(30, 2);
+        let load = word & (1 << 22) != 0;
+        let len = match (simd, opc) {
+            (false, 0b00) => 4,
+            // ldpsw; with L clear it is stgp, which stores allocation tags.
+            (false, 0b01) if load => 4,
+            (false, 0b10) => 8,
+            (true, 0b00) => 4,
+            (true, 0b01) => 8,
+            (true, 0b10) => 16,
+            _ => return None,
+        };
+        let imm = signed(15, 7) * len;
+        let (offset, writeback) = match field(23, 2) {
+            0b01 => (0, Some(imm)),
+            0b11 => (imm, Some(imm)),
+            _ => (imm, None),
+        };
+        return Some(ImmAccess {
+            load,
+            base,
+            offset,
+            writeback,
+            regs: vec![rt, field(10, 5) as usize],
+            len,
+            gpr: !simd,
+        });
+    }
+    None
+}
+
+/// The `add`/`sub xd, xn, #imm` that `word` is, as `(d, n, imm)` with `imm`
+/// negative for a `sub`. Register 31 is `sp` in either place.
+fn add_sub_imm(word: u32) -> Option<(usize, usize, i64)> {
+    let sub = match word & 0xff80_0000 {
+        0x9100_0000 => false,
+        0xd100_0000 => true,
+        _ => return None,
+    };
+    let imm = i64::from((word >> 10) & 0xfff) << if word & (1 << 22) != 0 { 12 } else { 0 };
+    Some((
+        (word & 31) as usize,
+        ((word >> 5) & 31) as usize,
+        if sub { -imm } else { imm },
+    ))
+}
+
 /// Opcodes whose first operand is a general-purpose register they write
 /// without reading. Any register operand after it is read.
 fn writes_first_operand(opcode: Opcode) -> bool {
@@ -722,24 +976,232 @@ impl PageFlow {
         Ok(ins)
     }
 
-    /// Run instruction `i` on `regs`: the registers after it. An instruction
-    /// that reads a page in a way this module does not rewrite is an error.
-    fn step(&self, i: usize, regs: &Regs) -> Result<Regs> {
-        let word = self.words[i];
-        let pc = self.pc(i);
+    /// Run instruction `i` on `state`: the state after it. An instruction
+    /// that uses a page in a way this module does not rewrite is an error.
+    fn step(&self, i: usize, state: &PageState) -> Result<PageState> {
+        let mut out = state.clone();
+        out.reached = true;
         let Some(insn) = &self.insns[i] else {
             // Not an instruction, so nothing runs past it.
-            return Ok(regs.clone());
+            return Ok(out);
         };
+        let word = self.words[i];
+        if let Some(access) = imm_access(word) {
+            let frame = match access.base {
+                31 => Some(state.sp),
+                29 if state.fp != Frame::Unknown => Some(state.fp),
+                _ => None,
+            };
+            if let Some(frame) = frame {
+                self.frame_access(i, &access, frame.known(), state, &mut out)?;
+                if access.load && access.regs.contains(&29) && access.gpr {
+                    out.fp = Frame::Unknown;
+                }
+                return Ok(out);
+            }
+        }
+        out.regs = self.step_regs(i, insn, &state.regs)?;
+        self.track_frame(insn, word, state, &mut out);
+        Ok(out)
+    }
+
+    /// Run the load or store `access` at word `i`, whose base is `sp` or the
+    /// frame pointer, at `frame` from the entry `sp` if known, writing what
+    /// it changes into `out`.
+    ///
+    /// A 64-bit store of a page-holding register puts the page in the slot,
+    /// and a 64-bit load of exactly that slot takes it back out. Anything
+    /// else that touches the slot is refused while it may hold a page, and a
+    /// store overwrites it. A slot that cannot be placed because the base
+    /// has moved by an amount not followed may be any of them: storing a page
+    /// there is refused, storing anything else may overwrite each of them,
+    /// and loading from there may bring back any of them.
+    fn frame_access(
+        &self,
+        i: usize,
+        access: &ImmAccess,
+        frame: Option<i64>,
+        state: &PageState,
+        out: &mut PageState,
+    ) -> Result<()> {
+        let word = self.words[i];
+        let pc = self.pc(i);
+        let base = if access.base == 31 {
+            "sp".to_string()
+        } else {
+            format!("x{}", access.base)
+        };
+        let page_in = |r: usize| access.gpr && r < GPRS && holds_page(&state.regs[r]);
+        let Some(frame) = frame else {
+            if access.load {
+                for &r in access.regs.iter().filter(|&&r| access.gpr && r < GPRS) {
+                    out.regs[r] = if state.slots.is_empty() {
+                        BTreeSet::from([None])
+                    } else {
+                        state.any_slot()
+                    };
+                }
+            } else if let Some(&r) = access.regs.iter().find(|&&r| page_in(r)) {
+                bail!(
+                    "0x{word:08x} at 0x{pc:x} stores x{r}, which holds the page of the adrp at \
+                     {}, to the stack through {base}, which has moved by an amount solder does \
+                     not follow",
+                    self.describe(&state.regs[r])
+                );
+            } else {
+                out.clobber_slots();
+            }
+            return Ok(());
+        };
+
+        let start = frame + access.offset;
+        for (k, &r) in access.regs.iter().enumerate() {
+            let at = start + k as i64 * access.len;
+            let overlapping: Vec<i64> = state
+                .slots
+                .range(at - 7..at + access.len)
+                .map(|(&slot, _)| slot)
+                .collect();
+            if access.load {
+                let value = match overlapping[..] {
+                    [] => BTreeSet::from([None]),
+                    [slot] if slot == at && access.len == 8 && access.gpr => {
+                        state.slots[&slot].clone()
+                    }
+                    [slot, ..] => bail!(
+                        "0x{word:08x} at 0x{pc:x} loads from the stack slot at {base}{:+}, which \
+                         holds the page of the adrp at {}, other than as the whole 64-bit page; \
+                         solder can only follow a page reloaded into the register it was \
+                         spilled from",
+                        slot - frame,
+                        self.describe(&state.slots[&slot])
+                    ),
+                };
+                if access.gpr && r < GPRS {
+                    out.regs[r] = value;
+                }
+            } else {
+                for slot in overlapping {
+                    out.slots.remove(&slot);
+                }
+                if page_in(r) {
+                    if access.len != 8 {
+                        return Err(self.refuse(i, &state.regs, r, "stores part of"));
+                    }
+                    out.slots.insert(at, state.regs[r].clone());
+                }
+            }
+        }
+
+        if let Some(by) = access.writeback {
+            let moved = Frame::At(frame + by);
+            if access.base == 31 {
+                out.set_sp(moved);
+            } else {
+                out.fp = moved;
+            }
+        }
+        Ok(())
+    }
+
+    /// Follow what instruction `insn` (word `word`), which is not a load or
+    /// store [`PageFlow::frame_access`] ran, does to `sp`, the frame pointer
+    /// and the stack slots, from `state` into `out`.
+    fn track_frame(&self, insn: &Instruction, word: u32, state: &PageState, out: &mut PageState) {
+        let frame_of = |r: usize| match r {
+            31 => state.sp,
+            29 => state.fp,
+            _ => Frame::Unknown,
+        };
+        let add_sub = add_sub_imm(word);
+        // `add`/`sub` of an immediate to `sp` or the frame pointer, and the
+        // `mov`s between the two, which are `add #0`.
+        let moved = |n: usize, by: i64| match frame_of(n) {
+            Frame::At(at) => Frame::At(at + by),
+            Frame::Unreached => Frame::Unreached,
+            Frame::Unknown => Frame::Unknown,
+        };
+        let writes = |r: usize| {
+            insn.operands.iter().enumerate().any(|(k, operand)| {
+                let written = (k == 0 && writes_first_operand(insn.opcode))
+                    || (k == 1 && writes_second_operand(insn.opcode));
+                match *operand {
+                    Operand::RegPreIndex(b, _, true)
+                    | Operand::RegPostIndex(b, _)
+                    | Operand::RegPostIndexReg(b, _) => b as usize == r,
+                    // Register 31 is `sp` only where the operand says so,
+                    // and `xzr` everywhere else.
+                    Operand::RegisterOrSP(_, d) => written && d as usize == r,
+                    Operand::Register(_, d) => written && r < GPRS && d as usize == r,
+                    Operand::RegisterPair(_, d) => {
+                        written && (d as usize == r || d as usize + 1 == r)
+                    }
+                    _ => false,
+                }
+            })
+        };
+
+        match add_sub {
+            Some((31, n, by)) => out.set_sp(moved(n, by)),
+            Some((29, n @ (29 | 31), by)) => out.fp = moved(n, by),
+            _ => {
+                if writes(31) {
+                    out.set_sp(Frame::Unknown);
+                }
+                if writes(29) {
+                    out.fp = Frame::Unknown;
+                }
+            }
+        }
+
+        // A load or store through `sp` or the frame pointer in some other
+        // form, with a register index, an atomic, an exclusive: a store may
+        // land on any slot. Compilers spill and reload through the immediate
+        // forms only, so a load this way is not a reload.
+        let through_frame = insn.operands.iter().any(|operand| match *operand {
+            Operand::RegPreIndex(b, ..)
+            | Operand::RegPostIndex(b, _)
+            | Operand::RegRegOffset(b, ..)
+            | Operand::RegPostIndexReg(b, _) => b == 31 || (b == 29 && state.fp != Frame::Unknown),
+            _ => false,
+        });
+        let plain_load = writes_first_operand(insn.opcode)
+            && !matches!(
+                insn.opcode,
+                Opcode::STXR
+                    | Opcode::STXRB
+                    | Opcode::STXRH
+                    | Opcode::STLXR
+                    | Opcode::STLXRB
+                    | Opcode::STLXRH
+                    | Opcode::STXP
+                    | Opcode::STLXP
+            );
+        if through_frame && !plain_load {
+            out.clobber_slots();
+        }
+    }
+
+    /// The error for instruction `i` using `r`, which holds a page in `regs`,
+    /// in a way only described by `what`.
+    fn refuse(&self, i: usize, regs: &Regs, r: usize, what: &str) -> anyhow::Error {
+        anyhow!(
+            "0x{:08x} at 0x{:x} {what} x{r}, which holds the page of the adrp at {}; solder can \
+             only follow an adrp page into the :lo12: add, load or store that completes it, or \
+             into a stack slot and back",
+            self.words[i],
+            self.pc(i),
+            self.describe(&regs[r])
+        )
+    }
+
+    /// Run instruction `insn`, word `i`, on `regs`: the registers after it.
+    /// An instruction that reads a page in a way this module does not rewrite
+    /// is an error.
+    fn step_regs(&self, i: usize, insn: &Instruction, regs: &Regs) -> Result<Regs> {
+        let word = self.words[i];
         let mut out = regs.clone();
-        let refuse = |r: usize, what: &str| {
-            anyhow!(
-                "0x{word:08x} at 0x{pc:x} {what} x{r}, which holds the page of the adrp at {}; \
-                 solder can only follow an adrp page into the :lo12: add, load or store that \
-                 completes it",
-                self.describe(&regs[r])
-            )
-        };
+        let refuse = |r: usize, what: &str| self.refuse(i, regs, r, what);
 
         if Field::AdrpPage.fits(word) {
             out[(word & 31) as usize] = BTreeSet::from([Some(i)]);
@@ -995,16 +1457,26 @@ fn is_call(opcode: Opcode) -> bool {
 /// loops, until it is overwritten; an `add #imm` or unsigned-offset load or
 /// store that takes it as the base is the other half of the pair. A 64-bit
 /// `mov` carries the page to its destination, and a call does not end it
-/// (see the call in `PageFlow::step`). Code only a jump table reaches is
+/// (see the call in `PageFlow::step_regs`). Code only a jump table reaches is
 /// followed too; see `PageFlow::solve`.
 ///
+/// A page GCC spills to the stack under register pressure is followed there
+/// and back. `sp`, and `x29` once it is set from `sp`, are tracked as
+/// offsets from the `sp` the function was entered with, so a 64-bit store
+/// of a page through either with an immediate offset (`str`, `stur`, `stp`,
+/// writeback included) puts it in a slot, and a 64-bit load of that slot
+/// takes it back out; see `PageFlow::frame_access`. A callee, or a store
+/// through any other pointer, is taken to leave the slot alone: a spill
+/// slot is not an object the program can name.
+///
 /// Anything this cannot account for is an error, not a guess: a page that is
-/// stored (spilled to the stack included), compared, truncated, or used any
-/// other way than as a `:lo12:` base or `mov` source; a base that holds a
-/// page on some paths and not on others, or the pages of two `adrp`s that
-/// disagree; and a `:lo12:` offset of 4 KiB or more. A merge that moves the
-/// code with such a reference in it would leave it pointing at the wrong
-/// address.
+/// stored anywhere but such a slot, compared, truncated, or used any other
+/// way than as a `:lo12:` base or `mov` source; a slot read other than as
+/// the whole page, or that cannot be told apart from its neighbours because
+/// `sp` moved by a register; a base that holds a page on some paths and not
+/// on others, or the pages of two `adrp`s that disagree; and a `:lo12:`
+/// offset of 4 KiB or more. A merge that moves the code with such a
+/// reference in it would leave it pointing at the wrong address.
 pub fn pair_lo12_refs(bytes: &[u8], vaddr: u64) -> Result<Vec<Lo12Ref>> {
     let flow = PageFlow::new(bytes, vaddr);
     let context = |i: usize| {
@@ -1016,15 +1488,15 @@ pub fn pair_lo12_refs(bytes: &[u8], vaddr: u64) -> Result<Vec<Lo12Ref>> {
 
     // On entry no register holds a page this function's adrps took.
     let ins = flow.solve(
-        vec![BTreeSet::from([None]); GPRS],
-        vec![Origins::new(); GPRS],
-        |i, regs| flow.step(i, regs).with_context(|| context(i)),
-        |_, into, from| join(into, from),
+        PageState::entry(),
+        PageState::unreached(),
+        |i, state| flow.step(i, state).with_context(|| context(i)),
+        |_, into, from| into.join(from),
     )?;
 
     let mut pairs = Vec::new();
-    for (i, regs) in ins.iter().enumerate() {
-        let (Some(regs), Some(form)) = (regs, lo12_form(flow.words[i])) else {
+    for (i, state) in ins.iter().enumerate() {
+        let (Some(PageState { regs, .. }), Some(form)) = (state, lo12_form(flow.words[i])) else {
             continue;
         };
         if flow.insns[i].is_none() || !holds_page(&regs[form.base]) {
@@ -2184,6 +2656,193 @@ mod tests {
         .unwrap();
         // The second case overwrote x19 before its load.
         assert_eq!(pairs, [lo12(0x08, &[0x00], 0x41_4020)]);
+    }
+
+    const STR_X0_SP_24: u32 = 0xf900_0fe0; // str x0, [sp, #24]
+    const LDR_X0_SP_24: u32 = 0xf940_0fe0; // ldr x0, [sp, #24]
+
+    /// GCC's spill of a page across calls, as in libcrypto's
+    /// `CMS_add1_signer`: stored to the stack, reloaded, then completed.
+    /// Through `sp`, through the frame pointer `mov x29, sp` sets up (one
+    /// slot, reached both ways), and as one half of a pair, with the frame
+    /// set up and torn down around it.
+    #[test]
+    fn a_page_spilled_to_the_stack_is_paired_where_it_is_reloaded() {
+        let pairs = pair_lo12_refs(
+            &code(&[
+                0xa9bd_7bfd,  // 0x00  stp  x29, x30, [sp, #-48]!
+                0x9100_03fd,  // 0x04  mov  x29, sp
+                0xd100_83ff,  // 0x08  sub  sp, sp, #0x20
+                ADRP_X0,      // 0x0c  adrp x0, 0x410000
+                STR_X0_SP_24, // 0x10  str  x0, [sp, #24]
+                0xf81f_83a0,  // 0x14  stur x0, [x29, #-8]
+                0xa900_87e0,  // 0x18  stp  x0, x1, [sp, #8]
+                0x9400_0000,  // 0x1c  bl   .
+                LDR_X0_SP_24, // 0x20  ldr  x0, [sp, #24]
+                0x913f_c001,  // 0x24  add  x1, x0, #0xff0
+                0xf85f_83a2,  // 0x28  ldur x2, [x29, #-8]
+                0xf940_0443,  // 0x2c  ldr  x3, [x2, #8]
+                0xa940_97e4,  // 0x30  ldp  x4, x5, [sp, #8]
+                0x913f_c084,  // 0x34  add  x4, x4, #0xff0
+                0x9100_83ff,  // 0x38  add  sp, sp, #0x20
+                0xa8c3_7bfd,  // 0x3c  ldp  x29, x30, [sp], #48
+                RET,
+            ]),
+            BASE,
+        )
+        .unwrap();
+        assert_eq!(
+            pairs,
+            [
+                lo12(0x24, &[0x0c], 0x41_0ff0),
+                lo12(0x2c, &[0x0c], 0x41_0008),
+                lo12(0x34, &[0x0c], 0x41_0ff0),
+            ]
+        );
+    }
+
+    /// A page taken back out of its slot any other way than whole, into a
+    /// 64-bit general-purpose register, or put there only in part, is not
+    /// one a `:lo12:` can be followed from.
+    #[test]
+    fn a_spilled_page_reloaded_or_spilled_in_part_is_refused() {
+        for (use_, what) in [
+            (0xb940_1be0, "loads from the stack slot at sp+24"), // ldr w0, [sp, #24]
+            (0xfd40_0fe0, "loads from the stack slot at sp+24"), // ldr d0, [sp, #24]
+            (0xf841_43e1, "loads from the stack slot at sp+24"), // ldur x1, [sp, #20]
+            (0xb900_1be0, "stores part of x0"),                  // str w0, [sp, #24]
+        ] {
+            let err = pairing_error(&[ADRP_X0, STR_X0_SP_24, use_, RET]);
+            assert!(err.contains(what), "{use_:08x}: {err}");
+            assert!(err.contains("adrp at 0x400000"), "{use_:08x}: {err}");
+        }
+    }
+
+    /// A slot overwritten, even in part, or left behind below `sp`, no longer
+    /// holds the page: what is reloaded from it is not completed.
+    #[test]
+    fn a_spilled_page_overwritten_or_popped_is_dropped() {
+        for words in [
+            // str xzr, [sp, #24]
+            &[
+                ADRP_X0,
+                STR_X0_SP_24,
+                0xf900_0fff,
+                LDR_X0_SP_24,
+                ADD_X0_LO12,
+                RET,
+            ][..],
+            // str w1, [sp, #24]
+            &[
+                ADRP_X0,
+                STR_X0_SP_24,
+                0xb900_1be1,
+                LDR_X0_SP_24,
+                ADD_X0_LO12,
+                RET,
+            ],
+            // sub sp, sp, #0x20 ... add sp, sp, #0x20; sub sp, sp, #0x20
+            &[
+                ADRP_X0,
+                0xd100_83ff,
+                STR_X0_SP_24,
+                0x9100_83ff,
+                0xd100_83ff,
+                LDR_X0_SP_24,
+                ADD_X0_LO12,
+                RET,
+            ],
+        ] {
+            assert_eq!(
+                pair_lo12_refs(&code(words), BASE).unwrap(),
+                [],
+                "{words:08x?}"
+            );
+        }
+    }
+
+    /// Where the slot a page was spilled to cannot be told apart from the
+    /// ones around it, a reload from it may or may not be the page, and
+    /// completing it is refused rather than guessed.
+    #[test]
+    fn a_spilled_page_that_cannot_be_placed_is_refused() {
+        const SUB_SP_X1: u32 = 0xcb21_63ff; // sub sp, sp, x1
+        let err = pairing_error(&[ADRP_X0, SUB_SP_X1, STR_X0_SP_24, RET]);
+        assert!(err.contains("has moved by an amount"), "{err}");
+
+        for words in [
+            // The slot holds the page down one path only.
+            &[
+                0xb400_0062,
+                ADRP_X0,
+                STR_X0_SP_24,
+                LDR_X0_SP_24,
+                ADD_X0_LO12,
+                RET,
+            ][..],
+            // Reloaded after `sp` moved by a register.
+            &[
+                ADRP_X0,
+                STR_X0_SP_24,
+                SUB_SP_X1,
+                LDR_X0_SP_24,
+                ADD_X0_LO12,
+                RET,
+            ],
+            // A store with a register index may have landed on it.
+            &[
+                ADRP_X0,
+                STR_X0_SP_24,
+                0xf821_6be2, // str x2, [sp, x1]
+                LDR_X0_SP_24,
+                ADD_X0_LO12,
+                RET,
+            ],
+        ] {
+            let err = format!("{:#}", pair_lo12_refs(&code(words), BASE).unwrap_err());
+            assert!(
+                err.contains("both with and without a page in x0"),
+                "{words:08x?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn immediate_loads_and_stores_are_decoded_with_their_slots() {
+        let access = |load, base, offset, writeback, regs: &[usize], len, gpr| ImmAccess {
+            load,
+            base,
+            offset,
+            writeback,
+            regs: regs.to_vec(),
+            len,
+            gpr,
+        };
+        for (word, expected) in [
+            (STR_X0_SP_24, access(false, 31, 24, None, &[0], 8, true)),
+            (0xf85f_83a2, access(true, 29, -8, None, &[2], 8, true)), // ldur x2, [x29, #-8]
+            (
+                0xa9bd_7bfd,
+                access(false, 31, -48, Some(-48), &[29, 30], 8, true),
+            ), // stp x29, x30, [sp, #-48]!
+            (
+                0xa8c3_7bfd,
+                access(true, 31, 0, Some(48), &[29, 30], 8, true),
+            ), // ldp x29, x30, [sp], #48
+            (0xb940_1be0, access(true, 31, 24, None, &[0], 4, true)), // ldr w0, [sp, #24]
+            (0x3d80_0425, access(false, 1, 16, None, &[5], 16, false)), // str q5, [x1, #16]
+            (0xad7f_07e0, access(true, 31, -32, None, &[0, 1], 16, false)), // ldp q0, q1, [sp, #-32]
+            (0xf842_8401, access(true, 0, 0, Some(40), &[1], 8, true)),     // ldr x1, [x0], #40
+        ] {
+            assert_eq!(imm_access(word), Some(expected), "{word:08x}");
+        }
+        for word in [
+            0xf821_6be2, // str x2, [sp, x1]
+            0x913f_c001, // add x1, x0, #0xff0
+            0xc85f_7c20, // ldxr x0, [x1]
+        ] {
+            assert_eq!(imm_access(word), None, "{word:08x}");
+        }
     }
 
     /// The `.plt` of a shared library GCC built and GNU ld 2.46 linked with no
