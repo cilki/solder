@@ -31,3 +31,11 @@ cc -O2 -fPIC -fno-section-anchors -c libtls.c
 cc -O2 -fPIC -fno-section-anchors -mtls-dialect=trad -c libtls-trad.c
 cc -shared -Wl,-soname,libtls.so.1 -o libtls.so.1 libtls.o libtls-trad.o
 ```
+
+`libanchors.so.1` is built with GCC's default section anchors left on, so
+that one function reaches several static objects as offsets from the first,
+from `libanchors.c`:
+
+```sh
+cc -O2 -fPIC -shared -Wl,-soname,libanchors.so.1 -o libanchors.so.1 libanchors.c
+```

@@ -101,6 +101,9 @@ pub static X86_64: Arch = {
             plt_stub_slot,
             veneer_short_branches,
         },
+        // GCC has no section anchors for x86-64: each static object is
+        // reached through a RIP-relative displacement of its own.
+        anchored_data: false,
     }
 };
 
@@ -322,6 +325,7 @@ fn scan_rip_relative_refs(instrs: &[Instruction], bytes: &[u8], base_vaddr: u64)
                                 word,
                                 addend: -(word.width() as i64),
                             },
+                            reaches: Vec::new(),
                         });
                     }
                 }
@@ -356,6 +360,7 @@ fn scan_rip_relative_refs(instrs: &[Instruction], bytes: &[u8], base_vaddr: u64)
                                     word: Word::Pc32,
                                     addend: -((instr.len() - pos) as i64),
                                 },
+                                reaches: Vec::new(),
                             });
                         }
                         break; // Only one memory operand per instruction
