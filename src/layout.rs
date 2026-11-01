@@ -7,9 +7,9 @@ use tracing::{debug, trace};
 use crate::elf_reader::{merged_load_address, va_to_file_offset};
 use crate::tls::TlsBlock;
 use crate::types::{
-    AssignedUnit, ExtractedUnit, GotPatch, InitFiniArrays, InitFiniKind, InitFiniPlan, MergePlan,
-    MergedArray, NewExternalSym, RelocTarget, SectionKind, TlsPlan, TlsReloc, TlsSlotFixup,
-    TrampolineStub,
+    AssignedUnit, ExtractedUnit, GotPatch, GotSlotImport, InitFiniArrays, InitFiniKind,
+    InitFiniPlan, MergePlan, MergedArray, RelocTarget, SectionKind, TlsPlan, TlsReloc,
+    TlsSlotFixup, TrampolineStub,
 };
 
 /// Plan the virtual address layout of all extracted units and trampolines,
@@ -148,15 +148,21 @@ pub fn plan_layout(
     units.extend(assign_addresses(load_address, &mut offset, data));
 
     // Fresh GOT slots for the externals the executable does not already
-    // import, plus the NewExternalSym records the writer turns into .dynsym
-    // entries and GLOB_DAT relocations.
-    let mut new_externals: Vec<NewExternalSym> = Vec::with_capacity(pending_got_slots.len());
+    // import, which the writer turns into GLOB_DAT relocations like any other
+    // slot the loader fills. The copied GOT slots join them below, once their
+    // units have addresses.
+    let mut got_imports: Vec<GotSlotImport> =
+        Vec::with_capacity(pending_got_slots.len() + got_slot_fixups.len());
     for (stub_idx, name) in pending_got_slots {
         offset = align_up(offset, 8);
         let got_vaddr = load_address + offset;
         offset += 8;
         trampoline_stubs[stub_idx].target_got_vaddr = got_vaddr;
-        new_externals.push(NewExternalSym { name, got_vaddr });
+        got_imports.push(GotSlotImport {
+            got_vaddr,
+            name,
+            weak: false,
+        });
     }
 
     // Map (library, unit name) → assigned VA. The library is part of the key
@@ -222,7 +228,6 @@ pub fn plan_layout(
         .iter()
         .map(|au| (au.unit.id, au.assigned_vaddr))
         .collect();
-    let mut got_imports = Vec::with_capacity(got_slot_fixups.len());
     for fixup in got_slot_fixups {
         let base = unit_vaddr_by_id.get(&fixup.unit).with_context(|| {
             format!(
@@ -230,7 +235,7 @@ pub fn plan_layout(
                 fixup.name, fixup.unit.0
             )
         })?;
-        got_imports.push(crate::types::GotSlotImport {
+        got_imports.push(GotSlotImport {
             got_vaddr: base + fixup.offset,
             name: fixup.name,
             weak: fixup.weak,
@@ -268,7 +273,6 @@ pub fn plan_layout(
         remove_needed: Vec::new(),
         add_needed: Vec::new(),
         relative_relocs: Vec::new(),
-        new_externals,
         got_imports,
         init_fini: init_fini_plan,
         tls,
@@ -594,7 +598,7 @@ pub fn relro_downgrade(
     // The loader resolves a GOT slot whether or not the executable is PIE; the
     // array entries and the pointers inside merged data are link-time
     // addresses, which it only has to rebase when the image moves.
-    let mut loader_written = plan.new_externals.len() + plan.got_imports.len();
+    let mut loader_written = plan.got_imports.len();
     if plan.is_pie {
         loader_written += arrays()
             .map(|(_, array)| array.entries.len())
@@ -823,8 +827,8 @@ mod tests {
             );
         }
 
-        assert_eq!(plan.new_externals.len(), 1, "{:?}", plan.new_externals);
-        let ext = &plan.new_externals[0];
+        assert_eq!(plan.got_imports.len(), 1, "{:?}", plan.got_imports);
+        let ext = &plan.got_imports[0];
         assert_eq!(ext.name, "solder_absent_symbol");
         assert!(
             ext.got_vaddr >= rodata_end && ext.got_vaddr + 8 <= writable_end,
@@ -949,7 +953,7 @@ mod tests {
         );
         // `memcpy` reuses test/grep's own GOT slot, so only the made-up symbol
         // needs a slot of the merge's own.
-        assert_eq!(plan.new_externals.len(), 1, "{:?}", plan.new_externals);
+        assert_eq!(plan.got_imports.len(), 1, "{:?}", plan.got_imports);
 
         let downgrade = with_grep(|exe| relro_downgrade(exe, &plan)).expect("a report");
         assert_eq!(downgrade.loader_written, 2, "{downgrade:?}");

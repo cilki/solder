@@ -651,14 +651,9 @@ fn check_runtime_writes_are_writable(plan: &MergePlan) -> Result<()> {
         .iter()
         .map(|r| ("R_X86_64_RELATIVE target", r.vaddr, String::new()))
         .chain(
-            plan.new_externals
-                .iter()
-                .map(|e| ("GOT slot", e.got_vaddr, format!(" for '{}'", e.name))),
-        )
-        .chain(
             plan.got_imports
                 .iter()
-                .map(|g| ("copied GOT slot", g.got_vaddr, format!(" for '{}'", g.name))),
+                .map(|g| ("GOT slot", g.got_vaddr, format!(" for '{}'", g.name))),
         )
         .chain(
             plan.tls
@@ -773,8 +768,8 @@ const ST_INFO_GLOBAL_FUNC: u8 = (1 << 4) | 2;
 const ST_INFO_WEAK_FUNC: u8 = (2 << 4) | 2;
 
 /// Build the merged segment with any extended sections appended. The result
-/// always covers the existing PIE-rela extension; when `plan.new_externals` is
-/// non-empty it also rebuilds `.dynstr`, `.dynsym`, and `.gnu.version` (placed
+/// always covers the existing PIE-rela extension; when `plan.got_imports` names
+/// a symbol the executable's `.dynsym` lacks it also rebuilds `.dynstr`, `.dynsym`, and `.gnu.version` (placed
 /// in the merged segment) and stitches new GLOB_DAT relocs into the rebuilt
 /// `.rela.dyn`.
 ///
@@ -808,12 +803,12 @@ fn build_extended_segment(
     // Existing .dynsym name → index, for GLOB_DATs against already-present symbols.
     let mut existing_sym_idx: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    // Symbols to inject: (name, weak). new_externals first (strong), then any
-    // got_imports whose symbol is in neither the exe's .dynsym nor this list.
+    // Symbols to inject: (name, weak), one per got_imports symbol in neither
+    // the exe's .dynsym nor this list. The first slot for a name decides its
+    // binding, and layout lists the trampolines' strong slots first.
     let mut injects: Vec<(String, bool)> = Vec::new();
 
-    if !plan.new_externals.is_empty() || !plan.got_imports.is_empty() || !plan.add_needed.is_empty()
-    {
+    if !plan.got_imports.is_empty() || !plan.add_needed.is_empty() {
         let (old_dynstr, old_dynsym, old_versym) = read_dynsym_tables(patched_exe, exe, dynamic)?;
         let old_num_syms = old_dynsym.len() / SYM_ENTRY_SIZE;
         new_sym_idx_base = old_num_syms;
@@ -824,9 +819,6 @@ fn build_extended_segment(
             }
         }
 
-        for ext in &plan.new_externals {
-            injects.push((ext.name.clone(), false));
-        }
         for gi in &plan.got_imports {
             if !existing_sym_idx.contains_key(&gi.name)
                 && !injects.iter().any(|(n, _)| n == &gi.name)
@@ -910,11 +902,7 @@ fn build_extended_segment(
     // ---- 2. Rebuild .rela.dyn (always when there's anything new to write).
 
     let tls_relocs = plan.tls.as_ref().map_or(&[][..], |tls| &tls.relocs);
-    let need_new_rela = !plan.relative_relocs.is_empty()
-        || !plan.new_externals.is_empty()
-        || !plan.got_imports.is_empty()
-        || !tls_relocs.is_empty();
-    if need_new_rela {
+    if !plan.relative_relocs.is_empty() || !plan.got_imports.is_empty() || !tls_relocs.is_empty() {
         let (existing_relative, existing_non_relative, old_relacount) =
             read_existing_rela_dyn(patched_exe, exe, dynamic)?;
 
@@ -928,25 +916,16 @@ fn build_extended_segment(
             new_relative.extend_from_slice(&entry);
         }
 
-        // New GLOB_DAT entries: one per freshly injected external's GOT slot,
-        // plus one per copied GOT slot that ld.so must re-resolve. r_info packs
-        // the symbol index and the relocation type.
-        let glob_dat_slots = plan
-            .new_externals
-            .iter()
-            .map(|ext| (ext.got_vaddr, ext.name.as_str()))
-            .chain(
-                plan.got_imports
-                    .iter()
-                    .map(|gi| (gi.got_vaddr, gi.name.as_str())),
-            );
+        // New GLOB_DAT entries: one per GOT slot in the merged segment that
+        // ld.so must resolve. r_info packs the symbol index and the relocation
+        // type.
         let mut new_glob_dat = Vec::new();
-        for (got_vaddr, name) in glob_dat_slots {
-            let sym_idx = sym_index_of(name)
-                .with_context(|| format!("no .dynsym index for GLOB_DAT symbol '{name}'"))?;
+        for gi in &plan.got_imports {
+            let sym_idx = sym_index_of(&gi.name)
+                .with_context(|| format!("no .dynsym index for GLOB_DAT symbol '{}'", gi.name))?;
             let r_info: u64 = ((sym_idx as u64) << 32) | u64::from(plan.arch.reloc.glob_dat);
             let mut entry = [0u8; RELA_ENTRY_SIZE];
-            entry[0..8].copy_from_slice(&got_vaddr.to_le_bytes());
+            entry[0..8].copy_from_slice(&gi.got_vaddr.to_le_bytes());
             entry[8..16].copy_from_slice(&r_info.to_le_bytes());
             // r_addend stays zero
             new_glob_dat.extend_from_slice(&entry);
@@ -1141,7 +1120,7 @@ fn update_dynamic_entries(
 #[cfg(test)]
 mod runtime_write_tests {
     use super::*;
-    use crate::types::{GotSlotImport, NewExternalSym};
+    use crate::types::GotSlotImport;
 
     const LOAD: u64 = 0x10_0000;
     const EXEC_END: u64 = LOAD + 0x1000;
@@ -1166,7 +1145,6 @@ mod runtime_write_tests {
             remove_needed: Vec::new(),
             add_needed: Vec::new(),
             relative_relocs: Vec::new(),
-            new_externals: Vec::new(),
             got_imports: Vec::new(),
             init_fini: None,
             tls: None,
@@ -1206,9 +1184,10 @@ mod runtime_write_tests {
     #[test]
     fn a_got_slot_among_the_code_is_rejected() {
         let mut plan = plan();
-        plan.new_externals.push(NewExternalSym {
-            name: "solder_absent_symbol".to_owned(),
+        plan.got_imports.push(GotSlotImport {
             got_vaddr: EXEC_END - 8,
+            name: "solder_absent_symbol".to_owned(),
+            weak: false,
         });
         let err = check_runtime_writes_are_writable(&plan)
             .expect_err("ld.so would fault writing an executable page");
@@ -1264,7 +1243,6 @@ mod trampoline_tests {
             remove_needed: Vec::new(),
             add_needed: Vec::new(),
             relative_relocs: Vec::new(),
-            new_externals: Vec::new(),
             got_imports: Vec::new(),
             init_fini: None,
             tls: None,
