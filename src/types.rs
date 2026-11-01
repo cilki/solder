@@ -239,10 +239,8 @@ pub struct TlsReloc {
 pub struct TlsPlan {
     /// Where the template is; its `p_vaddr`.
     pub vaddr: u64,
-    /// The initialized part of the template, `p_filesz` bytes.
-    pub image: Vec<u8>,
-    pub memsz: u64,
-    pub align: u64,
+    /// The merged block; its image is the template's `p_filesz` bytes.
+    pub block: crate::tls::TlsBlock,
     /// One per copied TLS slot.
     pub relocs: Vec<TlsReloc>,
 }

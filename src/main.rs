@@ -415,34 +415,21 @@ fn refuse_tls_imports_from_removed(
     merged_lib_syms: &HashMap<String, std::path::PathBuf>,
     removed: &HashSet<&std::path::Path>,
 ) -> Result<()> {
-    use object::{Object, ObjectSymbol, ObjectSymbolTable};
-    let Some(dynsym) = exe_elf.dynamic_symbol_table() else {
-        return Ok(());
-    };
-    for (vaddr, reloc) in exe_elf.dynamic_relocations().into_iter().flatten() {
-        let object::RelocationFlags::Elf { r_type } = reloc.flags() else {
+    for reloc in tls::exe_tls_relocs(exe_elf, arch) {
+        let Some(sym_name) = reloc.import else {
             continue;
         };
-        let Some((name, _)) = arch.tls.slot(r_type.0) else {
-            continue;
-        };
-        let object::RelocationTarget::Symbol(si) = reloc.target() else {
-            continue;
-        };
-        let Ok(sym) = dynsym.symbol_by_index(si) else {
-            continue;
-        };
-        let Ok(sym_name) = sym.name() else { continue };
         if let Some(lib) = merged_lib_syms.get(sym_name)
-            && sym.is_undefined()
             && removed.contains(lib.as_path())
         {
             anyhow::bail!(
                 "the executable reaches '{sym_name}', a thread-local variable of {}, \
-                 itself ({name} at {vaddr:#x}); merging that library would leave nothing \
+                 itself ({} at {:#x}); merging that library would leave nothing \
                  defining it, and solder does not rewrite the executable's own TLS \
                  relocations yet",
-                lib.display()
+                lib.display(),
+                reloc.name,
+                reloc.vaddr
             );
         }
     }

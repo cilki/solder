@@ -198,9 +198,8 @@ struct ExtractionState {
     /// Copied GOT slots the loader fills from a TLS relocation (see
     /// `TlsSlotFixup`).
     tls_slot_fixups: Vec<TlsSlotFixup>,
-    /// Each library's `PT_TLS`, read the first time one of its TLS slots is
-    /// copied; `None` for a library that has none.
-    tls_blocks: FastMap<LibId, Option<Rc<TlsBlock>>>,
+    /// The `PT_TLS` of each library one of whose TLS slots was copied.
+    tls_blocks: FastMap<LibId, TlsBlock>,
     /// Every library extraction has touched, in the order it first saw them;
     /// a [`LibId`] is a position in here (see [`ExtractionState::lib_id`]).
     lib_paths: Vec<Rc<Path>>,
@@ -425,14 +424,19 @@ impl ExtractionState {
         relocs.relocations
     }
 
-    /// The `PT_TLS` of `lib`, read on first use.
-    fn tls_block(&mut self, lib: Lib<'_, '_>) -> Result<Option<Rc<TlsBlock>>> {
+    /// The size of `lib`'s `PT_TLS` block, which is read and kept for the
+    /// merge the first time one of its TLS slots is copied; `None` for a
+    /// library that has none.
+    fn tls_block_memsz(&mut self, lib: Lib<'_, '_>) -> Result<Option<u64>> {
         if let Some(block) = self.tls_blocks.get(&lib.id) {
-            return Ok(block.clone());
+            return Ok(Some(block.memsz));
         }
-        let block = TlsBlock::of(lib.elf, &lib.path.display().to_string())?.map(Rc::new);
-        self.tls_blocks.insert(lib.id, block.clone());
-        Ok(block)
+        let Some(block) = TlsBlock::of(lib.elf, &lib.path.display().to_string())? else {
+            return Ok(None);
+        };
+        let memsz = block.memsz;
+        self.tls_blocks.insert(lib.id, block);
+        Ok(Some(memsz))
     }
 }
 
@@ -569,18 +573,12 @@ pub fn extract_units(
     // section can give back the run below the first byte anything references.
     trim_unreferenced_prefixes(&mut state);
 
-    // Only a library whose TLS slots were copied has a block worth merging:
-    // nothing merged can reach the variables of any other.
-    let tls_blocks = state
-        .tls_blocks
-        .iter()
-        .filter_map(|(&lib, block)| {
-            Some((
-                state.lib_path(lib).to_path_buf(),
-                (**block.as_ref()?).clone(),
-            ))
-        })
-        .filter(|(path, _)| state.tls_slot_fixups.iter().any(|f| &f.lib == path))
+    // A block is only read for a TLS slot being copied, and a slot that could
+    // not be is the end of the extraction, so these are exactly the libraries
+    // a copied slot reaches into.
+    let tls_blocks = std::mem::take(&mut state.tls_blocks)
+        .into_iter()
+        .map(|(lib, block)| (state.lib_path(lib).to_path_buf(), block))
         .collect();
 
     Ok(Extraction {
@@ -771,7 +769,7 @@ fn tls_fixup(
     offset: u64,
     state: &mut ExtractionState,
 ) -> Result<TlsFixup> {
-    let Some(block) = state.tls_block(lib)? else {
+    let Some(memsz) = state.tls_block_memsz(lib)? else {
         bail!(
             "'{ctx}' in {}: {name} reaches thread-local storage, but the library has no \
              PT_TLS segment",
@@ -816,7 +814,7 @@ fn tls_fixup(
         TlsSlot::Module => 0,
         _ => base
             .checked_add_signed(reloc.addend)
-            .filter(|&o| o <= block.memsz)
+            .filter(|&o| o <= memsz)
             .with_context(|| {
                 format!(
                     "'{ctx}' in {}: {name} at {:#x} names offset {:#x}{:+#x} of a {:#x}-byte \
@@ -825,7 +823,7 @@ fn tls_fixup(
                     reloc.offset,
                     base,
                     reloc.addend,
-                    block.memsz
+                    memsz
                 )
             })?,
     };
@@ -5552,7 +5550,7 @@ mod tests {
             ]
         );
         let state = extract_aarch64_from(&aarch64_tls_lib(), "tls_get");
-        let block = state.tls_blocks.values().flatten().next().expect("PT_TLS");
+        let block = state.tls_blocks.values().next().expect("PT_TLS");
         assert_eq!(
             (block.image.len(), block.memsz, block.align),
             (0x14, 0x34, 8)

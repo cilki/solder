@@ -25,8 +25,9 @@
 
 use anyhow::{Result, bail};
 use object::read::elf::{ElfFile64, ProgramHeader};
+use object::{Object, ObjectSymbol, ObjectSymbolTable};
 
-use crate::arch::TlsLayout;
+use crate::arch::{Arch, TlsLayout, TlsSlot};
 use crate::layout::align_up;
 
 /// One object's `PT_TLS`: the template each thread's copy of its block starts
@@ -98,14 +99,10 @@ pub struct MergedTls {
     /// Where the executable's own block starts within the merged block: 0
     /// unless the libraries went in front of it.
     pub exe_offset: u64,
-    /// The merged template's initialized part: every block's `.tdata` at its
-    /// place, with the `.tbss` of any block followed by another one written
-    /// out as the zeros it starts as.
-    pub image: Vec<u8>,
-    /// The size of the merged block.
-    pub memsz: u64,
-    /// The merged block's alignment: the largest of its parts'.
-    pub align: u64,
+    /// The merged block. Its image is every block's `.tdata` at its place,
+    /// with the `.tbss` of any block followed by another one written out as
+    /// the zeros it starts as; its alignment is the largest of its parts'.
+    pub block: TlsBlock,
 }
 
 /// Lay out the executable's own block, `exe` if it has one, together with the
@@ -195,10 +192,57 @@ pub fn plan(layout: TlsLayout, exe: Option<&TlsBlock>, libs: &[&TlsBlock]) -> Re
     Ok(MergedTls {
         lib_offsets,
         exe_offset,
-        image,
-        memsz,
-        align,
+        block: TlsBlock {
+            image,
+            memsz,
+            align,
+        },
     })
+}
+
+/// One of the executable's own dynamic TLS relocations.
+pub struct ExeTlsReloc<'data> {
+    /// The slot it fills.
+    pub vaddr: u64,
+    /// Its type, as readelf names it.
+    pub name: &'static str,
+    pub slot: TlsSlot,
+    /// The symbol it is against when the executable leaves that undefined —
+    /// a variable another object defines. `None` for one against the
+    /// executable's own module or a variable it defines itself.
+    pub import: Option<&'data str>,
+}
+
+/// The dynamic TLS relocations of `exe_elf`, numbered by `arch`.
+pub fn exe_tls_relocs<'data>(
+    exe_elf: &ElfFile64<'data>,
+    arch: &Arch,
+) -> impl Iterator<Item = ExeTlsReloc<'data>> {
+    let dynsym = exe_elf.dynamic_symbol_table();
+    exe_elf
+        .dynamic_relocations()
+        .into_iter()
+        .flatten()
+        .filter_map(move |(vaddr, reloc)| {
+            let object::RelocationFlags::Elf { r_type } = reloc.flags() else {
+                return None;
+            };
+            let (name, slot) = arch.tls.slot(r_type.0)?;
+            let import = match reloc.target() {
+                object::RelocationTarget::Symbol(si) => dynsym
+                    .as_ref()
+                    .and_then(|t| t.symbol_by_index(si).ok())
+                    .filter(|s| s.is_undefined())
+                    .map(|s| s.name().unwrap_or("")),
+                _ => None,
+            };
+            Some(ExeTlsReloc {
+                vaddr,
+                name,
+                slot,
+                import,
+            })
+        })
 }
 
 #[cfg(test)]
@@ -254,10 +298,10 @@ mod tests {
                         continue;
                     };
                     let at = merged.exe_offset;
-                    assert!(at + exe_memsz <= merged.memsz);
+                    assert!(at + exe_memsz <= merged.block.memsz);
                     for v in [0, exe_memsz - 1] {
                         assert_eq!(
-                            tp_relative(layout, merged.memsz, merged.align, at, v),
+                            tp_relative(layout, merged.block.memsz, merged.block.align, at, v),
                             tp_relative(layout, exe_memsz, exe_align, 0, v),
                             "{layout:?}: exe {exe_memsz:#x}/{exe_align}, \
                              lib {lib_memsz:#x}/{lib_align}, variable {v}"
@@ -269,7 +313,7 @@ mod tests {
                     for &off in &merged.lib_offsets {
                         assert_eq!(off % lib_align, 0);
                         assert!(off + lib_memsz <= exe_range.start || off >= exe_range.end);
-                        assert!(off + lib_memsz <= merged.memsz);
+                        assert!(off + lib_memsz <= merged.block.memsz);
                     }
                 }
             }
@@ -282,8 +326,8 @@ mod tests {
             let lib = block(&[1, 2, 3, 4], 0x10, 8);
             let merged = plan(layout, None, &[&lib]).expect("nothing to keep in place");
             assert_eq!(merged.lib_offsets, [0]);
-            assert_eq!(merged.image, [1, 2, 3, 4]);
-            assert_eq!((merged.memsz, merged.align), (0x10, 8));
+            assert_eq!(merged.block.image, [1, 2, 3, 4]);
+            assert_eq!((merged.block.memsz, merged.block.align), (0x10, 8));
         }
     }
 
@@ -298,12 +342,12 @@ mod tests {
         assert_eq!(merged.lib_offsets, [0, 8]);
         // The libraries take 12 bytes; the executable's block ends where an
         // 8-aligned block does.
-        assert_eq!(merged.memsz, 24);
+        assert_eq!(merged.block.memsz, 24);
         let mut expected = vec![
             0xaa, 0xaa, 0, 0, 0, 0, 0, 0, 0xbb, 0xbb, 0xbb, 0xbb, 0, 0, 0, 0,
         ];
         expected.extend([0xee; 4]);
-        assert_eq!(merged.image, expected);
+        assert_eq!(merged.block.image, expected);
     }
 
     /// Above the thread pointer the executable's block keeps its start, and
@@ -315,10 +359,38 @@ mod tests {
         let lib = block(&[0xaa; 3], 8, 8);
         let merged = plan(TlsLayout::AboveTp { tcb_size: 16 }, Some(&exe), &[&lib]).unwrap();
         assert_eq!(merged.lib_offsets, [8]);
-        assert_eq!(merged.memsz, 16);
+        assert_eq!(merged.block.memsz, 16);
         assert_eq!(
-            merged.image,
+            merged.block.image,
             [0xee, 0xee, 0, 0, 0, 0, 0, 0, 0xaa, 0xaa, 0xaa]
+        );
+    }
+
+    /// `test/aarch64/libtls.so.1` reaches its thread-local variables through
+    /// every kind of slot, each against its own module or a variable it
+    /// defines — none of them an import — and nothing else is taken for one.
+    #[test]
+    fn every_tls_relocation_is_found_with_its_slot_and_none_is_an_import() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test/aarch64/libtls.so.1");
+        let mapped = crate::elf_reader::MappedElf::open(std::path::Path::new(path)).unwrap();
+        let elf = mapped.parse().unwrap();
+        let found: Vec<(u64, TlsSlot)> = exe_tls_relocs(&elf, &crate::arch::AARCH64)
+            .inspect(|r| assert_eq!(r.import, None, "{} at {:#x}", r.name, r.vaddr))
+            .map(|r| (r.vaddr, r.slot))
+            .collect();
+        use TlsSlot::*;
+        assert_eq!(
+            found,
+            [
+                (0x1ff98, ThreadPointer),
+                (0x1ffc0, Module),
+                (0x1ffc8, Offset),
+                (0x1ffd0, Module),
+                (0x1ffd8, Offset),
+                (0x20018, Descriptor),
+                (0x20028, Descriptor),
+                (0x20038, Descriptor),
+            ]
         );
     }
 

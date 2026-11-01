@@ -34,7 +34,7 @@ pub fn plan_layout(
 ) -> Result<MergePlan> {
     let page_size = crate::elf_reader::page_size(exe_elf, arch);
     let load_address = merged_load_address(exe_elf, page_size);
-    let merged_tls = merge_tls_blocks(exe_elf, arch, lib_order, &tls_slot_fixups, tls_blocks)?;
+    let merged_tls = merge_tls_blocks(exe_elf, arch, lib_order, tls_blocks)?;
 
     // Separate units by section kind.
     let mut text: Vec<ExtractedUnit> = Vec::new();
@@ -133,10 +133,10 @@ pub fn plan_layout(
 
     // The merged TLS template is read-only too: the loader copies it into
     // each thread's block and never writes it.
-    let tls_vaddr = merged_tls.as_ref().map(|(_, merged)| {
-        offset = align_up(offset, merged.align);
+    let tls_vaddr = merged_tls.as_ref().map(|(_, block)| {
+        offset = align_up(offset, block.align);
         let vaddr = load_address + offset;
-        offset += merged.image.len() as u64;
+        offset += block.image.len() as u64;
         vaddr
     });
 
@@ -237,16 +237,16 @@ pub fn plan_layout(
         });
     }
 
-    let tls = match (merged_tls, tls_vaddr) {
-        (Some((libs, merged)), Some(vaddr)) => Some(TlsPlan {
-            vaddr,
-            relocs: resolve_tls_slots(arch, tls_slot_fixups, &unit_vaddr_by_id, &libs, &merged)?,
-            image: merged.image,
-            memsz: merged.memsz,
-            align: merged.align,
-        }),
-        _ => None,
-    };
+    let tls = merged_tls
+        .zip(tls_vaddr)
+        .map(|((lib_offsets, block), vaddr)| -> Result<TlsPlan> {
+            Ok(TlsPlan {
+                vaddr,
+                relocs: resolve_tls_slots(arch, tls_slot_fixups, &unit_vaddr_by_id, &lib_offsets)?,
+                block,
+            })
+        })
+        .transpose()?;
 
     // The relocations to neutralize are chosen by the caller, so leave them empty here.
     // Relative relocs are populated during segment building (trampolines) and patching (GOT).
@@ -276,39 +276,42 @@ pub fn plan_layout(
 }
 
 /// The executable's TLS block with the merged libraries' blocks in it, laid
-/// out by [`crate::tls::plan`] in the order of `lib_order`, or `None` when no
-/// merged code reaches thread-local storage. Libraries `lib_order` does not
-/// list come after the ones it does, by path.
-fn merge_tls_blocks(
+/// out by [`crate::tls::plan`] in the order of `lib_order`, together with where
+/// each library's block starts in it; `None` when no merged code reaches
+/// thread-local storage. Libraries `lib_order` does not list come after the
+/// ones it does, by path.
+fn merge_tls_blocks<'a>(
     exe_elf: &object::read::elf::ElfFile64<'_>,
     arch: &crate::arch::Arch,
     lib_order: &[PathBuf],
-    fixups: &[TlsSlotFixup],
-    blocks: &HashMap<PathBuf, TlsBlock>,
-) -> Result<Option<(Vec<PathBuf>, crate::tls::MergedTls)>> {
-    if fixups.is_empty() {
+    blocks: &'a HashMap<PathBuf, TlsBlock>,
+) -> Result<Option<(HashMap<&'a PathBuf, u64>, TlsBlock)>> {
+    if blocks.is_empty() {
         return Ok(None);
     }
-    let mut libs: Vec<PathBuf> = lib_order
-        .iter()
-        .filter(|lib| blocks.contains_key(*lib))
-        .cloned()
-        .collect();
-    let mut rest: Vec<PathBuf> = blocks
+    let mut rest: Vec<&PathBuf> = blocks
         .keys()
-        .filter(|lib| !libs.contains(lib))
-        .cloned()
+        .filter(|lib| !lib_order.contains(lib))
         .collect();
     rest.sort();
-    libs.extend(rest);
+    let libs: Vec<(&PathBuf, &TlsBlock)> = lib_order
+        .iter()
+        .filter_map(|lib| blocks.get_key_value(lib))
+        .chain(rest.into_iter().map(|lib| (lib, &blocks[lib])))
+        .collect();
 
     let exe = TlsBlock::of(exe_elf, "the executable")?;
-    let lib_blocks: Vec<&TlsBlock> = libs.iter().map(|lib| &blocks[lib]).collect();
+    let lib_blocks: Vec<&TlsBlock> = libs.iter().map(|&(_, block)| block).collect();
     let merged = crate::tls::plan(arch.tls.layout, exe.as_ref(), &lib_blocks)?;
     if merged.exe_offset != 0 {
         refuse_moving_exe_tls_relocs(exe_elf, arch)?;
     }
-    Ok(Some((libs, merged)))
+    let lib_offsets = libs
+        .iter()
+        .map(|&(lib, _)| lib)
+        .zip(merged.lib_offsets)
+        .collect();
+    Ok(Some((lib_offsets, merged.block)))
 }
 
 /// Refuse a merge that would move the executable's own block within its module
@@ -323,32 +326,15 @@ fn refuse_moving_exe_tls_relocs(
     exe_elf: &object::read::elf::ElfFile64<'_>,
     arch: &crate::arch::Arch,
 ) -> Result<()> {
-    use object::{Object, ObjectSymbol, ObjectSymbolTable};
-    let dynsym = exe_elf.dynamic_symbol_table();
-    for (vaddr, reloc) in exe_elf.dynamic_relocations().into_iter().flatten() {
-        let object::RelocationFlags::Elf { r_type } = reloc.flags() else {
-            continue;
-        };
-        let Some((name, slot)) = arch.tls.slot(r_type.0) else {
-            continue;
-        };
-        if slot == crate::arch::TlsSlot::Module {
-            continue;
-        }
-        let own = match reloc.target() {
-            object::RelocationTarget::Symbol(si) => dynsym
-                .as_ref()
-                .and_then(|t| t.symbol_by_index(si).ok())
-                .is_none_or(|s| !s.is_undefined()),
-            _ => true,
-        };
-        if own {
-            bail!(
-                "the executable's {name} at {vaddr:#x} names an offset in its own \
-                 thread-local block, which merging a library's thread-local storage in \
-                 front of it would move"
-            );
-        }
+    let own = crate::tls::exe_tls_relocs(exe_elf, arch)
+        .find(|r| r.slot != crate::arch::TlsSlot::Module && r.import.is_none());
+    if let Some(reloc) = own {
+        bail!(
+            "the executable's {} at {:#x} names an offset in its own thread-local block, \
+             which merging a library's thread-local storage in front of it would move",
+            reloc.name,
+            reloc.vaddr
+        );
     }
     Ok(())
 }
@@ -359,8 +345,7 @@ fn resolve_tls_slots(
     arch: &crate::arch::Arch,
     fixups: Vec<TlsSlotFixup>,
     unit_vaddrs: &HashMap<crate::types::UnitId, u64>,
-    libs: &[PathBuf],
-    merged: &crate::tls::MergedTls,
+    lib_offsets: &HashMap<&PathBuf, u64>,
 ) -> Result<Vec<TlsReloc>> {
     fixups
         .into_iter()
@@ -371,16 +356,12 @@ fn resolve_tls_slots(
                     fixup.unit.0
                 )
             })?;
-            let at = libs
-                .iter()
-                .position(|lib| *lib == fixup.lib)
-                .map(|i| merged.lib_offsets[i])
-                .with_context(|| {
-                    format!(
-                        "no thread-local block was read for {} — internal error",
-                        fixup.lib.display()
-                    )
-                })?;
+            let at = *lib_offsets.get(&fixup.lib).with_context(|| {
+                format!(
+                    "no thread-local block was read for {} — internal error",
+                    fixup.lib.display()
+                )
+            })?;
             if fixup.module_base && at != 0 {
                 bail!(
                     "{} asks for its thread-local block's module without naming a variable \
