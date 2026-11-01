@@ -396,12 +396,21 @@ dynamic, or relink against a soname.
   definition along — `test/bash` assigns ncurses' `PC`, `UP` and `BC` while
   readline sets the terminal up and merged `tputs` reads them back, which only
   works while the two sides are looking at the same bytes
-- We can't merge a library that uses thread-local storage, or one that defines
-  an ifunc that extracted code reaches. Both are dynamic relocations whose slot
-  is not an address — a TLS slot holds a module id or an offset from the thread
-  pointer, and an `R_X86_64_IRELATIVE` slot holds the address of a resolver
-  only `ld.so` can call — so there is nothing the merge can write into them.
-  `solder` refuses the merge when one turns up inside extracted code or data
+- We can't merge a library that defines an ifunc that extracted code reaches:
+  an `R_X86_64_IRELATIVE` slot holds the address of a resolver only `ld.so` can
+  call, so there is nothing the merge can write into it. `solder` refuses the
+  merge when one turns up inside extracted code or data
+- A merged library's thread-local storage joins the executable's: its `PT_TLS`
+  block goes into the executable's (a new `PT_TLS` if it had none), and each
+  copied TLS slot keeps a dynamic relocation against the executable's own
+  module, so `ld.so` fills it in as it did for the library. The executable's
+  own thread-local variables stay where its code expects them. Some cases are
+  still refused: a TLS variable defined by another object, or by the
+  executable as well; one the executable reaches by name itself; and
+  local-dynamic code (which writes offsets into the
+  block in its instructions) in a library whose block cannot start the
+  merged one, which is any library after the first on x86-64, and every one
+  on aarch64 when the executable has thread-local variables of its own
 - Merged code carries no unwind information. A library's `.eh_frame` is read
   during extraction — it is how a function's exact bounds are recovered when
   the symbol table records no size for it — but none of it is written back

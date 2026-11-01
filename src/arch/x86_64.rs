@@ -11,8 +11,8 @@ use anyhow::{Result, bail};
 use iced_x86::Instruction;
 
 use super::{
-    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, RefSite, Site, TextUnit, Trampoline,
-    UnitScan, Unliftable, Word,
+    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, RefSite, Site, TextUnit, TlsAbi,
+    TlsLayout, TlsSlot, Trampoline, UnitScan, Unliftable, Word,
 };
 use crate::types::ExtractedReloc;
 
@@ -38,9 +38,6 @@ pub static X86_64: Arch = {
             copy: R_X86_64_COPY.0,
         },
         unliftable_relocs: &[
-            (R_X86_64_DTPMOD64.0, "R_X86_64_DTPMOD64", Tls),
-            (R_X86_64_DTPOFF64.0, "R_X86_64_DTPOFF64", Tls),
-            (R_X86_64_TPOFF64.0, "R_X86_64_TPOFF64", Tls),
             (R_X86_64_TLSGD.0, "R_X86_64_TLSGD", Tls),
             (R_X86_64_TLSLD.0, "R_X86_64_TLSLD", Tls),
             (R_X86_64_DTPOFF32.0, "R_X86_64_DTPOFF32", Tls),
@@ -48,12 +45,24 @@ pub static X86_64: Arch = {
             (R_X86_64_TPOFF32.0, "R_X86_64_TPOFF32", Tls),
             (R_X86_64_GOTPC32_TLSDESC.0, "R_X86_64_GOTPC32_TLSDESC", Tls),
             (R_X86_64_TLSDESC_CALL.0, "R_X86_64_TLSDESC_CALL", Tls),
-            (R_X86_64_TLSDESC.0, "R_X86_64_TLSDESC", Tls),
             (R_X86_64_IRELATIVE.0, "R_X86_64_IRELATIVE", Ifunc),
             (R_X86_64_SIZE32.0, "R_X86_64_SIZE32", Size),
             (R_X86_64_SIZE64.0, "R_X86_64_SIZE64", Size),
             (R_X86_64_COPY.0, "R_X86_64_COPY", Copy),
         ],
+        tls: TlsAbi {
+            layout: TlsLayout::BelowTp,
+            relocs: [
+                (R_X86_64_DTPMOD64.0, "R_X86_64_DTPMOD64", TlsSlot::Module),
+                (R_X86_64_DTPOFF64.0, "R_X86_64_DTPOFF64", TlsSlot::Offset),
+                (
+                    R_X86_64_TPOFF64.0,
+                    "R_X86_64_TPOFF64",
+                    TlsSlot::ThreadPointer,
+                ),
+                (R_X86_64_TLSDESC.0, "R_X86_64_TLSDESC", TlsSlot::Descriptor),
+            ],
+        },
         // `FLAG_X8664_LIB64 | FLAG_ELF_LIBC6`. On x86-64
         // `_dl_cache_check_flags` accepts this value and nothing else, so an
         // entry with any other `flags` is one the loader would never load.

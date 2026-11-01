@@ -34,8 +34,8 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result, anyhow, bail};
 
 use super::{
-    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, RefSite, TextUnit, Trampoline,
-    UnitScan, Unliftable,
+    Arch, CodeRef, DynRelocTypes, GnuProperties, MachineCode, RefSite, TextUnit, TlsAbi, TlsLayout,
+    TlsSlot, Trampoline, UnitScan, Unliftable,
 };
 use crate::types::ExtractedReloc;
 use yaxpeax_arch::{Decoder, U8Reader};
@@ -1059,7 +1059,7 @@ fn plt_stub_slot_at(sec_data: &[u8], sec_addr: u64, addr: u64) -> Option<u64> {
 /// writer are tested against.
 #[cfg_attr(not(test), allow(dead_code))]
 pub static AARCH64: Arch = {
-    use Unliftable::{Copy, Ifunc, Tls};
+    use Unliftable::{Copy, Ifunc};
     use object::elf::{
         EM_AARCH64, GNU_PROPERTY_AARCH64_FEATURE_1_AND, R_AARCH64_COPY, R_AARCH64_GLOB_DAT,
         R_AARCH64_IRELATIVE, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE, R_AARCH64_TLS_DTPMOD,
@@ -1075,21 +1075,44 @@ pub static AARCH64: Arch = {
             jump_slot: R_AARCH64_JUMP_SLOT.0,
             copy: R_AARCH64_COPY.0,
         },
-        // Every dynamic relocation AAELF64 defines other than the three above.
-        // Unlike x86-64 there is no SIZE relocation, and the static TLS forms
-        // (`TLSGD_ADR_PAGE21` and the rest) are resolved by the linker into
-        // instruction fields and GOT slots carrying the dynamic ones below, so
-        // they never reach a shared library's dynamic tables. The TLS names
-        // are the ones readelf prints; `object` and glibc's `elf.h` drop the
-        // `64`.
+        // Every dynamic relocation AAELF64 defines other than the three above
+        // and the TLS ones below. Unlike x86-64 there is no SIZE relocation,
+        // and the static TLS forms (`TLSGD_ADR_PAGE21` and the rest) are
+        // resolved by the linker into instruction fields and GOT slots
+        // carrying the dynamic ones, so they never reach a shared library's
+        // dynamic tables.
         unliftable_relocs: &[
-            (R_AARCH64_TLS_DTPMOD.0, "R_AARCH64_TLS_DTPMOD64", Tls),
-            (R_AARCH64_TLS_DTPREL.0, "R_AARCH64_TLS_DTPREL64", Tls),
-            (R_AARCH64_TLS_TPREL.0, "R_AARCH64_TLS_TPREL64", Tls),
-            (R_AARCH64_TLSDESC.0, "R_AARCH64_TLSDESC", Tls),
             (R_AARCH64_IRELATIVE.0, "R_AARCH64_IRELATIVE", Ifunc),
             (R_AARCH64_COPY.0, "R_AARCH64_COPY", Copy),
         ],
+        // The names are the ones readelf prints; `object` and glibc's `elf.h`
+        // drop the `64`. glibc's aarch64 `TLS_TCB_SIZE` is the two-word
+        // `tcbhead_t`.
+        tls: TlsAbi {
+            layout: TlsLayout::AboveTp { tcb_size: 16 },
+            relocs: [
+                (
+                    R_AARCH64_TLS_DTPMOD.0,
+                    "R_AARCH64_TLS_DTPMOD64",
+                    TlsSlot::Module,
+                ),
+                (
+                    R_AARCH64_TLS_DTPREL.0,
+                    "R_AARCH64_TLS_DTPREL64",
+                    TlsSlot::Offset,
+                ),
+                (
+                    R_AARCH64_TLS_TPREL.0,
+                    "R_AARCH64_TLS_TPREL64",
+                    TlsSlot::ThreadPointer,
+                ),
+                (
+                    R_AARCH64_TLSDESC.0,
+                    "R_AARCH64_TLSDESC",
+                    TlsSlot::Descriptor,
+                ),
+            ],
+        },
         // `FLAG_AARCH64_LIB64 | FLAG_ELF_LIBC6`, glibc's
         // `sysdeps/unix/sysv/linux/aarch64/dl-cache.h`. As on x86-64,
         // `_dl_cache_check_flags` accepts exactly this value, so an ILP32

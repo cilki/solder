@@ -6,11 +6,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use object::{Object, ObjectSection, ObjectSymbol, SectionKind as ObjSectionKind};
 use tracing::{debug, warn};
 
-use crate::arch::{Arch, RefSite, Site, TextUnit, UnitScan, Unliftable, Word};
+use crate::arch::{Arch, RefSite, Site, TextUnit, TlsSlot, UnitScan, Unliftable, Word};
 use crate::elf_reader::MappedElf;
+use crate::tls::TlsBlock;
 use crate::types::{
     DATA_BLOB_ALIGNMENT, DataSectionCopy, ExtractedReloc, ExtractedUnit, GotSlotFixup,
-    InitFiniArrays, InitFiniEntry, RelocTarget, SectionKind, UnboundedEnd, UnitId,
+    InitFiniArrays, InitFiniEntry, RelocTarget, SectionKind, TlsSlotFixup, UnboundedEnd, UnitId,
 };
 
 /// The map the extractor's own caches are kept in.
@@ -194,6 +195,12 @@ struct ExtractionState {
     plt_refs: FastMap<(LibId, u64), Option<RelocTarget>>,
     /// Copied GOT slots that need a GLOB_DAT in the output (see GotSlotFixup).
     got_slot_fixups: Vec<GotSlotFixup>,
+    /// Copied GOT slots the loader fills from a TLS relocation (see
+    /// `TlsSlotFixup`).
+    tls_slot_fixups: Vec<TlsSlotFixup>,
+    /// Each library's `PT_TLS`, read the first time one of its TLS slots is
+    /// copied; `None` for a library that has none.
+    tls_blocks: FastMap<LibId, Option<Rc<TlsBlock>>>,
     /// Every library extraction has touched, in the order it first saw them;
     /// a [`LibId`] is a position in here (see [`ExtractionState::lib_id`]).
     lib_paths: Vec<Rc<Path>>,
@@ -376,10 +383,37 @@ impl ExtractionState {
         }
     }
 
+    /// Zero the copied TLS slots at `slots` within `bytes` and register a
+    /// fixup for each: what the library's copy held is whatever ld.so put
+    /// there for the library's module, and it writes them again for the
+    /// executable's (see `TlsSlotFixup`).
+    fn register_tls_slot_fixups(&mut self, unit: UnitId, bytes: &mut [u8], slots: Vec<TlsFixup>) {
+        for fixup in slots {
+            // A descriptor is two words, and the loader writes both.
+            let len = match fixup.slot {
+                TlsSlot::Descriptor => 2 * GOT_SLOT_SIZE,
+                _ => GOT_SLOT_SIZE,
+            };
+            let off = fixup.offset as usize;
+            if let Some(slot) = bytes.get_mut(off..off + len as usize) {
+                slot.fill(0);
+            }
+            let lib = self.lib_path(fixup.lib).to_path_buf();
+            self.tls_slot_fixups.push(TlsSlotFixup {
+                unit,
+                offset: fixup.offset,
+                lib,
+                slot: fixup.slot,
+                offset_in_block: fixup.offset_in_block,
+                module_base: fixup.module_base,
+            });
+        }
+    }
+
     /// Finish the relocations collected for unit `id`: zero and record the
-    /// copied GOT slots in `bytes` that ld.so has to fill in, and hand back the
-    /// unit's relocation list for the caller to store. Extracting a symbol and
-    /// extracting a data section blob both end this way.
+    /// copied GOT and TLS slots in `bytes` that ld.so has to fill in, and hand
+    /// back the unit's relocation list for the caller to store. Extracting a
+    /// symbol and extracting a data section blob both end this way.
     fn take_unit_relocs(
         &mut self,
         id: UnitId,
@@ -387,7 +421,18 @@ impl ExtractionState {
         relocs: UnitRelocs,
     ) -> Vec<ExtractedReloc> {
         self.register_got_slot_fixups(id, bytes, relocs.got_fixups);
+        self.register_tls_slot_fixups(id, bytes, relocs.tls_fixups);
         relocs.relocations
+    }
+
+    /// The `PT_TLS` of `lib`, read on first use.
+    fn tls_block(&mut self, lib: Lib<'_, '_>) -> Result<Option<Rc<TlsBlock>>> {
+        if let Some(block) = self.tls_blocks.get(&lib.id) {
+            return Ok(block.clone());
+        }
+        let block = TlsBlock::of(lib.elf, &lib.path.display().to_string())?.map(Rc::new);
+        self.tls_blocks.insert(lib.id, block.clone());
+        Ok(block)
     }
 }
 
@@ -399,6 +444,10 @@ pub struct Extraction {
     pub init_fini: InitFiniArrays,
     /// Copied GOT slots that ld.so has to re-resolve at startup.
     pub got_slot_fixups: Vec<GotSlotFixup>,
+    /// Copied GOT slots ld.so fills from a TLS relocation.
+    pub tls_slot_fixups: Vec<TlsSlotFixup>,
+    /// The `PT_TLS` of each library one of `tls_slot_fixups` reaches into.
+    pub tls_blocks: HashMap<PathBuf, TlsBlock>,
     /// The data sections that had to be copied whole, which is where an
     /// extraction far larger than the symbols asked for comes from (see
     /// [`DataSectionCopy`]).
@@ -447,6 +496,8 @@ pub fn extract_units(
         units_at: FastMap::default(),
         plt_refs: FastMap::default(),
         got_slot_fixups: Vec::new(),
+        tls_slot_fixups: Vec::new(),
+        tls_blocks: FastMap::default(),
         lib_paths: Vec::new(),
         lib_ids: FastMap::default(),
         lib_bytes_cache: Vec::new(),
@@ -518,10 +569,26 @@ pub fn extract_units(
     // section can give back the run below the first byte anything references.
     trim_unreferenced_prefixes(&mut state);
 
+    // Only a library whose TLS slots were copied has a block worth merging:
+    // nothing merged can reach the variables of any other.
+    let tls_blocks = state
+        .tls_blocks
+        .iter()
+        .filter_map(|(&lib, block)| {
+            Some((
+                state.lib_path(lib).to_path_buf(),
+                (**block.as_ref()?).clone(),
+            ))
+        })
+        .filter(|(path, _)| state.tls_slot_fixups.iter().any(|f| &f.lib == path))
+        .collect();
+
     Ok(Extraction {
         units: state.units,
         init_fini: state.init_fini,
         got_slot_fixups: state.got_slot_fixups,
+        tls_slot_fixups: state.tls_slot_fixups,
+        tls_blocks,
         data_section_copies: state.data_section_copies,
     })
 }
@@ -540,6 +607,20 @@ struct UnitRelocs {
     /// `(offset within the unit, symbol name, weak)` per copied GOT slot that
     /// ld.so has to fill in (see `GotSlotFixup`).
     got_fixups: Vec<(u64, String, bool)>,
+    /// One per copied slot ld.so fills from a TLS relocation.
+    tls_fixups: Vec<TlsFixup>,
+}
+
+/// A copied TLS slot, as [`collect_dynamic_range_relocs`] finds it; see
+/// `TlsSlotFixup`, which it becomes once its unit is finished.
+struct TlsFixup {
+    /// Offset within the unit.
+    offset: u64,
+    /// The library whose block the variable is in.
+    lib: LibId,
+    slot: TlsSlot,
+    offset_in_block: u64,
+    module_base: bool,
 }
 
 /// Reject relocation kinds that need a GOT we cannot reproduce. `ctx` names the
@@ -579,11 +660,8 @@ fn elf_r_type(reloc: &object::Relocation) -> Option<u32> {
 /// `arch`'s name for a dynamic relocation type solder cannot lift, and what
 /// the loader was supposed to put in its slot.
 fn describe_unliftable_reloc(arch: &Arch, r_type: u32) -> (String, &'static str) {
-    const TLS: &str = ": the slot holds a module id or an offset from the thread \
-                       pointer, not an address. Merging a library that uses \
-                       thread-local storage needs its PT_TLS block merged into the \
-                       executable's and an offset assigned in it, which solder does \
-                       not do yet — exclude this library from the merge";
+    const TLS: &str = ": a static-link TLS relocation, which a linker resolves \
+                       and never leaves in a linked library";
     const IFUNC: &str = ": the slot holds the address of an ifunc resolver that only \
                          ld.so can call, and what belongs in it is whatever that \
                          resolver returns — exclude this library from the merge";
@@ -633,10 +711,12 @@ fn describe_unliftable_reloc(arch: &Arch, r_type: u32) -> (String, &'static str)
 ///     returns a function pointer where the caller expects the function's own
 ///     result.
 ///
-/// Neither is a matter of patching the slot differently: TLS needs the
-/// library's `PT_TLS` block merged into the executable's, and `IRELATIVE`
-/// needs ld.so to run the resolver. Failing the merge keeps the problem at
-/// merge time instead of turning it into a wild access in the merged binary.
+/// Neither is a matter of patching the slot differently. A TLS slot never
+/// reaches this check any more: `collect_dynamic_range_relocs` hands it to the
+/// loader as a TLS relocation against the executable's merged block (see
+/// `crate::tls`). `IRELATIVE` needs ld.so to run the resolver. Failing the
+/// merge keeps the problem at merge time instead of turning it into a wild
+/// access in the merged binary.
 ///
 /// `ctx` names the symbol or section being extracted, and `arch` is what
 /// `r_type` is numbered by.
@@ -670,6 +750,92 @@ fn reject_unliftable_dynamic_reloc(
         name,
         note
     )
+}
+
+/// The variable the TLS relocation `reloc`, of type `name`, fills its slot for:
+/// which library's block it is in and at what offset.
+///
+/// A relocation with no symbol names the library's own module, with the
+/// variable's offset in its block as the addend — what a linker writes for a
+/// variable that cannot be preempted. One against a symbol the library defines
+/// is the same variable at `st_value + addend`, `st_value` being an offset in
+/// the block for a TLS symbol. A symbol defined anywhere else, or one the
+/// executable defines and so takes over, is refused: its block is not one the
+/// merge lays out.
+fn tls_fixup(
+    lib: Lib<'_, '_>,
+    ctx: &str,
+    name: &str,
+    slot: TlsSlot,
+    reloc: &DynReloc,
+    offset: u64,
+    state: &mut ExtractionState,
+) -> Result<TlsFixup> {
+    let Some(block) = state.tls_block(lib)? else {
+        bail!(
+            "'{ctx}' in {}: {name} reaches thread-local storage, but the library has no \
+             PT_TLS segment",
+            lib.path.display()
+        );
+    };
+    let sym = reloc
+        .symbol
+        .filter(|si| si.0 != 0)
+        .and_then(|si| dynamic_symbol_by_index(lib.elf, si));
+    let base = match &sym {
+        None => 0,
+        Some(sym) => {
+            let sym_name = sym.name().unwrap_or("");
+            if sym.is_undefined() {
+                bail!(
+                    "'{ctx}' in {}: {name} against '{sym_name}', a thread-local variable \
+                     another object defines; solder merges a library's accesses to its own \
+                     thread-local storage only",
+                    lib.path.display()
+                );
+            }
+            if sym.elf_symbol().st_type() != object::elf::STT_TLS {
+                bail!(
+                    "'{ctx}' in {}: {name} against '{sym_name}', which is not a thread-local \
+                     variable",
+                    lib.path.display()
+                );
+            }
+            if is_preemptible(sym) && state.exe_defined_syms.contains(sym_name) {
+                bail!(
+                    "'{ctx}' in {}: {name} against '{sym_name}', a thread-local variable the \
+                     executable defines as well, which takes the library's place at runtime; \
+                     solder does not merge such a library's thread-local storage",
+                    lib.path.display()
+                );
+            }
+            sym.address()
+        }
+    };
+    let offset_in_block = match slot {
+        TlsSlot::Module => 0,
+        _ => base
+            .checked_add_signed(reloc.addend)
+            .filter(|&o| o <= block.memsz)
+            .with_context(|| {
+                format!(
+                    "'{ctx}' in {}: {name} at {:#x} names offset {:#x}{:+#x} of a {:#x}-byte \
+                     thread-local block",
+                    lib.path.display(),
+                    reloc.offset,
+                    base,
+                    reloc.addend,
+                    block.memsz
+                )
+            })?,
+    };
+    Ok(TlsFixup {
+        offset,
+        lib: lib.id,
+        slot,
+        offset_in_block,
+        module_base: slot == TlsSlot::Module && sym.is_none(),
+    })
 }
 
 /// Process a single symbol: extract its bytes under the id reserved for it and
@@ -1848,6 +2014,15 @@ fn collect_dynamic_range_relocs(
         let kind = reloc.kind;
         let encoding = reloc.encoding;
         reject_got_reloc(kind, encoding, ctx, lib.path)?;
+
+        // A TLS slot is filled by the loader against the executable's module
+        // once the library's block is part of it (see `crate::tls`).
+        if let Some((name, slot)) = reloc.r_type.and_then(|t| state.arch.tls.slot(t)) {
+            let fixup = tls_fixup(lib, ctx, name, slot, &reloc, offset_within_unit, state)?;
+            occupied.insert(offset_within_unit);
+            relocs.tls_fixups.push(fixup);
+            continue;
+        }
         reject_unliftable_dynamic_reloc(state.arch, kind, reloc.r_type, ctx, lib.path)?;
 
         // Resolve the relocation target symbol. Dynamic relocation symbol
@@ -2037,6 +2212,39 @@ fn got_slot_at(sec: &SectionInfo<'_>, addr: u64) -> Option<(u64, u64)> {
     Some((slot, GOT_SLOT_SIZE.min(sec.vaddr + sec.size - slot)))
 }
 
+/// The GOT slot `(slot, len)` that [`got_slot_at`] found, widened to the
+/// two-slot entry it is half of when that is a TLS one.
+///
+/// A module id and the offset `__tls_get_addr` is called with come as a pair
+/// of slots, and so does a TLS descriptor: the code names the first slot, and
+/// the callee reads both. Copied a slot at a time, the second would be left
+/// behind — and the loader would write it over whatever the layout put next.
+fn tls_pair_around(
+    lib: Lib<'_, '_>,
+    arch: &Arch,
+    sec: &SectionInfo<'_>,
+    slot: u64,
+    len: u64,
+) -> (u64, u64) {
+    let starts_pair = |at: u64| {
+        lib.index.dyn_relocs_in(at..at + 1).iter().any(|r| {
+            matches!(
+                r.r_type.and_then(|t| arch.tls.slot(t)),
+                Some((_, TlsSlot::Module | TlsSlot::Descriptor))
+            )
+        })
+    };
+    let sec_end = sec.vaddr + sec.size;
+    let pair = |at: u64| (at, (2 * GOT_SLOT_SIZE).min(sec_end - at));
+    if starts_pair(slot) {
+        pair(slot)
+    } else if slot >= sec.vaddr + GOT_SLOT_SIZE && starts_pair(slot - GOT_SLOT_SIZE) {
+        pair(slot - GOT_SLOT_SIZE)
+    } else {
+        (slot, len)
+    }
+}
+
 /// How much of `sec`, counted from its first byte, a reference to
 /// `target_addr` needs copied.
 ///
@@ -2132,7 +2340,10 @@ fn ensure_data_blob_extracted(
     // What to copy: one GOT slot, or a long enough prefix of the section for
     // everything else.
     let (base_vaddr, needed, alignment, report_copy) = match got_slot_at(&sec, target_addr) {
-        Some((slot, len)) => (slot, len, GOT_SLOT_SIZE, false),
+        Some((slot, len)) => {
+            let (slot, len) = tls_pair_around(lib, state.arch, &sec, slot, len);
+            (slot, len, GOT_SLOT_SIZE, false)
+        }
         None => (
             sec.vaddr,
             needed_prefix(lib, &sec, target_addr, access_len),
@@ -2446,10 +2657,10 @@ fn grow_data_blob(
 /// 198,544 bytes into a stripped `libcrypto.so.3`'s `.rodata`, and carrying
 /// the run below it was the whole of what that merge still copied (issue #66).
 ///
-/// There are exactly three places an offset into a blob is held, and this
+/// There are exactly four places an offset into a blob is held, and this
 /// rewrites all of them: [`RelocTarget::DataBlobOffset`] in any unit's
-/// relocation, the `offset_within_unit` of the blob's own relocations, and
-/// [`GotSlotFixup::offset`]. The blob map itself is left as it was — its keys
+/// relocation, the `offset_within_unit` of the blob's own relocations,
+/// [`GotSlotFixup::offset`] and [`TlsSlotFixup::offset`]. The blob map itself is left as it was — its keys
 /// are the anchors the lookups used, and there are no lookups left.
 ///
 /// Two things bound how far up a copy can start:
@@ -2466,9 +2677,10 @@ fn grow_data_blob(
 ///   this bound can still find is one straddling the cut.
 fn trim_unreferenced_prefixes(state: &mut ExtractionState) {
     let mut lowest_fixup: FastMap<UnitId, u64> = FastMap::default();
-    for fixup in &state.got_slot_fixups {
-        let at = lowest_fixup.entry(fixup.unit).or_insert(u64::MAX);
-        *at = (*at).min(fixup.offset);
+    let fixups = state.got_slot_fixups.iter().map(|f| (f.unit, f.offset));
+    for (unit, offset) in fixups.chain(state.tls_slot_fixups.iter().map(|f| (f.unit, f.offset))) {
+        let at = lowest_fixup.entry(unit).or_insert(u64::MAX);
+        *at = (*at).min(offset);
     }
 
     // `report` is what tells a copied section from a GOT slice, which is
@@ -2528,6 +2740,14 @@ fn trim_unreferenced_prefixes(state: &mut ExtractionState) {
                 .offset
                 .checked_sub(*trim)
                 .expect("a copy starts at or below every GOT slot it holds");
+        }
+    }
+    for fixup in &mut state.tls_slot_fixups {
+        if let Some(trim) = trim_of.get(&fixup.unit) {
+            fixup.offset = fixup
+                .offset
+                .checked_sub(*trim)
+                .expect("a copy starts at or below every TLS slot it holds");
         }
     }
 
@@ -2746,6 +2966,8 @@ mod tests {
             units_at: FastMap::default(),
             plt_refs: FastMap::default(),
             got_slot_fixups: Vec::new(),
+            tls_slot_fixups: Vec::new(),
+            tls_blocks: FastMap::default(),
             lib_paths: Vec::new(),
             lib_ids: FastMap::default(),
             lib_bytes_cache: Vec::new(),
@@ -3050,19 +3272,23 @@ mod tests {
     /// merge rather than be patched as if it were an address.
     ///
     /// The `object` crate names none of x86-64's dynamic relocation types, so
-    /// a TLS slot and an ifunc slot reach the extractor looking exactly like
-    /// the `R_X86_64_RELATIVE` entries it does lift — `RelocationKind::Unknown`
-    /// with a reported size of 0. Widening that 0 to 64 bits turned both into
-    /// `R_X86_64_64`: the TLS slot got a link-time address where ld.so was to
-    /// store an offset from the thread pointer, so the merged code indexed
-    /// `%fs` by it, and the ifunc slot got the resolver's address instead of
-    /// the implementation it returns.
+    /// an ifunc slot reaches the extractor looking exactly like the
+    /// `R_X86_64_RELATIVE` entries it does lift — `RelocationKind::Unknown`
+    /// with a reported size of 0. Widening that 0 to 64 bits turned it into
+    /// `R_X86_64_64`, and the slot got the resolver's address instead of the
+    /// implementation it returns.
+    ///
+    /// A TLS slot looked the same, and got a link-time address where ld.so
+    /// was to store an offset from the thread pointer. Those are lifted as TLS
+    /// slots now, which takes a `PT_TLS` the library has to have: `libtinfo`
+    /// has none, so a TLS relocation in it is refused, by name, all the same.
     #[test]
     fn a_relocation_that_is_not_a_pointer_slot_is_refused() {
         for (r_type, expected) in [
             (object::elf::R_X86_64_TPOFF64.0, "R_X86_64_TPOFF64"),
             (object::elf::R_X86_64_DTPMOD64.0, "R_X86_64_DTPMOD64"),
             (object::elf::R_X86_64_IRELATIVE.0, "R_X86_64_IRELATIVE"),
+            (object::elf::R_X86_64_SIZE64.0, "R_X86_64_SIZE64"),
         ] {
             let lib = lib_with_retyped_strnames_reloc(r_type);
             let mut state = test_state();
@@ -3099,9 +3325,10 @@ mod tests {
     }
 
     /// The gate reads relocation numbers in the library's architecture: under
-    /// aarch64 its own three pointer slots pass, its TLS and ifunc types are
+    /// aarch64 its own three pointer slots pass, its ifunc and copy types are
     /// refused by their binutils names, and x86-64's `R_X86_64_RELATIVE` (8)
-    /// is just an unknown number.
+    /// is just an unknown number. (Its TLS types never reach the gate; see
+    /// `collect_dynamic_range_relocs`.)
     #[test]
     fn the_unliftable_gate_numbers_relocations_by_the_architecture() {
         use crate::arch::AARCH64;
@@ -3123,14 +3350,9 @@ mod tests {
         }
         for (r_type, name, why) in [
             (
-                object::elf::R_AARCH64_TLS_TPREL.0,
-                "R_AARCH64_TLS_TPREL64",
-                "thread",
-            ),
-            (
-                object::elf::R_AARCH64_TLSDESC.0,
-                "R_AARCH64_TLSDESC",
-                "thread",
+                object::elf::R_AARCH64_COPY.0,
+                "R_AARCH64_COPY",
+                "executable",
             ),
             (
                 object::elf::R_AARCH64_IRELATIVE.0,
@@ -5256,21 +5478,144 @@ mod tests {
 
     /// Extract `seed` and everything it reaches from the aarch64 fixture.
     fn extract_aarch64_units(seed: &str) -> Vec<ExtractedUnit> {
+        extract_aarch64_from(&aarch64_lib(), seed).units
+    }
+
+    /// Extract `seed` and everything it reaches from the aarch64 library
+    /// `lib`, handing back the whole state.
+    fn extract_aarch64_from(lib: &Path, seed: &str) -> ExtractionState {
         let mut state = test_state();
         state.arch = &crate::arch::AARCH64;
-        let key = key_in(&mut state, &aarch64_lib(), seed);
+        let key = key_in(&mut state, lib, seed);
         state.reserve(key);
         while let Some((key, id)) = state.worklist.pop_front() {
             process_symbol(&key, id, &mut state)
                 .unwrap_or_else(|e| panic!("extract '{}': {e:#}", key.sym));
         }
-        state.units
+        state
+    }
+
+    /// `test/aarch64/libtls.so.1`, built from `libtls.c` and `libtls-trad.c`.
+    fn aarch64_tls_lib() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/aarch64/libtls.so.1"
+        ))
+    }
+
+    /// The TLS slots extracting `seed` from the TLS fixture copied, as
+    /// `(kind, offset in the library's block)` in slot order, after checking
+    /// that each one sits in a GOT copy of its own whose bytes the loader is
+    /// left to write: two words for a descriptor or a module/offset pair, one
+    /// for a static-TLS offset.
+    fn tls_slots_of(seed: &str) -> Vec<(TlsSlot, u64)> {
+        let state = extract_aarch64_from(&aarch64_tls_lib(), seed);
+        let mut slots: Vec<(String, u64, TlsSlot, u64)> = state
+            .tls_slot_fixups
+            .iter()
+            .map(|f| {
+                let unit = state.unit(f.unit).expect("the slot's unit");
+                assert_eq!(f.lib, aarch64_tls_lib());
+                assert!(!f.module_base, "{f:?}");
+                let pair = !matches!(f.slot, TlsSlot::ThreadPointer);
+                assert_eq!(
+                    unit.bytes.len() as u64,
+                    if pair { 16 } else { 8 },
+                    "{}",
+                    unit.name
+                );
+                if f.slot != TlsSlot::Offset {
+                    assert!(unit.bytes.iter().all(|&b| b == 0), "{}", unit.name);
+                }
+                (unit.name.clone(), f.offset, f.slot, f.offset_in_block)
+            })
+            .collect();
+        slots.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        slots
+            .into_iter()
+            .map(|(.., slot, off)| (slot, off))
+            .collect()
+    }
+
+    /// GCC's default on aarch64: one TLS descriptor per variable, two words
+    /// each, the local ones written with no symbol and their offset in the
+    /// block as the addend. `scratch` is at 0x18, `counter` at 0x10 and the
+    /// exported `shared` at 0x8.
+    #[test]
+    fn an_aarch64_tls_descriptor_is_copied_whole_and_lifted_as_a_tls_slot() {
+        assert_eq!(
+            tls_slots_of("tls_get"),
+            [
+                (TlsSlot::Descriptor, 0x18),
+                (TlsSlot::Descriptor, 0x10),
+                (TlsSlot::Descriptor, 0x8),
+            ]
+        );
+        let state = extract_aarch64_from(&aarch64_tls_lib(), "tls_get");
+        let block = state.tls_blocks.values().flatten().next().expect("PT_TLS");
+        assert_eq!(
+            (block.image.len(), block.memsz, block.align),
+            (0x14, 0x34, 8)
+        );
+    }
+
+    /// An initial-exec variable is reached through one GOT slot holding its
+    /// offset from the thread pointer.
+    #[test]
+    fn an_aarch64_static_tls_offset_is_lifted_as_a_tls_slot() {
+        assert_eq!(tls_slots_of("tls_fast"), [(TlsSlot::ThreadPointer, 0)]);
+    }
+
+    /// The traditional dialect calls `__tls_get_addr`, which stays external,
+    /// with a module/offset pair for each variable; the code names the first
+    /// slot of the pair and the callee reads both, so both are copied.
+    #[test]
+    fn an_aarch64_module_and_offset_pair_is_copied_whole() {
+        assert_eq!(
+            tls_slots_of("tls_trad"),
+            [
+                (TlsSlot::Module, 0),
+                (TlsSlot::Offset, 0x30),
+                (TlsSlot::Module, 0),
+                (TlsSlot::Offset, 0x8),
+            ]
+        );
+        let units = extract_aarch64_units_of(&aarch64_tls_lib(), "tls_trad");
+        assert!(
+            units["tls_trad"]
+                .iter()
+                .any(|r| r.ends_with("-> extern __tls_get_addr+0")),
+            "{:?}",
+            units["tls_trad"]
+        );
+    }
+
+    /// A TLS relocation in a library with no `PT_TLS` names a block there is
+    /// nothing to lay out from, and is refused rather than guessed at.
+    #[test]
+    fn a_tls_slot_in_a_library_without_tls_is_refused() {
+        let lib = lib_with_retyped_strnames_reloc(object::elf::R_X86_64_TPOFF64.0);
+        let mut state = test_state();
+        let key = key_in(&mut state, lib.path(), "strnames");
+        let Err(err) = reserve_and_extract(&key, &mut state) else {
+            panic!("a TLS slot was lifted out of a library with no PT_TLS");
+        };
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("R_X86_64_TPOFF64") && err.contains("PT_TLS"),
+            "{err}"
+        );
     }
 
     /// [`extract_aarch64_units`], with each unit's relocations spelled out as
     /// `offset field -> target`.
     fn extract_aarch64(seed: &str) -> BTreeMap<String, Vec<String>> {
-        let units = extract_aarch64_units(seed);
+        extract_aarch64_units_of(&aarch64_lib(), seed)
+    }
+
+    /// [`extract_aarch64`] out of the aarch64 library `lib`.
+    fn extract_aarch64_units_of(lib: &Path, seed: &str) -> BTreeMap<String, Vec<String>> {
+        let units = extract_aarch64_from(lib, seed).units;
         let name_of: BTreeMap<u32, String> =
             units.iter().map(|u| (u.id.0, u.name.clone())).collect();
         units

@@ -909,6 +909,7 @@ mod verneed_tests {
             new_externals: Vec::new(),
             got_imports: Vec::new(),
             init_fini: None,
+            tls: None,
         }
     }
 
@@ -1274,6 +1275,7 @@ mod gnu_property_tests {
             new_externals: Vec::new(),
             got_imports: Vec::new(),
             init_fini: None,
+            tls: None,
         }
     }
 

@@ -199,6 +199,54 @@ pub struct GotSlotImport {
     pub weak: bool,
 }
 
+/// A copied GOT slot the loader fills from a dynamic TLS relocation (see
+/// [`crate::tls`]): a module id, a variable's offset in its block or from the
+/// thread pointer, or a TLS descriptor.
+///
+/// Recorded during extraction as (unit, offset) like a [`GotSlotFixup`];
+/// layout turns it into a [`TlsReloc`] once both the slot and the library's
+/// place in the merged TLS block are known.
+#[derive(Debug, Clone)]
+pub struct TlsSlotFixup {
+    pub unit: UnitId,
+    pub offset: u64,
+    /// The library whose block the variable is in.
+    pub lib: PathBuf,
+    pub slot: crate::arch::TlsSlot,
+    /// The variable's offset within that library's block; 0 for a module id.
+    pub offset_in_block: u64,
+    /// A module id the library's code asked for without naming a variable —
+    /// `R_*_DTPMOD64` with no symbol. Local-dynamic code asks for that, then
+    /// adds offsets in the library's block that the linker wrote into the
+    /// instructions, which are only right if the block still starts the
+    /// module's.
+    pub module_base: bool,
+}
+
+/// A dynamic TLS relocation the writer adds to the executable, against the
+/// executable's own module: no symbol, `addend` the variable's offset in the
+/// merged block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsReloc {
+    pub vaddr: u64,
+    pub r_type: u32,
+    pub addend: i64,
+}
+
+/// The executable's TLS block once the merged libraries' blocks have joined
+/// it: a new `PT_TLS`, whose template sits in the merged constants.
+#[derive(Debug, Clone)]
+pub struct TlsPlan {
+    /// Where the template is; its `p_vaddr`.
+    pub vaddr: u64,
+    /// The initialized part of the template, `p_filesz` bytes.
+    pub image: Vec<u8>,
+    pub memsz: u64,
+    pub align: u64,
+    /// One per copied TLS slot.
+    pub relocs: Vec<TlsReloc>,
+}
+
 /// A symbol that the executable imports from a shared library.
 #[derive(Debug, Clone)]
 pub struct ImportedSymbol {
@@ -481,6 +529,9 @@ pub struct MergePlan {
     pub got_imports: Vec<GotSlotImport>,
     /// Plan for extending init/fini arrays with merged library constructors/destructors.
     pub init_fini: Option<InitFiniPlan>,
+    /// The merged TLS block, when a merged library brought thread-local
+    /// variables with it.
+    pub tls: Option<TlsPlan>,
 }
 
 impl MergePlan {

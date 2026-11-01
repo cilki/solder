@@ -21,3 +21,13 @@ aarch64 host:
 cc -O2 -fPIC -fno-section-anchors -shared -Wl,-soname,libpages.so.1 \
    -o libpages.so.1 libpages.c
 ```
+
+`libtls.so.1` is the same for thread-local storage, built from `libtls.c`
+(TLS descriptors and a static-TLS offset) and `libtls-trad.c` (the
+`__tls_get_addr` module/offset pairs, which need the traditional dialect):
+
+```sh
+cc -O2 -fPIC -fno-section-anchors -c libtls.c
+cc -O2 -fPIC -fno-section-anchors -mtls-dialect=trad -c libtls-trad.c
+cc -shared -Wl,-soname,libtls.so.1 -o libtls.so.1 libtls.o libtls-trad.o
+```

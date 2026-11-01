@@ -11,6 +11,7 @@ mod lib_discovery;
 mod patcher;
 mod relocator;
 mod symbol_analysis;
+mod tls;
 mod types;
 mod writer;
 
@@ -141,6 +142,8 @@ fn run() -> Result<()> {
         units,
         init_fini,
         got_slot_fixups,
+        tls_slot_fixups,
+        tls_blocks,
         data_section_copies,
     } = extractor::extract_units(imports, &exe_elf, merged_lib_syms, &copy_relocated, arch)?;
 
@@ -238,11 +241,17 @@ fn run() -> Result<()> {
         init_fini,
         &lib_order,
         got_slot_fixups,
+        tls_slot_fixups,
+        &tls_blocks,
     )?;
 
     // Nothing in the executable reaches these libraries any more, so their
     // DT_NEEDED entries (and the version requirements against them) go.
     plan.remove_needed = absorbed.iter().map(|lib| lib.soname.clone()).collect();
+
+    let removed_libs: HashSet<&std::path::Path> =
+        absorbed.iter().map(|lib| lib.path.as_path()).collect();
+    refuse_tls_imports_from_removed(&exe_elf, arch, merged_lib_syms, &removed_libs)?;
 
     info!(
         load_address = format_args!("0x{:016x}", plan.load_address),
@@ -352,8 +361,6 @@ fn run() -> Result<()> {
     // removing (e.g. ncurses' UP/PC/BC). Only symbols a library we are dropping
     // provides are eligible, so a candidate library that stays in DT_NEEDED
     // keeps its copy relocations.
-    let removed_libs: HashSet<&std::path::Path> =
-        absorbed.iter().map(|lib| lib.path.as_path()).collect();
     let removed_provided_syms: HashSet<String> = merged_lib_syms
         .iter()
         .filter(|(_, lib)| removed_libs.contains(lib.as_path()))
@@ -394,6 +401,51 @@ fn run() -> Result<()> {
         "Merge complete"
     );
 
+    Ok(())
+}
+
+/// Stop a merge that removes a library whose thread-local variable the
+/// executable reaches itself, through a TLS relocation against the variable's
+/// name: with the library gone nothing defines the name, and the loader fails
+/// the whole process on it. The merge rewrites the TLS slots it copies out of
+/// a library, but not the executable's own.
+fn refuse_tls_imports_from_removed(
+    exe_elf: &object::read::elf::ElfFile64<'_>,
+    arch: &arch::Arch,
+    merged_lib_syms: &HashMap<String, std::path::PathBuf>,
+    removed: &HashSet<&std::path::Path>,
+) -> Result<()> {
+    use object::{Object, ObjectSymbol, ObjectSymbolTable};
+    let Some(dynsym) = exe_elf.dynamic_symbol_table() else {
+        return Ok(());
+    };
+    for (vaddr, reloc) in exe_elf.dynamic_relocations().into_iter().flatten() {
+        let object::RelocationFlags::Elf { r_type } = reloc.flags() else {
+            continue;
+        };
+        let Some((name, _)) = arch.tls.slot(r_type.0) else {
+            continue;
+        };
+        let object::RelocationTarget::Symbol(si) = reloc.target() else {
+            continue;
+        };
+        let Ok(sym) = dynsym.symbol_by_index(si) else {
+            continue;
+        };
+        let Ok(sym_name) = sym.name() else { continue };
+        if let Some(lib) = merged_lib_syms.get(sym_name)
+            && sym.is_undefined()
+            && removed.contains(lib.as_path())
+        {
+            anyhow::bail!(
+                "the executable reaches '{sym_name}', a thread-local variable of {}, \
+                 itself ({name} at {vaddr:#x}); merging that library would leave nothing \
+                 defining it, and solder does not rewrite the executable's own TLS \
+                 relocations yet",
+                lib.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -700,6 +752,7 @@ mod dry_run_report_tests {
             new_externals: Vec::new(),
             got_imports: Vec::new(),
             init_fini: None,
+            tls: None,
         }
     }
 

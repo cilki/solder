@@ -40,7 +40,9 @@ use aarch64::InsnField;
 /// `extractor::reject_unliftable_dynamic_reloc`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unliftable {
-    /// A module id, or an offset from the thread pointer.
+    /// A static-link TLS relocation, which the linker resolves into GOT slots
+    /// carrying the dynamic ones in [`TlsAbi`] and so never leaves in a
+    /// linked library.
     Tls,
     /// Whatever an ifunc resolver returns.
     Ifunc,
@@ -61,6 +63,67 @@ pub struct DynRelocTypes {
     pub jump_slot: u32,
     /// Copy the symbol's initial value into the executable's own storage.
     pub copy: u32,
+}
+
+/// What a dynamic thread-local-storage relocation asks the loader to put in
+/// its slot. Each is relative to a module's TLS block, which is why the merge
+/// can keep them dynamic: once a library's `PT_TLS` block is part of the
+/// executable's, the same relocation against the executable's own module (no
+/// symbol, the variable's offset in the merged block as the addend) gets the
+/// value the library's copy would have got. See [`crate::tls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsSlot {
+    /// The module id `__tls_get_addr` looks the block up by.
+    Module,
+    /// The variable's offset within its module's block.
+    Offset,
+    /// The variable's offset from the thread pointer, for static TLS.
+    ThreadPointer,
+    /// A two-word TLS descriptor: a resolver and the argument it is called
+    /// with.
+    Descriptor,
+}
+
+/// Where a thread's static TLS blocks sit relative to its thread pointer,
+/// which decides where the executable's own block is, and so which end of a
+/// merged block it has to keep. See [`crate::tls::plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsLayout {
+    /// Variant I (aarch64): the blocks follow a thread control block of
+    /// `tcb_size` bytes the thread pointer points at, the executable's first.
+    AboveTp { tcb_size: u64 },
+    /// Variant II (x86-64): the blocks end at the thread pointer, the
+    /// executable's last.
+    BelowTp,
+}
+
+/// How an architecture lays out thread-local storage and names the dynamic
+/// relocations that reach it.
+#[derive(Debug, Clone)]
+pub struct TlsAbi {
+    pub layout: TlsLayout,
+    /// Each dynamic TLS relocation type, as readelf names it, and what it
+    /// puts in its slot.
+    pub relocs: [(u32, &'static str, TlsSlot); 4],
+}
+
+impl TlsAbi {
+    /// The name and the meaning of TLS relocation type `r_type`, if it is one.
+    pub fn slot(&self, r_type: u32) -> Option<(&'static str, TlsSlot)> {
+        self.relocs
+            .iter()
+            .find(|(t, ..)| *t == r_type)
+            .map(|&(_, name, slot)| (name, slot))
+    }
+
+    /// The relocation type that fills a slot of kind `slot`.
+    pub fn r_type(&self, slot: TlsSlot) -> u32 {
+        self.relocs
+            .iter()
+            .find(|(.., s)| *s == slot)
+            .map(|&(t, ..)| t)
+            .expect("every TlsSlot kind has a relocation")
+    }
 }
 
 /// The processor-specific GNU properties (`.note.gnu.property`) that describe
@@ -106,6 +169,8 @@ pub struct Arch {
     /// The dynamic relocation types the merge refuses to lift, with their
     /// names, for the error that says why.
     pub unliftable_relocs: &'static [(u32, &'static str, Unliftable)],
+    /// Thread-local storage: the block layout and its dynamic relocations.
+    pub tls: TlsAbi,
     /// `_DL_CACHE_DEFAULT_ID`: the `flags` value an `ld.so.cache` entry has to
     /// carry for this architecture's loader to use it.
     pub ldso_cache_flags: u32,
@@ -356,9 +421,30 @@ mod tests {
             (1024, 1025, 1026, 1027)
         );
         let unliftable: Vec<u32> = AARCH64.unliftable_relocs.iter().map(|(t, ..)| *t).collect();
-        assert_eq!(unliftable, [1028, 1029, 1030, 1031, 1032, 1024]);
-        for (t, name, _) in AARCH64.unliftable_relocs {
+        assert_eq!(unliftable, [1032, 1024]);
+        let tls: Vec<u32> = AARCH64.tls.relocs.iter().map(|(t, ..)| *t).collect();
+        assert_eq!(tls, [1028, 1029, 1030, 1031]);
+        let names = AARCH64.unliftable_relocs.iter().map(|(t, n, _)| (t, n));
+        for (t, name) in names.chain(AARCH64.tls.relocs.iter().map(|(t, n, _)| (t, n))) {
             assert!(name.starts_with("R_AARCH64_"), "{t}: {name}");
+        }
+    }
+
+    /// A TLS relocation is lifted as a TLS slot, so one that was also listed
+    /// as unliftable would be refused before it got there; and each kind of
+    /// slot has exactly one relocation filling it.
+    #[test]
+    fn each_tls_relocation_is_lifted_and_names_one_kind_of_slot() {
+        for arch in DESCRIBED {
+            for (t, name, slot) in &arch.tls.relocs {
+                assert!(
+                    !arch.unliftable_relocs.iter().any(|(u, ..)| u == t),
+                    "{}: {name}",
+                    arch.name
+                );
+                assert_eq!(arch.tls.r_type(*slot), *t, "{}: {name}", arch.name);
+                assert_eq!(arch.tls.slot(*t), Some((*name, *slot)), "{}", arch.name);
+            }
         }
     }
 

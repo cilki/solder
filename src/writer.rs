@@ -56,6 +56,16 @@ pub fn build_merged_segment(plan: &mut MergePlan) -> Result<Vec<u8>> {
         seg[off..off + code.len()].copy_from_slice(&code);
     }
 
+    // The merged TLS template, which the new PT_TLS points the loader at.
+    if let Some(tls) = &plan.tls {
+        let off = (tls.vaddr - plan.load_address) as usize;
+        let end = off + tls.image.len();
+        if end > seg.len() {
+            bail!("TLS template at offset 0x{off:x} overflows segment");
+        }
+        seg[off..end].copy_from_slice(&tls.image);
+    }
+
     // Write the preinit and fini arrays if present. Each entry is a link-time
     // VA in the output image, so under PIE each one also needs an
     // R_X86_64_RELATIVE relocation for ld.so to rebase it.
@@ -95,7 +105,7 @@ pub fn write_output(
     merged_seg: &[u8],
     output_path: &std::path::Path,
 ) -> Result<()> {
-    use object::elf::{PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR};
+    use object::elf::{PF_R, PF_W, PF_X, PT_LOAD, PT_PHDR, PT_TLS};
     use object::read::elf::{ElfFile64, ProgramHeader};
 
     check_runtime_writes_are_writable(plan)?;
@@ -168,8 +178,15 @@ pub fn write_output(
     }
     boundaries.push((plan.writable_end, PF_R.0));
 
+    // The merged TLS block replaces the executable's PT_TLS, or is a new one
+    // when it had none.
+    let old_tls = old_phdrs
+        .iter()
+        .position(|phdr| phdr.p_type(endian) == PT_TLS);
+    let adds_tls = plan.tls.is_some() && old_tls.is_none();
+
     // Calculate sizes for embedding PHT within the new PT_LOAD segments.
-    let new_phnum = old_phdrs.len() + boundaries.len();
+    let new_phnum = old_phdrs.len() + boundaries.len() + usize::from(adds_tls);
     let pht_size = (new_phnum * phdr_entry_size) as u64;
 
     // PHT will be placed at the end of the extended segment, aligned to 8 bytes.
@@ -245,6 +262,29 @@ pub fn write_output(
         write_u64_le(&mut out, dst + 48, plan.page_size);
         written += phdr_entry_size;
     }
+
+    if let Some(tls) = &plan.tls {
+        let dst = match old_tls {
+            Some(i) => pht_start + i * phdr_entry_size,
+            None => {
+                written += phdr_entry_size;
+                pht_start + written - phdr_entry_size
+            }
+        };
+        write_u32_le(&mut out, dst, PT_TLS.0);
+        write_u32_le(&mut out, dst + 4, PF_R.0);
+        write_u64_le(
+            &mut out,
+            dst + 8,
+            seg_file_offset + (tls.vaddr - plan.load_address),
+        );
+        write_u64_le(&mut out, dst + 16, tls.vaddr);
+        write_u64_le(&mut out, dst + 24, tls.vaddr);
+        write_u64_le(&mut out, dst + 32, tls.image.len() as u64);
+        write_u64_le(&mut out, dst + 40, tls.memsz);
+        write_u64_le(&mut out, dst + 48, tls.align);
+    }
+    debug_assert_eq!(written, new_phnum * phdr_entry_size);
 
     // Update ELF header: e_phoff and e_phnum.
     write_u64_le(&mut out, 32, pht_file_offset);
@@ -619,6 +659,12 @@ fn check_runtime_writes_are_writable(plan: &MergePlan) -> Result<()> {
             plan.got_imports
                 .iter()
                 .map(|g| ("copied GOT slot", g.got_vaddr, format!(" for '{}'", g.name))),
+        )
+        .chain(
+            plan.tls
+                .iter()
+                .flat_map(|tls| &tls.relocs)
+                .map(|r| ("copied TLS slot", r.vaddr, String::new())),
         );
     for (what, vaddr, which) in slots {
         if misplaced(vaddr) {
@@ -863,9 +909,11 @@ fn build_extended_segment(
 
     // ---- 2. Rebuild .rela.dyn (always when there's anything new to write).
 
+    let tls_relocs = plan.tls.as_ref().map_or(&[][..], |tls| &tls.relocs);
     let need_new_rela = !plan.relative_relocs.is_empty()
         || !plan.new_externals.is_empty()
-        || !plan.got_imports.is_empty();
+        || !plan.got_imports.is_empty()
+        || !tls_relocs.is_empty();
     if need_new_rela {
         let (existing_relative, existing_non_relative, old_relacount) =
             read_existing_rela_dyn(patched_exe, exe, dynamic)?;
@@ -904,17 +952,30 @@ fn build_extended_segment(
             new_glob_dat.extend_from_slice(&entry);
         }
 
+        // One TLS relocation per copied TLS slot, against the executable's own
+        // module: symbol 0, so r_info is the type alone.
+        let mut new_tls = Vec::with_capacity(tls_relocs.len() * RELA_ENTRY_SIZE);
+        for reloc in tls_relocs {
+            let mut entry = [0u8; RELA_ENTRY_SIZE];
+            entry[0..8].copy_from_slice(&reloc.vaddr.to_le_bytes());
+            entry[8..16].copy_from_slice(&u64::from(reloc.r_type).to_le_bytes());
+            entry[16..24].copy_from_slice(&reloc.addend.to_le_bytes());
+            new_tls.extend_from_slice(&entry);
+        }
+
         pad_to(&mut extended, 8);
         let rela_at = extended.len();
         extended.extend_from_slice(&existing_relative);
         extended.extend_from_slice(&new_relative);
         extended.extend_from_slice(&existing_non_relative);
         extended.extend_from_slice(&new_glob_dat);
+        extended.extend_from_slice(&new_tls);
 
         let total_size = existing_relative.len()
             + new_relative.len()
             + existing_non_relative.len()
-            + new_glob_dat.len();
+            + new_glob_dat.len()
+            + new_tls.len();
         let new_count = old_relacount + (plan.relative_relocs.len() as u64);
 
         info.rebuilt(".rela.dyn", DT_RELA, Some(DT_RELASZ), rela_at, total_size);
@@ -1108,6 +1169,7 @@ mod runtime_write_tests {
             new_externals: Vec::new(),
             got_imports: Vec::new(),
             init_fini: None,
+            tls: None,
         }
     }
 
@@ -1205,6 +1267,7 @@ mod trampoline_tests {
             new_externals: Vec::new(),
             got_imports: Vec::new(),
             init_fini: None,
+            tls: None,
         }
     }
 
@@ -1355,12 +1418,119 @@ mod section_header_tests {
             init_fini,
             lib_order,
             Vec::new(),
+            Vec::new(),
+            &std::collections::HashMap::new(),
         )
         .expect("plan layout");
 
         let seg = build_merged_segment(&mut plan).expect("build merged segment");
         write_output(exe, &plan, &seg, dest).expect("write output");
         plan
+    }
+
+    /// A merged library's TLS block becomes the executable's `PT_TLS` — a new
+    /// one, since `test/grep` has none — with its template among the merged
+    /// constants, and each copied TLS slot gets a relocation against the
+    /// executable's own module: no symbol, the variable's offset in the merged
+    /// block as the addend.
+    #[test]
+    fn a_merged_tls_block_becomes_the_executables_pt_tls() {
+        use crate::arch::TlsSlot;
+        use crate::types::TlsSlotFixup;
+        use object::Object;
+        use object::read::elf::ProgramHeader;
+
+        let lib = PathBuf::from("/nonexistent/libtest.so.1");
+        let block = crate::tls::TlsBlock {
+            image: vec![1, 2, 3, 4, 5, 6],
+            memsz: 0x20,
+            align: 16,
+        };
+        let fixups = vec![TlsSlotFixup {
+            unit: UnitId(2),
+            offset: 8,
+            lib: lib.clone(),
+            slot: TlsSlot::ThreadPointer,
+            offset_in_block: 0x10,
+            module_base: false,
+        }];
+        let out = tempfile::NamedTempFile::new().expect("temp output");
+        let mapped = MappedElf::open(Path::new(GREP)).expect("open test/grep");
+        let elf = mapped.parse().expect("parse test/grep");
+        let arch = &crate::arch::X86_64;
+        let rela = crate::symbol_analysis::RelaTables::read(&elf, arch).expect("the .rela tables");
+        let mut plan = plan_layout(
+            vec![
+                unit(0, "fn_a", SectionKind::Text, 64, &[]),
+                unit(2, "data_a", SectionKind::Data, 48, &[]),
+            ],
+            &elf,
+            &[],
+            &rela.got_slot_vas(),
+            arch,
+            true,
+            InitFiniArrays::default(),
+            std::slice::from_ref(&lib),
+            Vec::new(),
+            fixups,
+            &std::collections::HashMap::from([(lib.clone(), block)]),
+        )
+        .expect("plan layout");
+        let seg = build_merged_segment(&mut plan).expect("build merged segment");
+        write_output(mapped.bytes(), &plan, &seg, out.path()).expect("write output");
+        let bytes = std::fs::read(out.path()).expect("read the merged output back");
+
+        let merged = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes)
+            .expect("parse the output");
+        let endian = merged.endian();
+        let tls: Vec<_> = merged
+            .elf_program_headers()
+            .iter()
+            .filter(|p| p.p_type(endian) == object::elf::PT_TLS)
+            .collect();
+        assert_eq!(tls.len(), 1, "one PT_TLS");
+        let tls = tls[0];
+        let vaddr = tls.p_vaddr(endian);
+        assert!(
+            (plan.load_address + plan.exec_size..plan.load_address + plan.rodata_end)
+                .contains(&vaddr),
+            "the template at {vaddr:#x} is not among the merged constants"
+        );
+        assert_eq!(
+            (
+                tls.p_filesz(endian),
+                tls.p_memsz(endian),
+                tls.p_align(endian)
+            ),
+            (6, 0x20, 16)
+        );
+        assert_eq!(vaddr % 16, 0);
+        assert_eq!(
+            tls.data(endian, &*bytes).expect("the template"),
+            [1, 2, 3, 4, 5, 6]
+        );
+
+        let data_a = plan
+            .units
+            .iter()
+            .find(|u| u.unit.name == "data_a")
+            .expect("data_a placed")
+            .assigned_vaddr;
+        let tpoff = merged
+            .dynamic_relocations()
+            .into_iter()
+            .flatten()
+            .find(|(at, _)| *at == data_a + 8)
+            .map(|(_, r)| r)
+            .expect("a relocation for the copied TLS slot");
+        assert_eq!(
+            tpoff.flags(),
+            object::RelocationFlags::Elf {
+                r_type: object::elf::R_X86_64_TPOFF64
+            }
+        );
+        assert_eq!(tpoff.target(), object::RelocationTarget::Absolute);
+        assert_eq!(tpoff.addend(), 0x10);
     }
 
     fn section_table(bytes: &[u8]) -> SectionTable {

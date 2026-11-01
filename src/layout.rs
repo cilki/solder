@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::{debug, trace};
 
 use crate::elf_reader::{merged_load_address, va_to_file_offset};
+use crate::tls::TlsBlock;
 use crate::types::{
     AssignedUnit, ExtractedUnit, GotPatch, InitFiniArrays, InitFiniKind, InitFiniPlan, MergePlan,
-    MergedArray, NewExternalSym, RelocTarget, SectionKind, TrampolineStub,
+    MergedArray, NewExternalSym, RelocTarget, SectionKind, TlsPlan, TlsReloc, TlsSlotFixup,
+    TrampolineStub,
 };
 
 /// Plan the virtual address layout of all extracted units and trampolines,
@@ -27,9 +29,12 @@ pub fn plan_layout(
     init_fini: InitFiniArrays,
     lib_order: &[PathBuf],
     got_slot_fixups: Vec<crate::types::GotSlotFixup>,
+    tls_slot_fixups: Vec<TlsSlotFixup>,
+    tls_blocks: &HashMap<PathBuf, TlsBlock>,
 ) -> Result<MergePlan> {
     let page_size = crate::elf_reader::page_size(exe_elf, arch);
     let load_address = merged_load_address(exe_elf, page_size);
+    let merged_tls = merge_tls_blocks(exe_elf, arch, lib_order, &tls_slot_fixups, tls_blocks)?;
 
     // Separate units by section kind.
     let mut text: Vec<ExtractedUnit> = Vec::new();
@@ -108,8 +113,11 @@ pub fn plan_layout(
     // own, so the merged constants keep the permissions the library gave them.
     // The rest — anything the dynamic loader rebases or resolves at startup —
     // has to stay in the writable run.
-    let got_slot_units: HashSet<crate::types::UnitId> =
-        got_slot_fixups.iter().map(|f| f.unit).collect();
+    let got_slot_units: HashSet<crate::types::UnitId> = got_slot_fixups
+        .iter()
+        .map(|f| f.unit)
+        .chain(tls_slot_fixups.iter().map(|f| f.unit))
+        .collect();
     let (rebased_rodata, const_rodata): (Vec<ExtractedUnit>, Vec<ExtractedUnit>) =
         rodata.into_iter().partition(|unit| {
             got_slot_units.contains(&unit.id)
@@ -122,6 +130,15 @@ pub fn plan_layout(
     );
 
     units.extend(assign_addresses(load_address, &mut offset, const_rodata));
+
+    // The merged TLS template is read-only too: the loader copies it into
+    // each thread's block and never writes it.
+    let tls_vaddr = merged_tls.as_ref().map(|(_, merged)| {
+        offset = align_up(offset, merged.align);
+        let vaddr = load_address + offset;
+        offset += merged.image.len() as u64;
+        vaddr
+    });
 
     // End of the read-only run, for the same page-boundary reason.
     offset = align_up(offset, page_size);
@@ -220,6 +237,17 @@ pub fn plan_layout(
         });
     }
 
+    let tls = match (merged_tls, tls_vaddr) {
+        (Some((libs, merged)), Some(vaddr)) => Some(TlsPlan {
+            vaddr,
+            relocs: resolve_tls_slots(arch, tls_slot_fixups, &unit_vaddr_by_id, &libs, &merged)?,
+            image: merged.image,
+            memsz: merged.memsz,
+            align: merged.align,
+        }),
+        _ => None,
+    };
+
     // The relocations to neutralize are chosen by the caller, so leave them empty here.
     // Relative relocs are populated during segment building (trampolines) and patching (GOT).
     Ok(MergePlan {
@@ -243,7 +271,136 @@ pub fn plan_layout(
         new_externals,
         got_imports,
         init_fini: init_fini_plan,
+        tls,
     })
+}
+
+/// The executable's TLS block with the merged libraries' blocks in it, laid
+/// out by [`crate::tls::plan`] in the order of `lib_order`, or `None` when no
+/// merged code reaches thread-local storage. Libraries `lib_order` does not
+/// list come after the ones it does, by path.
+fn merge_tls_blocks(
+    exe_elf: &object::read::elf::ElfFile64<'_>,
+    arch: &crate::arch::Arch,
+    lib_order: &[PathBuf],
+    fixups: &[TlsSlotFixup],
+    blocks: &HashMap<PathBuf, TlsBlock>,
+) -> Result<Option<(Vec<PathBuf>, crate::tls::MergedTls)>> {
+    if fixups.is_empty() {
+        return Ok(None);
+    }
+    let mut libs: Vec<PathBuf> = lib_order
+        .iter()
+        .filter(|lib| blocks.contains_key(*lib))
+        .cloned()
+        .collect();
+    let mut rest: Vec<PathBuf> = blocks
+        .keys()
+        .filter(|lib| !libs.contains(lib))
+        .cloned()
+        .collect();
+    rest.sort();
+    libs.extend(rest);
+
+    let exe = TlsBlock::of(exe_elf, "the executable")?;
+    let lib_blocks: Vec<&TlsBlock> = libs.iter().map(|lib| &blocks[lib]).collect();
+    let merged = crate::tls::plan(arch.tls.layout, exe.as_ref(), &lib_blocks)?;
+    if merged.exe_offset != 0 {
+        refuse_moving_exe_tls_relocs(exe_elf, arch)?;
+    }
+    Ok(Some((libs, merged)))
+}
+
+/// Refuse a merge that would move the executable's own block within its module
+/// when the executable has dynamic TLS relocations of its own that name an
+/// offset in that block: those are written relative to the block's start,
+/// which the merge moves, and the merge does not rewrite them.
+///
+/// A linker relaxes every access an executable makes to its own thread-local
+/// variables to an offset from the thread pointer, which the move keeps, so
+/// only an unusual executable has any.
+fn refuse_moving_exe_tls_relocs(
+    exe_elf: &object::read::elf::ElfFile64<'_>,
+    arch: &crate::arch::Arch,
+) -> Result<()> {
+    use object::{Object, ObjectSymbol, ObjectSymbolTable};
+    let dynsym = exe_elf.dynamic_symbol_table();
+    for (vaddr, reloc) in exe_elf.dynamic_relocations().into_iter().flatten() {
+        let object::RelocationFlags::Elf { r_type } = reloc.flags() else {
+            continue;
+        };
+        let Some((name, slot)) = arch.tls.slot(r_type.0) else {
+            continue;
+        };
+        if slot == crate::arch::TlsSlot::Module {
+            continue;
+        }
+        let own = match reloc.target() {
+            object::RelocationTarget::Symbol(si) => dynsym
+                .as_ref()
+                .and_then(|t| t.symbol_by_index(si).ok())
+                .is_none_or(|s| !s.is_undefined()),
+            _ => true,
+        };
+        if own {
+            bail!(
+                "the executable's {name} at {vaddr:#x} names an offset in its own \
+                 thread-local block, which merging a library's thread-local storage in \
+                 front of it would move"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The dynamic TLS relocation each copied TLS slot gets, now that the slot has
+/// an address and its library a place in the merged block.
+fn resolve_tls_slots(
+    arch: &crate::arch::Arch,
+    fixups: Vec<TlsSlotFixup>,
+    unit_vaddrs: &HashMap<crate::types::UnitId, u64>,
+    libs: &[PathBuf],
+    merged: &crate::tls::MergedTls,
+) -> Result<Vec<TlsReloc>> {
+    fixups
+        .into_iter()
+        .map(|fixup| {
+            let base = unit_vaddrs.get(&fixup.unit).with_context(|| {
+                format!(
+                    "TLS slot fixup references UnitId({}) not in plan",
+                    fixup.unit.0
+                )
+            })?;
+            let at = libs
+                .iter()
+                .position(|lib| *lib == fixup.lib)
+                .map(|i| merged.lib_offsets[i])
+                .with_context(|| {
+                    format!(
+                        "no thread-local block was read for {} — internal error",
+                        fixup.lib.display()
+                    )
+                })?;
+            if fixup.module_base && at != 0 {
+                bail!(
+                    "{} asks for its thread-local block's module without naming a variable \
+                     (local-dynamic code), then adds offsets into the block that are written \
+                     in its instructions; those are only right where its block starts the \
+                     executable's, and it lands {at:#x} bytes in",
+                    fixup.lib.display()
+                );
+            }
+            let addend = match fixup.slot {
+                crate::arch::TlsSlot::Module => 0,
+                _ => (at + fixup.offset_in_block) as i64,
+            };
+            Ok(TlsReloc {
+                vaddr: base + fixup.offset,
+                r_type: arch.tls.r_type(fixup.slot),
+                addend,
+            })
+        })
+        .collect()
 }
 
 fn assign_addresses(
@@ -582,6 +739,8 @@ mod tests {
             init_fini,
             lib_order,
             Vec::new(),
+            Vec::new(),
+            &HashMap::new(),
         )
         .expect("plan layout")
     }
