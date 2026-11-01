@@ -59,11 +59,11 @@ pub fn build_merged_segment(plan: &mut MergePlan) -> Result<Vec<u8>> {
     // The merged TLS template, which the new PT_TLS points the loader at.
     if let Some(tls) = &plan.tls {
         let off = (tls.vaddr - plan.load_address) as usize;
-        let end = off + tls.image.len();
+        let end = off + tls.block.image.len();
         if end > seg.len() {
             bail!("TLS template at offset 0x{off:x} overflows segment");
         }
-        seg[off..end].copy_from_slice(&tls.image);
+        seg[off..end].copy_from_slice(&tls.block.image);
     }
 
     // Write the preinit and fini arrays if present. Each entry is a link-time
@@ -280,9 +280,9 @@ pub fn write_output(
         );
         write_u64_le(&mut out, dst + 16, tls.vaddr);
         write_u64_le(&mut out, dst + 24, tls.vaddr);
-        write_u64_le(&mut out, dst + 32, tls.image.len() as u64);
-        write_u64_le(&mut out, dst + 40, tls.memsz);
-        write_u64_le(&mut out, dst + 48, tls.align);
+        write_u64_le(&mut out, dst + 32, tls.block.image.len() as u64);
+        write_u64_le(&mut out, dst + 40, tls.block.memsz);
+        write_u64_le(&mut out, dst + 48, tls.block.align);
     }
     debug_assert_eq!(written, new_phnum * phdr_entry_size);
 
