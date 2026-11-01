@@ -257,14 +257,15 @@ fn run() -> Result<()> {
         load_address = format_args!("0x{:016x}", plan.load_address),
         got_patches = plan.got_patches.len(),
         trampolines = plan.trampoline_stubs.len(),
-        new_externals = plan.new_externals.len(),
+        got_imports = plan.got_imports.len(),
         "Merge plan"
     );
-    for ext in &plan.new_externals {
+    for gi in &plan.got_imports {
         info!(
-            symbol = ext.name,
-            got_vaddr = format_args!("0x{:x}", ext.got_vaddr),
-            "New external symbol (injected into .dynsym)"
+            symbol = gi.name,
+            got_vaddr = format_args!("0x{:x}", gi.got_vaddr),
+            weak = gi.weak,
+            "GOT slot for ld.so to resolve"
         );
     }
     for t in &plan.trampoline_stubs {
@@ -282,12 +283,7 @@ fn run() -> Result<()> {
     // so any dependency that still provides one of those symbols has to move
     // onto the executable's DT_NEEDED as the merged library leaves it.
     plan.add_needed = {
-        let injected: HashSet<String> = plan
-            .new_externals
-            .iter()
-            .map(|e| e.name.clone())
-            .chain(plan.got_imports.iter().map(|g| g.name.clone()))
-            .collect();
+        let injected: HashSet<String> = plan.got_imports.iter().map(|g| g.name.clone()).collect();
 
         // A dependency is looked up the way ld.so looks it up for the library
         // that declared it: through that library's own DT_RPATH/DT_RUNPATH
@@ -686,8 +682,8 @@ fn render_merge_plan(
         plan.trampoline_stubs.len()
     );
     say!(
-        "  symbols injected into .dynsym: {}",
-        plan.new_externals.len()
+        "  GOT slots in the new mapping for ld.so to resolve: {}",
+        plan.got_imports.len()
     );
     if let Some(init_fini) = &plan.init_fini {
         // Both arrays are rebuilt whole: the merged libraries' entries *and*
@@ -749,7 +745,6 @@ mod dry_run_report_tests {
             remove_needed: Vec::new(),
             add_needed: Vec::new(),
             relative_relocs: Vec::new(),
-            new_externals: Vec::new(),
             got_imports: Vec::new(),
             init_fini: None,
             tls: None,

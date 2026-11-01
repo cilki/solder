@@ -155,18 +155,6 @@ pub struct RelativeReloc {
     pub addend: i64,
 }
 
-/// A newly-injected external symbol — one that the merged libraries reference
-/// but the original executable did not. Solder appends a new entry to a copy
-/// of `.dynsym`/`.dynstr`/`.gnu.version` placed in the merged segment, adds a
-/// `GLOB_DAT` relocation pointing at a fresh GOT slot (also in the merged
-/// segment), and routes the trampoline for `name` through that slot.
-#[derive(Debug, Clone)]
-pub struct NewExternalSym {
-    pub name: String,
-    /// VA of the 8-byte GOT slot in the merged segment.
-    pub got_vaddr: u64,
-}
-
 /// Stable identifier for an extracted unit across pipeline stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UnitId(pub u32);
@@ -189,13 +177,18 @@ pub struct GotSlotFixup {
     pub weak: bool,
 }
 
-/// A resolved `GotSlotFixup`: the writer emits an R_X86_64_GLOB_DAT at
-/// `got_vaddr` against `name` (reusing the executable's .dynsym entry when one
-/// exists, otherwise injecting one).
+/// A GOT slot in the merged segment for ld.so to fill with `name`'s address:
+/// either a resolved `GotSlotFixup`, or the fresh slot layout allocates for a
+/// trampoline whose symbol the executable does not already import. The writer
+/// emits a `GLOB_DAT` at `got_vaddr` against `name`, reusing the executable's
+/// `.dynsym` entry when one exists and otherwise injecting one.
 #[derive(Debug, Clone)]
 pub struct GotSlotImport {
+    /// VA of the 8-byte GOT slot in the merged segment.
     pub got_vaddr: u64,
     pub name: String,
+    /// Whether an injected `.dynsym` entry is weak, so ld.so tolerates the
+    /// symbol staying unresolved. A trampoline's slot is always strong.
     pub weak: bool,
 }
 
@@ -521,11 +514,9 @@ pub struct MergePlan {
     pub add_needed: Vec<String>,
     /// R_X86_64_RELATIVE relocations to add for PIE executables.
     pub relative_relocs: Vec<RelativeReloc>,
-    /// Symbols the merged libraries reference but the executable doesn't import.
-    /// Each gets a new `.dynsym` entry, a fresh GOT slot in the merged segment,
-    /// and a `GLOB_DAT` relocation so the dynamic loader resolves it at startup.
-    pub new_externals: Vec<NewExternalSym>,
-    /// Copied GOT slots that must be re-resolved by ld.so at startup.
+    /// GOT slots in the merged segment that ld.so resolves at startup: the
+    /// fresh slot behind each trampoline whose symbol the executable doesn't
+    /// import, then the GOT slots copied along with a library's data.
     pub got_imports: Vec<GotSlotImport>,
     /// Plan for extending init/fini arrays with merged library constructors/destructors.
     pub init_fini: Option<InitFiniPlan>,
