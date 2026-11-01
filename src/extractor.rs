@@ -38,19 +38,6 @@ type FastMap<K, V> = rustc_hash::FxHashMap<K, V>;
 /// The set counterpart of [`FastMap`], for the same reasons.
 type FastSet<T> = rustc_hash::FxHashSet<T>;
 
-/// Relocation type names we explicitly reject with a helpful error.
-fn describe_reloc(
-    kind: object::RelocationKind,
-    encoding: object::RelocationEncoding,
-) -> &'static str {
-    match (kind, encoding) {
-        (object::RelocationKind::Got, _) => "GOT-relative (GOTPCREL/GOTPCRELX)",
-        (object::RelocationKind::GotRelative, _) => "GOT-relative",
-        (object::RelocationKind::GotBaseRelative, _) => "GOT-base-relative",
-        _ => "unsupported",
-    }
-}
-
 /// One of the libraries extraction is reading, named by position in
 /// [`ExtractionState::lib_paths`] rather than by path.
 ///
@@ -621,32 +608,6 @@ struct TlsFixup {
     slot: TlsSlot,
     offset_in_block: u64,
     module_base: bool,
-}
-
-/// Reject relocation kinds that need a GOT we cannot reproduce. `ctx` names the
-/// symbol or section being extracted.
-fn reject_got_reloc(
-    kind: object::RelocationKind,
-    encoding: object::RelocationEncoding,
-    ctx: &str,
-    lib: &Path,
-) -> Result<()> {
-    if matches!(
-        kind,
-        object::RelocationKind::Got
-            | object::RelocationKind::GotRelative
-            | object::RelocationKind::GotBaseRelative
-            | object::RelocationKind::GotBaseOffset
-    ) {
-        bail!(
-            "'{}' in {}: {} relocation is not supported in Tier 1; \
-             recompile the library with an older toolchain or wait for Tier 2 support",
-            ctx,
-            lib.display(),
-            describe_reloc(kind, encoding)
-        );
-    }
-    Ok(())
 }
 
 /// The `r_type` of a relocation the `object` crate read out of an ELF file.
@@ -2010,11 +1971,6 @@ fn collect_dynamic_range_relocs(
             continue;
         }
 
-        // Validate relocation kind (same as code extraction)
-        let kind = reloc.kind;
-        let encoding = reloc.encoding;
-        reject_got_reloc(kind, encoding, ctx, lib.path)?;
-
         // A TLS slot is filled by the loader against the executable's module
         // once the library's block is part of it (see `crate::tls`).
         if let Some((name, slot)) = reloc.r_type.and_then(|t| state.arch.tls.slot(t)) {
@@ -2023,7 +1979,26 @@ fn collect_dynamic_range_relocs(
             relocs.tls_fixups.push(fixup);
             continue;
         }
+        let kind = reloc.kind;
         reject_unliftable_dynamic_reloc(state.arch, kind, reloc.r_type, ctx, lib.path)?;
+
+        // The field the slot's value goes into, decided before the target is,
+        // so that a form the merge cannot write is refused whatever it points
+        // at — including a slot handed to ld.so as a GLOB_DAT below, which
+        // writes a whole pointer.
+        //
+        // The `object` crate does not name R_X86_64_RELATIVE/GLOB_DAT/JUMP_SLOT
+        // and reports a size of 0 for them, but all three describe a 64-bit
+        // slot. `reject_unliftable_dynamic_reloc` above is what makes widening
+        // the 0 sound: it is the only reason the unnamed types reaching here
+        // are those three and not, say, a TLS offset.
+        let reloc_size = if reloc.size == 0 { 64 } else { reloc.size };
+        let word = Word::of_object(kind, reloc.encoding, reloc_size).with_context(|| {
+            format!(
+                "'{ctx}' in {}: unsupported relocation kind {kind:?} (size={reloc_size})",
+                lib.path.display()
+            )
+        })?;
 
         // Resolve the relocation target symbol. Dynamic relocation symbol
         // indices refer to .dynsym, not .symtab.
@@ -2126,19 +2101,6 @@ fn collect_dynamic_range_relocs(
                 continue;
             }
         };
-
-        // The `object` crate does not name R_X86_64_RELATIVE/GLOB_DAT/JUMP_SLOT
-        // and reports a size of 0 for them, but all three describe a 64-bit
-        // slot. `reject_unliftable_dynamic_reloc` above is what makes widening
-        // the 0 sound: it is the only reason the unnamed types reaching here
-        // are those three and not, say, a TLS offset.
-        let reloc_size = if reloc.size == 0 { 64 } else { reloc.size };
-        let word = Word::of_object(kind, encoding, reloc_size).with_context(|| {
-            format!(
-                "'{ctx}' in {}: unsupported relocation kind {kind:?} (size={reloc_size})",
-                lib.path.display()
-            )
-        })?;
 
         occupied.insert(offset_within_unit);
         relocs.relocations.push(ExtractedReloc {
@@ -3229,6 +3191,12 @@ mod tests {
     /// `r_type` — so retyping one entry of a table solder is known to extract
     /// reproduces exactly the input that used to be patched as a pointer.
     fn lib_with_retyped_strnames_reloc(r_type: u32) -> tempfile::NamedTempFile {
+        lib_with_rewritten_strnames_reloc(u64::from(r_type))
+    }
+
+    /// [`lib_with_retyped_strnames_reloc`], with the entry's whole `r_info`
+    /// rewritten, so that it can name a symbol as well.
+    fn lib_with_rewritten_strnames_reloc(r_info: u64) -> tempfile::NamedTempFile {
         use object::read::elf::SectionHeader;
 
         let mut bytes = std::fs::read(test_lib("libtinfo.so.6")).expect("read libtinfo.so.6");
@@ -3256,9 +3224,9 @@ mod tests {
                 .expect("a .rela.dyn entry inside strnames")
         };
 
-        // r_info is (r_sym << 32) | r_type, and the entry found above is an
-        // R_X86_64_RELATIVE with no symbol, so the whole field is the type.
-        bytes[entry_offset..entry_offset + 8].copy_from_slice(&u64::from(r_type).to_le_bytes());
+        // r_info is (r_sym << 32) | r_type; the entry found above is an
+        // R_X86_64_RELATIVE with no symbol.
+        bytes[entry_offset..entry_offset + 8].copy_from_slice(&r_info.to_le_bytes());
 
         let out = tempfile::Builder::new()
             .suffix(".so.6")
@@ -3303,6 +3271,34 @@ mod tests {
                 "{expected} was not named in the error: {msg}"
             );
         }
+    }
+
+    /// A relocation form the merge cannot write is refused whatever it points
+    /// at. Against a symbol the library imports it used to slip through as a
+    /// copied GOT slot, and the GLOB_DAT handed to ld.so for it would have
+    /// written a whole pointer over a two-byte field.
+    #[test]
+    fn a_relocation_form_the_merge_cannot_write_is_refused_against_an_import() {
+        let undefined = {
+            let bytes = std::fs::read(test_lib("libtinfo.so.6")).expect("read libtinfo.so.6");
+            let elf = parse_lib(&bytes);
+            elf.dynamic_symbols()
+                .find(|s| s.is_undefined() && s.index().0 != 0)
+                .expect("libtinfo imports something")
+                .index()
+                .0 as u64
+        };
+        let lib = lib_with_rewritten_strnames_reloc(
+            (undefined << 32) | u64::from(object::elf::R_X86_64_16.0),
+        );
+        let mut state = test_state();
+        let key = key_in(&mut state, lib.path(), "strnames");
+        let err = match reserve_and_extract(&key, &mut state) {
+            Err(e) => e,
+            Ok(_) => panic!("an R_X86_64_16 against an import was extracted"),
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("size=16"), "{msg}");
     }
 
     /// The three types solder does lift are reported the same way as the ones
