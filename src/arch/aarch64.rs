@@ -789,6 +789,27 @@ fn implicit_registers(opcode: Opcode) -> &'static [usize] {
     }
 }
 
+/// Whether `insn` writes register `r` through one of its operands: as a
+/// destination, or as a base it writes back to. Register 31 is `sp`, which
+/// only an operand that can name `sp` writes.
+fn writes_register(insn: &Instruction, r: usize) -> bool {
+    insn.operands.iter().enumerate().any(|(k, operand)| {
+        let written = (k == 0 && writes_first_operand(insn.opcode))
+            || (k == 1 && writes_second_operand(insn.opcode));
+        match *operand {
+            Operand::RegPreIndex(b, _, true)
+            | Operand::RegPostIndex(b, _)
+            | Operand::RegPostIndexReg(b, _) => b as usize == r,
+            // Register 31 is `sp` only where the operand says so, and `xzr`
+            // everywhere else.
+            Operand::RegisterOrSP(_, d) => written && d as usize == r,
+            Operand::Register(_, d) => written && r < GPRS && d as usize == r,
+            Operand::RegisterPair(_, d) => written && (d as usize == r || d as usize + 1 == r),
+            _ => false,
+        }
+    })
+}
+
 /// The general-purpose registers `operand` names, `sp`/`xzr` left out.
 fn operand_registers(operand: &Operand) -> Vec<usize> {
     let regs: &[u16] = match *operand {
@@ -873,14 +894,27 @@ struct PageFlow {
     vaddr: u64,
     /// Per word, what it calls, if it is a call.
     calls: Vec<Option<Callee>>,
+    /// Per word, where it branches to if it is the `br` of a switch whose
+    /// jump table was read (see [`PageFlow::find_jump_tables`]).
+    br_targets: Vec<Option<Vec<usize>>>,
 }
+
+/// Reads `len` bytes of the library at a virtual address, if they are
+/// read-only data: what a jump table's entries are read through.
+pub type ReadData<'a> = dyn Fn(u64, usize) -> Option<Vec<u8>> + 'a;
 
 impl PageFlow {
     /// The function `bytes`, loaded at `vaddr`, decoded a word at a time. A
     /// trailing partial word is not code. `callee` says what a `bl` to an
     /// address calls (see [`TextUnit::callee`]); an indirect call's target
-    /// is not known until run time.
-    fn new(bytes: &[u8], vaddr: u64, callee: &dyn Fn(u64) -> Callee) -> PageFlow {
+    /// is not known until run time. `data` reads the jump tables the
+    /// function's switches index.
+    fn new(
+        bytes: &[u8],
+        vaddr: u64,
+        callee: &dyn Fn(u64) -> Callee,
+        data: &ReadData<'_>,
+    ) -> PageFlow {
         let words: Vec<u32> = bytes
             .chunks_exact(INSN_LEN)
             .map(|c| u32::from_le_bytes(c.try_into().expect("chunks_exact")))
@@ -903,12 +937,16 @@ impl PageFlow {
                 )
             })
             .collect();
-        PageFlow {
+        let n = words.len();
+        let mut flow = PageFlow {
             insns,
             words,
             vaddr,
             calls,
-        }
+            br_targets: vec![None; n],
+        };
+        flow.find_jump_tables(data);
+        flow
     }
 
     fn pc(&self, i: usize) -> u64 {
@@ -956,7 +994,13 @@ impl PageFlow {
             Bcc(_) | BCcc(_) | CBZ | CBNZ | TBZ | TBNZ => {
                 (next.into_iter().chain(branch_target()).collect(), false)
             }
-            BR | BRAA | BRAAZ | BRAB | BRABZ => (Vec::new(), true),
+            // A switch whose table was read goes to its cases and nowhere
+            // else.
+            BR => match &self.br_targets[i] {
+                Some(cases) => (cases.clone(), false),
+                None => (Vec::new(), true),
+            },
+            BRAA | BRAAZ | BRAB | BRABZ => (Vec::new(), true),
             RET | RETAA | RETAB | RETAASPPC | RETABSPPC | RETAASPPCR | RETABSPPCR | ERET
             | ERETAA | ERETAB | DRPS | UDF | BRK | HLT | Invalid => (Vec::new(), false),
             _ => (next.into_iter().collect(), false),
@@ -970,10 +1014,12 @@ impl PageFlow {
     /// whether it grew. Returns the state before each word, `None` for a word
     /// nothing reaches.
     ///
-    /// Code control never falls or branches into from the entry (a switch case
-    /// only its jump table reaches, or a local function only ever called) is
-    /// still followed: it starts from what the function's indirect branches
-    /// carried, which is where a jump table sends it.
+    /// A switch whose jump table was read branches to its cases like any
+    /// other branch. Code control never falls or branches into from the entry
+    /// otherwise (a case of a table that could not be read, or a local
+    /// function only ever called) is still followed: it starts from what the
+    /// function's other indirect branches carried, which is where a jump
+    /// table sends it.
     fn solve<S: Clone>(
         &self,
         entry: S,
@@ -1177,25 +1223,7 @@ impl PageFlow {
             Frame::Unreached => Frame::Unreached,
             Frame::Unknown => Frame::Unknown,
         };
-        let writes = |r: usize| {
-            insn.operands.iter().enumerate().any(|(k, operand)| {
-                let written = (k == 0 && writes_first_operand(insn.opcode))
-                    || (k == 1 && writes_second_operand(insn.opcode));
-                match *operand {
-                    Operand::RegPreIndex(b, _, true)
-                    | Operand::RegPostIndex(b, _)
-                    | Operand::RegPostIndexReg(b, _) => b as usize == r,
-                    // Register 31 is `sp` only where the operand says so,
-                    // and `xzr` everywhere else.
-                    Operand::RegisterOrSP(_, d) => written && d as usize == r,
-                    Operand::Register(_, d) => written && r < GPRS && d as usize == r,
-                    Operand::RegisterPair(_, d) => {
-                        written && (d as usize == r || d as usize + 1 == r)
-                    }
-                    _ => false,
-                }
-            })
-        };
+        let writes = |r: usize| writes_register(insn, r);
 
         match add_sub {
             Some((31, n, by)) => out.set_sp(moved(n, by)),
@@ -1391,6 +1419,562 @@ impl PageFlow {
     }
 }
 
+/// The most entries a jump table is read for. A `switch` GCC turns into a
+/// table spans at most a few thousand values; a bound past that is not a
+/// switch's.
+const MAX_JUMP_TABLE_ENTRIES: u64 = 4096;
+
+/// The dispatch a dense `switch` compiles to, ending in a `br`:
+///
+/// ```text
+/// ldrh w0, [x28, w24, uxtw #1]   ; the entry: base register, index register
+/// adr  x1, .Lcases               ; the label the entries count from
+/// add  x0, x1, w0, sxth #2       ; .Lcases + entry * 4
+/// br   x0
+/// ```
+///
+/// The `ldr` and the `adr` come in either order. The entries are bytes,
+/// halfwords or words, extended as the `add` says and scaled by its shift.
+#[derive(Debug, Clone, Copy)]
+struct Dispatch {
+    /// The word index of the load that reads the entry.
+    load: usize,
+    /// The register holding the table's address at the load.
+    base: usize,
+    /// The register holding the case number at the load.
+    index: usize,
+    /// Whether the load uses all 64 bits of the index, rather than its low
+    /// 32.
+    index_64: bool,
+    /// The size of one entry in bytes.
+    entry_len: usize,
+    /// The `add`'s extend: `uxtb`..`sxtx`, 0 to 7 as encoded.
+    extend: u32,
+    /// The `add`'s left shift of the extended entry.
+    shift: u32,
+    /// The address the `adr` takes, which the entries count from.
+    label: u64,
+}
+
+/// What [`PageFlow::address_constants`] knows of one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Known {
+    /// No path that has been followed sets it.
+    Unreached,
+    /// The same address on every path that sets it.
+    Value(u64),
+    /// Anything else.
+    Any,
+}
+
+impl Known {
+    fn join(&mut self, from: Known) -> bool {
+        let joined = match (*self, from) {
+            (Known::Unreached, other) | (other, Known::Unreached) => other,
+            (Known::Value(a), Known::Value(b)) if a == b => Known::Value(a),
+            _ => Known::Any,
+        };
+        let changed = joined != *self;
+        *self = joined;
+        changed
+    }
+
+    fn add(self, by: i64) -> Known {
+        match self {
+            Known::Value(v) => Known::Value(v.wrapping_add(by as u64)),
+            other => other,
+        }
+    }
+}
+
+/// The state [`PageFlow::address_constants`] follows: the address each
+/// register and each eight-byte stack slot holds.
+#[derive(Debug, Clone)]
+struct ConstState {
+    regs: [Known; GPRS],
+    sp: Frame,
+    /// By offset from the entry `sp`.
+    slots: BTreeMap<i64, Known>,
+    /// What a slot not in `slots` holds.
+    other_slots: Known,
+}
+
+impl ConstState {
+    fn entry() -> ConstState {
+        ConstState {
+            regs: [Known::Any; GPRS],
+            sp: Frame::At(0),
+            slots: BTreeMap::new(),
+            other_slots: Known::Any,
+        }
+    }
+
+    fn unreached() -> ConstState {
+        ConstState {
+            regs: [Known::Unreached; GPRS],
+            sp: Frame::Unreached,
+            slots: BTreeMap::new(),
+            other_slots: Known::Unreached,
+        }
+    }
+
+    fn slot(&self, at: i64) -> Known {
+        self.slots.get(&at).copied().unwrap_or(self.other_slots)
+    }
+
+    fn join(&mut self, from: &ConstState) -> bool {
+        let mut grew = false;
+        for (into, &from) in self.regs.iter_mut().zip(&from.regs) {
+            grew |= into.join(from);
+        }
+        grew |= self.sp.join(from.sp);
+        let keys: BTreeSet<i64> = self
+            .slots
+            .keys()
+            .chain(from.slots.keys())
+            .copied()
+            .collect();
+        for key in keys {
+            let mut slot = self.slot(key);
+            slot.join(from.slot(key));
+            grew |= self.slots.insert(key, slot) != Some(slot);
+        }
+        grew |= self.other_slots.join(from.other_slots);
+        grew
+    }
+
+    /// Any slot may have been overwritten.
+    fn clobber_slots(&mut self) {
+        self.slots.clear();
+        self.other_slots = Known::Any;
+    }
+}
+
+impl PageFlow {
+    /// Read the jump table of every switch in the function, so each `br`
+    /// that dispatches one branches to its own cases rather than to every
+    /// case of every switch.
+    ///
+    /// Without the tables, the code only a jump table reaches starts from
+    /// what all the function's indirect branches carried, joined (see
+    /// [`PageFlow::solve`]). That is right while there is one switch. With
+    /// two, the cases of each look reached with the state of the other's
+    /// `br`: a page one switch's cases spill to a stack slot appears in the
+    /// slot the other switch reloads its table's address from. OpenSSL's
+    /// `ossl_quic_handle_frames` does exactly that.
+    ///
+    /// A table is read when the `br` ends a [`Dispatch`], the table's address
+    /// is one constant at its load ([`PageFlow::address_constants`]), and
+    /// the case number is bounded by a `cmp` and a conditional branch on the
+    /// only way to the load ([`PageFlow::case_count`]). Every entry has to
+    /// land on an instruction of the function. Anything less and that `br`
+    /// stays an indirect branch whose cases start from the joined state, as
+    /// before.
+    ///
+    /// The table addresses depend on the edges the tables add, so the
+    /// tables are read again with them until the answer stops changing. A
+    /// function where it does not settle keeps no table.
+    fn find_jump_tables(&mut self, data: &ReadData<'_>) {
+        let dispatches: Vec<(usize, Dispatch)> = (0..self.words.len())
+            .filter_map(|i| Some((i, self.dispatch(i)?)))
+            .collect();
+        if dispatches.is_empty() {
+            return;
+        }
+        for _ in 0..4 {
+            let constants = self.address_constants();
+            let mut found = vec![None; self.words.len()];
+            for &(br, dispatch) in &dispatches {
+                let Some(Some(state)) = constants.get(dispatch.load) else {
+                    continue;
+                };
+                let Known::Value(table) = state.regs[dispatch.base] else {
+                    continue;
+                };
+                found[br] = self
+                    .case_count(&dispatch)
+                    .and_then(|count| self.read_cases(&dispatch, table, count, data));
+            }
+            if found == self.br_targets {
+                return;
+            }
+            self.br_targets = found;
+        }
+        self.br_targets = vec![None; self.words.len()];
+    }
+
+    /// The [`Dispatch`] the `br` at word `br` ends, if it ends one.
+    fn dispatch(&self, br: usize) -> Option<Dispatch> {
+        let word = self.words[br];
+        if word & 0xffff_fc1f != 0xd61f_0000 || br < 3 {
+            return None;
+        }
+        let target = ((word >> 5) & 31) as usize;
+
+        // add xT, xA, wE, <extend> #shift; or add xT, xA, xE, lsl #shift.
+        let add = self.words[br - 1];
+        let (extend, shift) = if add & 0xffe0_0000 == 0x8b20_0000 {
+            ((add >> 13) & 7, (add >> 10) & 7)
+        } else if add & 0xffe0_0000 == 0x8b00_0000 {
+            // lsl of a 64-bit register: the entry as loaded, zero-extended.
+            (3, (add >> 10) & 63)
+        } else {
+            return None;
+        };
+        if (add & 31) as usize != target || shift > 4 {
+            return None;
+        }
+        let label_reg = ((add >> 5) & 31) as usize;
+        let entry_reg = ((add >> 16) & 31) as usize;
+        if label_reg == entry_reg || label_reg >= GPRS || entry_reg >= GPRS {
+            return None;
+        }
+
+        // The `adr` and the load, in the two words before the `add`, in
+        // either order, reached only by falling through to them.
+        let (mut label, mut load) = (None, None);
+        for j in [br - 2, br - 3] {
+            let w = self.words[j];
+            let rd = (w & 31) as usize;
+            if w & 0x9f00_0000 == 0x1000_0000 && rd == label_reg && label.is_none() {
+                label = Some(pc_relative_ref(w, self.pc(j)).ok()??.target);
+            } else if w & 0x3fe0_0c00 == 0x3860_0800 && rd == entry_reg && load.is_none() {
+                load = Some(j);
+            } else {
+                return None;
+            }
+        }
+        let (label, load) = (label?, load?);
+        if (br - 2..=br).any(|k| self.branched_into(k)) {
+            return None;
+        }
+
+        // ldrb/ldrh/ldr wE, [xB, wI|xI, <extend> #scale]
+        let w = self.words[load];
+        let entry_len = 1usize << (w >> 30);
+        let option = (w >> 13) & 7;
+        let scaled = w & (1 << 12) != 0;
+        let base = ((w >> 5) & 31) as usize;
+        let index = ((w >> 16) & 31) as usize;
+        if entry_len > 4 || (entry_len > 1 && !scaled) || base >= GPRS || index >= GPRS {
+            return None;
+        }
+        let index_64 = match option {
+            0b010 => false,
+            0b011 => true,
+            _ => return None,
+        };
+        Some(Dispatch {
+            load,
+            base,
+            index,
+            index_64,
+            entry_len,
+            extend,
+            shift,
+            label,
+        })
+    }
+
+    /// Whether anything but the word before branches to word `i`.
+    fn branched_into(&self, i: usize) -> bool {
+        (0..self.words.len()).any(|j| {
+            let (succs, _) = self.successors(j);
+            succs.contains(&i) && j + 1 != i
+        })
+    }
+
+    /// The words that can run just before word `i`.
+    fn predecessors(&self, i: usize) -> Vec<usize> {
+        (0..self.words.len())
+            .filter(|&j| self.successors(j).0.contains(&i))
+            .collect()
+    }
+
+    /// How many cases the table of `dispatch` has: one more than the bound
+    /// a `cmp` of the index register and an unsigned conditional branch put
+    /// on it, found by walking back from the load along the only way to it.
+    ///
+    /// ```text
+    /// cmp  w24, #0x1e
+    /// b.hi .Ldefault                 ; falling through: w24 <= 30
+    /// ldr  x0, [sp, #56]
+    /// ldrh w0, [x0, w24, uxtw #1]    ; 31 entries
+    /// ```
+    ///
+    /// The branch may instead be taken to the table (`b.ls`, `b.lo`). Any
+    /// write to the index register on the way, a join of paths, or a
+    /// comparison narrower than the index the load uses, and the count is
+    /// not known.
+    fn case_count(&self, dispatch: &Dispatch) -> Option<u64> {
+        let mut at = dispatch.load;
+        for _ in 0..32 {
+            let [p] = self.predecessors(at)[..] else {
+                return None;
+            };
+            let word = self.words[p];
+            if word & 0xff00_0010 == 0x5400_0000 && p >= 1 {
+                let cmp = self.words[p - 1];
+                let compares_index = cmp & 0x7f80_001f == 0x7100_001f
+                    && ((cmp >> 5) & 31) as usize == dispatch.index
+                    && (cmp >> 31 == 1 || !dispatch.index_64);
+                if compares_index {
+                    let imm =
+                        u64::from((cmp >> 10) & 0xfff) << if cmp & (1 << 22) != 0 { 12 } else { 0 };
+                    let taken = at != p + 1;
+                    // hi/ls: unsigned >, <=; hs/lo: unsigned >=, <.
+                    let count = match (word & 0xf, taken) {
+                        (0x8, false) | (0x9, true) => imm + 1,
+                        (0x2, false) | (0x3, true) => imm,
+                        _ => return None,
+                    };
+                    return (count > 0 && count <= MAX_JUMP_TABLE_ENTRIES).then_some(count);
+                }
+            }
+            let insn = self.insns[p].as_ref()?;
+            let clobbers_call = match self.calls[p] {
+                Some(Callee::Local) => matches!(dispatch.index, 0 | 1 | 30),
+                Some(_) => dispatch.index <= 18 || dispatch.index == 30,
+                None => false,
+            };
+            if writes_register(insn, dispatch.index) || clobbers_call {
+                return None;
+            }
+            at = p;
+        }
+        None
+    }
+
+    /// The word index of each of the `count` cases the table at `table`
+    /// sends `dispatch` to, deduplicated, or `None` if the table cannot be
+    /// read or an entry lands anywhere but on one of this function's words.
+    fn read_cases(
+        &self,
+        dispatch: &Dispatch,
+        table: u64,
+        count: u64,
+        data: &ReadData<'_>,
+    ) -> Option<Vec<usize>> {
+        let bytes = data(table, count as usize * dispatch.entry_len)?;
+        if bytes.len() != count as usize * dispatch.entry_len {
+            return None;
+        }
+        let mut cases: Vec<usize> = bytes
+            .chunks_exact(dispatch.entry_len)
+            .map(|entry| {
+                let mut raw = [0u8; 8];
+                raw[..entry.len()].copy_from_slice(entry);
+                let raw = u64::from_le_bytes(raw);
+                let value = match dispatch.extend {
+                    0 => raw & 0xff,
+                    1 => raw & 0xffff,
+                    2 => raw & 0xffff_ffff,
+                    4 => raw as u8 as i8 as u64,
+                    5 => raw as u16 as i16 as u64,
+                    6 => raw as u32 as i32 as u64,
+                    _ => raw,
+                };
+                self.index_of(dispatch.label.wrapping_add(value << dispatch.shift))
+                    .filter(|&case| self.insns[case].is_some())
+            })
+            .collect::<Option<_>>()?;
+        cases.sort_unstable();
+        cases.dedup();
+        Some(cases)
+    }
+
+    /// The address each register holds before each word, where it is one
+    /// constant: the page an `adrp` took, or the address an `adr` did, moved
+    /// on by `add`/`sub` immediates, `mov`s, and spills to the stack and
+    /// back through `sp`. Indexed like [`PageFlow::solve`]'s answer.
+    ///
+    /// Code only an unread jump table reaches is followed from what nothing
+    /// set: what the `br` that reaches it carried is taken to be whatever
+    /// each value turns out to be on the other paths. That is what makes a
+    /// table found inside a loop over a switch, whose cases go back round,
+    /// and the edges found that way are checked by following the code again
+    /// with them (see [`PageFlow::find_jump_tables`]). Only the stack's
+    /// position is carried to that code, so its spills are placed.
+    fn address_constants(&self) -> Vec<Option<ConstState>> {
+        let solved = self.solve(
+            ConstState::entry(),
+            ConstState::unreached(),
+            |i, state| Ok(self.constant_step(i, state)),
+            |at, into, from| match at {
+                Some(_) => into.join(from),
+                None => into.sp.join(from.sp),
+            },
+        );
+        solved.expect("constant_step does not fail")
+    }
+
+    /// Run word `i` on `state` for [`PageFlow::address_constants`].
+    fn constant_step(&self, i: usize, state: &ConstState) -> ConstState {
+        let mut out = state.clone();
+        let Some(insn) = &self.insns[i] else {
+            return out;
+        };
+        let word = self.words[i];
+
+        // adr, adrp.
+        if word & 0x1f00_0000 == 0x1000_0000 {
+            let rd = (word & 31) as usize;
+            out.regs[rd] = match pc_relative_ref(word, self.pc(i)) {
+                Ok(Some(r)) => Known::Value(r.target),
+                _ => Known::Any,
+            };
+            return out;
+        }
+
+        // add/sub xd, xn, #imm, sp included.
+        if let Some((d, n, by)) = add_sub_imm(word) {
+            match (d, n) {
+                (31, 31) => {
+                    out.sp = match state.sp {
+                        Frame::At(at) => Frame::At(at + by),
+                        other => other,
+                    }
+                }
+                (31, _) => out.sp = Frame::Unknown,
+                (_, 31) => out.regs[d] = Known::Any,
+                _ => out.regs[d] = state.regs[n].add(by),
+            }
+            return out;
+        }
+
+        // mov xd, xs.
+        if let (
+            Opcode::ORR,
+            [
+                Operand::Register(SizeCode::X, d),
+                Operand::Register(SizeCode::X, 31),
+                Operand::RegShift(ShiftStyle::LSL, 0, SizeCode::X, s),
+                _,
+            ],
+        ) = (insn.opcode, &insn.operands)
+        {
+            let (d, s) = (*d as usize, *s as usize);
+            if d < GPRS {
+                out.regs[d] = if s < GPRS {
+                    state.regs[s]
+                } else {
+                    Known::Value(0)
+                };
+            }
+            return out;
+        }
+
+        // A load or store through `sp` with an immediate offset.
+        if let Some(access) = imm_access(word).filter(|a| a.base == 31) {
+            match state.sp.known() {
+                Some(frame) => {
+                    let start = frame + access.offset;
+                    for (k, &r) in access.regs.iter().enumerate() {
+                        let at = start + k as i64 * access.len;
+                        let whole = access.gpr && access.len == 8;
+                        if access.load {
+                            let overlapped = state
+                                .slots
+                                .range(at - 7..at + access.len)
+                                .any(|(&s, _)| s != at);
+                            if access.gpr && r < GPRS {
+                                out.regs[r] = if whole && !overlapped {
+                                    state.slot(at)
+                                } else {
+                                    Known::Any
+                                };
+                            }
+                        } else {
+                            let overlapping: Vec<i64> = out
+                                .slots
+                                .range(at - 7..at + access.len)
+                                .map(|(&s, _)| s)
+                                .collect();
+                            for s in overlapping {
+                                out.slots.insert(s, Known::Any);
+                            }
+                            for off in (0..access.len).step_by(8) {
+                                out.slots.insert(at + off, Known::Any);
+                            }
+                            if whole {
+                                let value = if r < GPRS {
+                                    state.regs[r]
+                                } else {
+                                    Known::Value(0)
+                                };
+                                out.slots.insert(at, value);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    if access.load {
+                        for &r in access.regs.iter().filter(|&&r| access.gpr && r < GPRS) {
+                            out.regs[r] = Known::Any;
+                        }
+                    } else {
+                        out.clobber_slots();
+                    }
+                }
+            }
+            if let Some(by) = access.writeback {
+                out.sp = match state.sp {
+                    Frame::At(at) => Frame::At(at + by),
+                    other => other,
+                };
+            }
+            return out;
+        }
+
+        // Anything else: what it writes is no longer known, and a store
+        // through the frame pointer, or through `sp` any other way, may
+        // land on any slot.
+        for r in 0..GPRS {
+            if writes_register(insn, r) {
+                out.regs[r] = Known::Any;
+            }
+        }
+        if writes_register(insn, 31) {
+            out.sp = Frame::Unknown;
+        }
+        let stores = !writes_first_operand(insn.opcode)
+            || matches!(
+                insn.opcode,
+                Opcode::STXR
+                    | Opcode::STXRB
+                    | Opcode::STXRH
+                    | Opcode::STLXR
+                    | Opcode::STLXRB
+                    | Opcode::STLXRH
+                    | Opcode::STXP
+                    | Opcode::STLXP
+            );
+        let through_frame = insn.operands.iter().any(|operand| match *operand {
+            Operand::RegPreIndex(b, ..)
+            | Operand::RegPostIndex(b, _)
+            | Operand::RegRegOffset(b, ..)
+            | Operand::RegPostIndexReg(b, _) => b == 31 || b == 29,
+            _ => false,
+        });
+        if stores && through_frame {
+            out.clobber_slots();
+        }
+        match self.calls[i] {
+            Some(Callee::Local) => {
+                out.regs[0] = Known::Any;
+                out.regs[1] = Known::Any;
+            }
+            Some(_) => out.regs[..=18].fill(Known::Any),
+            None if insn.opcode == Opcode::SVC => out.regs[0] = Known::Any,
+            None => {}
+        }
+        if self.calls[i].is_some() {
+            out.regs[30] = Known::Any;
+        }
+        out
+    }
+}
+
 impl PageFlow {
     /// Run instruction `i` on `regs` for [`address_reaches`]: the registers
     /// after it, with each use it makes of a formed address added to `uses`.
@@ -1554,8 +2138,10 @@ fn is_call(opcode: Opcode) -> bool {
 /// loops, until it is overwritten; an `add #imm` or unsigned-offset load or
 /// store that takes it as the base is the other half of the pair. A 64-bit
 /// `mov` carries the page to its destination, and a call does not end it
-/// (see the call in `PageFlow::step_regs`). Code only a jump table reaches is
-/// followed too; see `PageFlow::solve`.
+/// (see the call in `PageFlow::step_regs`). A switch's `br` goes to the cases
+/// its jump table, read through `data`, lists; see
+/// `PageFlow::find_jump_tables`. Code only a jump table that could not be
+/// read reaches is followed too; see `PageFlow::solve`.
 ///
 /// `callee` says what a `bl` to an address calls. A page in `x0` or `x1`
 /// does not survive a call to an import, which the compiler cannot know the
@@ -1587,8 +2173,9 @@ pub fn pair_lo12_refs(
     bytes: &[u8],
     vaddr: u64,
     callee: &dyn Fn(u64) -> Callee,
+    data: &ReadData<'_>,
 ) -> Result<Vec<Lo12Ref>> {
-    let flow = PageFlow::new(bytes, vaddr, callee);
+    let flow = PageFlow::new(bytes, vaddr, callee, data);
     let context = |i: usize| {
         format!(
             "pairing adrp pages in code at 0x{vaddr:x}, offset 0x{:x}",
@@ -1700,8 +2287,9 @@ pub fn address_reaches(
     vaddr: u64,
     formers: &[usize],
     callee: &dyn Fn(u64) -> Callee,
+    data: &ReadData<'_>,
 ) -> BTreeMap<usize, Vec<Reach>> {
-    let flow = PageFlow::new(bytes, vaddr, callee);
+    let flow = PageFlow::new(bytes, vaddr, callee, data);
     let formers: BTreeSet<usize> = formers.iter().map(|&off| off / INSN_LEN).collect();
     if formers.is_empty() {
         return BTreeMap::new();
@@ -2048,10 +2636,31 @@ pub static AARCH64: Arch = {
 /// indexes it, so they move with it.
 fn scan(unit: &TextUnit<'_, '_>) -> Result<UnitScan> {
     let len = code_len(unit.bytes, unit.vaddr, unit.fde_end);
+    let data = |addr: u64, len: usize| read_only_data(unit.elf, addr, len);
     Ok(UnitScan {
-        refs: scan_refs(&unit.bytes[..len], unit.vaddr, unit.callee)?,
+        refs: scan_refs(&unit.bytes[..len], unit.vaddr, unit.callee, &data)?,
         jump_tables: Vec::new(),
     })
+}
+
+/// The `len` bytes at `addr` in `elf`, if they lie inside one read-only data
+/// section: where a jump table is, and what the code cannot change under it.
+fn read_only_data(
+    elf: &object::read::elf::ElfFile64<'_>,
+    addr: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    use object::ObjectSection;
+    let section = crate::elf_reader::section_at_address(elf, addr)?;
+    if section.kind() != object::SectionKind::ReadOnlyData {
+        return None;
+    }
+    let start = usize::try_from(addr - section.address()).ok()?;
+    section
+        .data()
+        .ok()?
+        .get(start..start.checked_add(len)?)
+        .map(<[u8]>::to_vec)
 }
 
 /// How many of a text unit's leading bytes are its function's code: as far
@@ -2079,9 +2688,14 @@ fn code_len(bytes: &[u8], vaddr: u64, fde_end: Option<u64>) -> usize {
 /// `:lo12:` base, a PC-relative form with no field to rewrite — fails the
 /// extraction, since copying it as it is would leave it aimed at wherever the
 /// old offset lands.
-fn scan_refs(code: &[u8], vaddr: u64, callee: &dyn Fn(u64) -> Callee) -> Result<Vec<CodeRef>> {
+fn scan_refs(
+    code: &[u8],
+    vaddr: u64,
+    callee: &dyn Fn(u64) -> Callee,
+    data: &ReadData<'_>,
+) -> Result<Vec<CodeRef>> {
     let mut refs = Vec::new();
-    let pairs = pair_lo12_refs(code, vaddr, callee)?;
+    let pairs = pair_lo12_refs(code, vaddr, callee, data)?;
     let pc_rel = scan_pc_relative_refs(code, vaddr)?;
     let word_at = |offset: usize| {
         u32::from_le_bytes(
@@ -2105,7 +2719,7 @@ fn scan_refs(code: &[u8], vaddr: u64, callee: &dyn Fn(u64) -> Callee) -> Result<
                 .map(|&(offset, _)| offset),
         )
         .collect();
-    let mut reaches = address_reaches(code, vaddr, &formers, callee);
+    let mut reaches = address_reaches(code, vaddr, &formers, callee, data);
 
     for pair in &pairs {
         let word = word_at(pair.offset);
@@ -2476,6 +3090,11 @@ mod tests {
         words.iter().copied().flat_map(u32::to_le_bytes).collect()
     }
 
+    /// A library with no read-only data, so no jump table can be read.
+    fn no_data(_: u64, _: usize) -> Option<Vec<u8>> {
+        None
+    }
+
     /// A program GNU as assembled and `ld -Ttext=0x400000 -Tdata=0x410ff0`
     /// linked, as `objdump -d` shows it. The data symbols are `a` (0x410ff0)
     /// and `a2` (0x410ff8), on one page, `b` (0x413000) and `v` (0x414020).
@@ -2517,7 +3136,7 @@ mod tests {
 
     #[test]
     fn every_lo12_half_is_paired_with_the_adrp_the_assembler_meant() {
-        let pairs = pair_lo12_refs(&code(PAIRS), BASE, &|_| Callee::Local).unwrap();
+        let pairs = pair_lo12_refs(&code(PAIRS), BASE, &|_| Callee::Local, &no_data).unwrap();
         assert_eq!(
             pairs,
             [
@@ -2547,7 +3166,7 @@ mod tests {
     /// the words the linker wrote.
     #[test]
     fn a_pair_patched_with_its_target_reproduces_both_words() {
-        for pair in pair_lo12_refs(&code(PAIRS), BASE, &|_| Callee::Local).unwrap() {
+        for pair in pair_lo12_refs(&code(PAIRS), BASE, &|_| Callee::Local, &no_data).unwrap() {
             let word = PAIRS[pair.offset / INSN_LEN];
             assert_eq!(Field::Lo12.patch(word, pair.target, 0, 0).unwrap(), word);
             for adrp in pair.adrps {
@@ -2564,7 +3183,7 @@ mod tests {
     fn pairing_error(words: &[u32]) -> String {
         format!(
             "{:#}",
-            pair_lo12_refs(&code(words), BASE, &|_| Callee::Local).unwrap_err()
+            pair_lo12_refs(&code(words), BASE, &|_| Callee::Local, &no_data).unwrap_err()
         )
     }
 
@@ -2596,7 +3215,7 @@ mod tests {
     /// What `address_reaches` says of the address the instruction at
     /// `former` forms in `words`, as `(offset, access_len)`.
     fn reaches_of(words: &[u32], former: usize) -> Vec<(i64, Option<u64>)> {
-        address_reaches(&code(words), BASE, &[former], &|_| Callee::Local)
+        address_reaches(&code(words), BASE, &[former], &|_| Callee::Local, &no_data)
             .remove(&former)
             .unwrap_or_default()
             .into_iter()
@@ -2682,9 +3301,12 @@ mod tests {
             0xa940_07e0, // ldp x0, x1, [sp]
         ] {
             assert_eq!(
-                pair_lo12_refs(&code(&[ADRP_X0, kill, ADD_X0_LO12, RET]), BASE, &|_| {
-                    Callee::Local
-                })
+                pair_lo12_refs(
+                    &code(&[ADRP_X0, kill, ADD_X0_LO12, RET]),
+                    BASE,
+                    &|_| { Callee::Local },
+                    &no_data
+                )
                 .unwrap(),
                 [],
                 "{kill:08x}"
@@ -2707,6 +3329,7 @@ mod tests {
             ]),
             BASE,
             &|_| Callee::Local,
+            &no_data,
         )
         .unwrap();
         assert_eq!(pairs, [lo12(0x0c, &[0x00], 0x41_0ff0)]);
@@ -2747,7 +3370,7 @@ mod tests {
             Callee::NoReturn
         };
         assert_eq!(
-            pair_lo12_refs(&code(&words), BASE, &callee).unwrap(),
+            pair_lo12_refs(&code(&words), BASE, &callee, &no_data).unwrap(),
             [lo12(0x10, &[0x04], 0x41_0ff0)]
         );
         // Taken to return, the call falls into the `add` without the page.
@@ -2770,7 +3393,7 @@ mod tests {
                 Callee::External
             };
             assert_eq!(
-                pair_lo12_refs(&code(&words), BASE, &callee).unwrap(),
+                pair_lo12_refs(&code(&words), BASE, &callee, &no_data).unwrap(),
                 [],
                 "{call:08x}"
             );
@@ -2793,6 +3416,7 @@ mod tests {
             ]),
             BASE,
             &|_| Callee::Local,
+            &no_data,
         )
         .unwrap();
         assert_eq!(pairs, [lo12(0x04, &[0x00], 0x41_0ff0)]);
@@ -2864,10 +3488,132 @@ mod tests {
             ]),
             BASE,
             &|_| Callee::Local,
+            &no_data,
         )
         .unwrap();
         // The second case overwrote x19 before its load.
         assert_eq!(pairs, [lo12(0x08, &[0x00], 0x41_4020)]);
+    }
+
+    /// Two switches in one function, each in its own loop, linked with
+    /// `ld -Ttext=0x400000 --section-start=.rodata=0x410000
+    /// -Tdata=0x411000`: the shape of OpenSSL's `ossl_quic_handle_frames`.
+    /// A case of the first spills a page to `[sp, #56]`, the slot the second
+    /// keeps its table's address in and reloads on every trip round. The
+    /// tables are `ta` (0x410000) and `tb` (0x410008), and `d` is at
+    /// 0x411010.
+    const TWO_SWITCHES: &[u32] = &[
+        0x3400_01e0, // 0x00  cbz w0, b_head
+        0x9000_0093, // 0x04  adrp x19, ta
+        0x9100_0273, // 0x08  add x19, x19, :lo12:ta
+        0x7100_043f, // 0x0c  a_head: cmp w1, #1
+        0x5400_0308, // 0x10  b.hi done
+        0x3861_4a62, // 0x14  ldrb w2, [x19, w1, uxtw]
+        0x1000_0063, // 0x18  adr x3, a_cases
+        0x8b22_8862, // 0x1c  add x2, x3, w2, sxtb #2
+        0xd61f_0040, // 0x20  br x2
+        0xb000_0084, // 0x24  a_cases: adrp x4, d
+        0xf900_1fe4, // 0x28  str x4, [sp, #56]
+        0xf940_1fe4, // 0x2c  ldr x4, [sp, #56]
+        0xb940_1085, // 0x30  ldr w5, [x4, :lo12:d]
+        0x17ff_fff6, // 0x34  b a_head
+        0x17ff_fff5, // 0x38  a_case1: b a_head
+        0x9000_0080, // 0x3c  b_head: adrp x0, tb
+        0x9100_2000, // 0x40  add x0, x0, :lo12:tb
+        0xf900_1fe0, // 0x44  str x0, [sp, #56]
+        0x7100_043f, // 0x48  b_loop: cmp w1, #1
+        0x5400_0128, // 0x4c  b.hi done
+        0xf940_1fe0, // 0x50  ldr x0, [sp, #56]
+        0x3861_4802, // 0x54  ldrb w2, [x0, w1, uxtw]
+        0x1000_0063, // 0x58  adr x3, b_cases
+        0x8b22_8862, // 0x5c  add x2, x3, w2, sxtb #2
+        0xd61f_0040, // 0x60  br x2
+        0xd503_201f, // 0x64  b_cases: nop
+        0x17ff_fff8, // 0x68  b b_loop
+        0x17ff_fff7, // 0x6c  b_case1: b b_loop
+        RET,         // 0x70  done
+    ];
+
+    /// `.rodata` of [`TWO_SWITCHES`]: `ta` sends case 1 five words on,
+    /// `tb` two.
+    const TWO_SWITCHES_RODATA: [u8; 10] = [0, 5, 0, 0, 0, 0, 0, 0, 0, 2];
+
+    fn two_switches_rodata(addr: u64, len: usize) -> Option<Vec<u8>> {
+        let start = usize::try_from(addr.checked_sub(0x41_0000)?).ok()?;
+        TWO_SWITCHES_RODATA
+            .get(start..start + len)
+            .map(<[u8]>::to_vec)
+    }
+
+    /// Each switch's `br` is given the cases its own table lists, bounded by
+    /// the `cmp` in front of it, found whether the table's address sits in a
+    /// register or a stack slot.
+    #[test]
+    fn each_switch_branches_to_the_cases_its_table_lists() {
+        let flow = PageFlow::new(
+            &code(TWO_SWITCHES),
+            BASE,
+            &|_| Callee::Local,
+            &two_switches_rodata,
+        );
+        assert_eq!(flow.br_targets[0x20 / INSN_LEN], Some(vec![9, 14]));
+        assert_eq!(flow.br_targets[0x60 / INSN_LEN], Some(vec![25, 27]));
+        let branches = flow.br_targets.iter().filter(|t| t.is_some()).count();
+        assert_eq!(branches, 2);
+    }
+
+    /// With the tables read, the page the first switch's case spills never
+    /// reaches the second switch's reload, so every pair is found. Without
+    /// them, both switches' cases start from what both `br`s carried, and
+    /// the second's table load looks like it reads that page.
+    #[test]
+    fn a_page_one_switch_spills_does_not_reach_another_switch() {
+        let pairs = pair_lo12_refs(
+            &code(TWO_SWITCHES),
+            BASE,
+            &|_| Callee::Local,
+            &two_switches_rodata,
+        )
+        .unwrap();
+        assert_eq!(
+            pairs,
+            [
+                lo12(0x08, &[0x04], 0x41_0000),
+                lo12(0x30, &[0x24], 0x41_1010),
+                lo12(0x40, &[0x3c], 0x41_0008),
+            ]
+        );
+
+        let err = pairing_error(TWO_SWITCHES);
+        assert!(err.contains("at 0x400054 reads x0"), "{err}");
+        assert!(err.contains("adrp at 0x400024"), "{err}");
+    }
+
+    /// A table is only believed when every entry lands on the function's
+    /// code and the case number is bounded on the way to the load; anything
+    /// less leaves the `br` an indirect branch, as when no table is read.
+    #[test]
+    fn a_table_that_does_not_fit_the_code_is_not_read() {
+        // An entry past the end of the function.
+        let past_the_end = |addr: u64, len: usize| {
+            let mut rodata = two_switches_rodata(addr, len)?;
+            rodata[len - 1] = 0x40;
+            Some(rodata)
+        };
+        let flow = PageFlow::new(&code(TWO_SWITCHES), BASE, &|_| Callee::Local, &past_the_end);
+        assert_eq!(flow.br_targets.iter().flatten().count(), 0);
+
+        // No `cmp` bounds the first switch's index.
+        let mut words = TWO_SWITCHES.to_vec();
+        words[0x0c / INSN_LEN] = 0xd503_201f; // nop
+        let flow = PageFlow::new(
+            &code(&words),
+            BASE,
+            &|_| Callee::Local,
+            &two_switches_rodata,
+        );
+        assert_eq!(flow.br_targets[0x20 / INSN_LEN], None);
+        assert_eq!(flow.br_targets[0x60 / INSN_LEN], Some(vec![25, 27]));
     }
 
     const STR_X0_SP_24: u32 = 0xf900_0fe0; // str x0, [sp, #24]
@@ -2902,6 +3648,7 @@ mod tests {
             ]),
             BASE,
             &|_| Callee::Local,
+            &no_data,
         )
         .unwrap();
         assert_eq!(
@@ -2967,7 +3714,7 @@ mod tests {
             ],
         ] {
             assert_eq!(
-                pair_lo12_refs(&code(words), BASE, &|_| Callee::Local).unwrap(),
+                pair_lo12_refs(&code(words), BASE, &|_| Callee::Local, &no_data).unwrap(),
                 [],
                 "{words:08x?}"
             );
@@ -3014,7 +3761,7 @@ mod tests {
         ] {
             let err = format!(
                 "{:#}",
-                pair_lo12_refs(&code(words), BASE, &|_| Callee::Local).unwrap_err()
+                pair_lo12_refs(&code(words), BASE, &|_| Callee::Local, &no_data).unwrap_err()
             );
             assert!(
                 err.contains("both with and without a page in x0"),
