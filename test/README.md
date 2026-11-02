@@ -47,3 +47,11 @@ cc -O2 -fPIC -shared -Wl,-soname,libanchors.so.1 -o libanchors.so.1 libanchors.c
 cc -O2 -fPIC -fno-section-anchors -shared -Wl,-soname,libstatics.so.1 \
    -o libstatics.so.1 libstatics-a.c libstatics-b.c
 ```
+
+`libtextdata.so.1` keeps two constant tables in `.text`, as OpenSSL's aarch64
+assembly does: one typed as an object, one marked only by a `$d` mapping
+symbol. It is assembled from `libtextdata.S`:
+
+```sh
+cc -shared -Wl,-soname,libtextdata.so.1 -o libtextdata.so.1 libtextdata.S
+```

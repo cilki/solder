@@ -929,6 +929,15 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
     };
     let alignment = unit_alignment(sym_vaddr, section.align());
 
+    // A constant table hand-written assembly keeps in `.text` is data. Decoded
+    // as code, its bytes turned into branches and literal loads to nowhere,
+    // and relocating those failed the merge (`_vpsm4_ex_consts` in aarch64
+    // libcrypto). It still goes out with the code rather than with the
+    // read-only data, though: code reaches it with `adr`, whose ±1 MiB the
+    // library met by keeping it in `.text`, and which the far side of every
+    // merged function would not.
+    let is_code = section_kind == SectionKind::Text && !sym.object;
+
     // Data symbol units: pick up .rela.dyn entries within the symbol's range
     // (e.g. __dso_handle's self-pointing RELATIVE, function pointers in .data).
     //
@@ -948,7 +957,7 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
     // executable copy-relocates, and which answered a relocation with no
     // symbol with a `UnitId(u32::MAX)` that nothing ever extracts — a
     // `MergedUnit` target the relocator could only fail on.
-    if section_kind != SectionKind::Text {
+    if !is_code {
         collect_dynamic_range_relocs(
             lib,
             &key.sym,
@@ -965,7 +974,7 @@ fn process_symbol(key: &UnitKey, id: UnitId, state: &mut ExtractionState) -> Res
     // function needs from it: how far the code runs, the addresses its
     // instructions keep, and the jump tables it indexes. See
     // `arch::MachineCode::scan`.
-    let scan = if section_kind == SectionKind::Text {
+    let scan = if is_code {
         let arch = state.arch;
         (arch.code.scan)(&TextUnit {
             bytes: &bytes,
@@ -1239,6 +1248,12 @@ struct SymInfo {
     vaddr: u64,
     size: u64,
     section: object::SectionIndex,
+    /// The symbol names data, wherever it lives: it is typed `STT_OBJECT`, or
+    /// it is the synthetic name of an unnamed table in `.text` (see
+    /// [`LibIndex::text_objects`]). Hand-written assembly keeps constant
+    /// tables in `.text` (OpenSSL's aarch64 SM4 has `_vpsm4_ex_consts`), and
+    /// those are not code to decode.
+    object: bool,
 }
 
 /// Precomputed per-library symbol lookups.
@@ -1267,6 +1282,13 @@ struct LibIndex {
     /// unnamed object ends there, which is what [`needed_prefix`] needs of a
     /// bound.
     object_addrs_by_section: Vec<(u64, usize)>,
+    /// `[start, end)` of the data in each executable section, sorted: every
+    /// sized `STT_OBJECT`, and every run an aarch64 `$d` mapping symbol starts
+    /// outside a function. Such data is copied as it is rather than decoded
+    /// as code, and a reference into the middle of it reaches it
+    /// too, though no `.eh_frame` range covers data and no section copy is
+    /// made of `.text` (see `resolve_owning_unit`).
+    text_objects: Vec<(u64, u64)>,
     /// `(start address, size, section index)` of each PLT section, so a
     /// scanned code reference can be recognised as a stub (see `plt_target`).
     plt_spans: Vec<(u64, u64, object::SectionIndex)>,
@@ -1313,9 +1335,23 @@ impl LibIndex {
         let mut addr_to_name: FastMap<u64, String> = FastMap::default();
         let mut addrs_by_section: Vec<(u64, usize)> = Vec::new();
         let mut object_addrs_by_section: Vec<(u64, usize)> = Vec::new();
+        let mut text_objects: Vec<(u64, u64)> = Vec::new();
         // Addresses that hold a global definition, which is what lets a global
         // take a name over from a local but not from another global or alias.
         let mut global_at: FastSet<u64> = FastSet::default();
+
+        // What `text_objects` is built from besides the typed objects: where
+        // each executable section holds a mapping symbol, which of those start
+        // a run of data, and the sized functions, whose own literal pools stay
+        // part of them.
+        let text_sections: FastMap<usize, u64> = elf
+            .sections()
+            .filter(|s| s.kind() == ObjSectionKind::Text)
+            .map(|s| (s.index().0, s.address() + s.size()))
+            .collect();
+        let mut mapping_addrs: Vec<(u64, usize)> = Vec::new();
+        let mut data_marks: Vec<(u64, object::SectionIndex)> = Vec::new();
+        let mut functions: Vec<(u64, u64)> = Vec::new();
 
         // Iterate .symtab first, then .dynsym, so first-writer-wins matches the
         // ".symtab preferred" order of the original linear scans.
@@ -1324,10 +1360,19 @@ impl LibIndex {
             let object::SymbolSection::Section(si) = sym.section() else {
                 continue;
             };
-            if sym.name().is_ok_and(is_mapping_symbol) {
+            let addr = sym.address();
+            let in_text = text_sections.contains_key(&si.0);
+            if let Ok(name) = sym.name()
+                && is_mapping_symbol(name)
+            {
+                if in_text {
+                    mapping_addrs.push((addr, si.0));
+                    if name.as_bytes()[1] == b'd' {
+                        data_marks.push((addr, si));
+                    }
+                }
                 continue;
             }
-            let addr = sym.address();
             addrs_by_section.push((addr, si.0));
             if sym.size() > 0 {
                 object_addrs_by_section.push((addr, si.0));
@@ -1342,7 +1387,15 @@ impl LibIndex {
                 vaddr: addr,
                 size: sym.size(),
                 section: si,
+                object: sym.kind() == object::SymbolKind::Data,
             };
+            if in_text && info.size > 0 {
+                match sym.kind() {
+                    object::SymbolKind::Data => text_objects.push((addr, addr + info.size)),
+                    object::SymbolKind::Text => functions.push((addr, addr + info.size)),
+                    _ => {}
+                }
+            }
             if !sym.is_undefined() {
                 // The plain name is what the executable imports, and an import
                 // binds to the library's global definition. `.symtab` lists
@@ -1389,6 +1442,32 @@ impl LibIndex {
         object_addrs_by_section.sort_unstable();
         object_addrs_by_section.dedup();
 
+        // A `$d` outside every function starts a table the assembly keeps in
+        // `.text` without naming it as an object: aarch64 libcrypto's SHA-256
+        // constants ahead of `asm_aescbc_sha256_hmac`, bsaes's XTS masks. It
+        // runs to the next mapping symbol or symbol, where code resumes.
+        mapping_addrs.sort_unstable();
+        functions.sort_unstable();
+        for (start, section) in data_marks {
+            let i = functions.partition_point(|&(f, _)| f <= start);
+            if functions[..i].last().is_some_and(|&(_, end)| start < end) {
+                continue;
+            }
+            let end = [
+                next_in_section(&mapping_addrs, start, section),
+                next_in_section(&addrs_by_section, start, section),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(text_sections[&section.0]);
+            if start < end {
+                text_objects.push((start, end));
+            }
+        }
+        text_objects.sort_unstable();
+        text_objects.dedup();
+
         let plt_spans: Vec<(u64, u64, object::SectionIndex)> = elf
             .sections()
             .filter(|s| matches!(s.name().unwrap_or(""), ".plt" | ".plt.got" | ".plt.sec"))
@@ -1433,6 +1512,7 @@ impl LibIndex {
             addr_to_name,
             addrs_by_section,
             object_addrs_by_section,
+            text_objects,
             plt_spans,
             got_to_name,
             fdes,
@@ -1464,6 +1544,18 @@ impl LibIndex {
             .iter()
             .find(|&&(start, size, _)| addr >= start && addr - start < size)
             .map(|&(start, _, section)| (start, section))
+    }
+
+    /// `[start, end)` of the data in an executable section that holds `addr`,
+    /// if any (see [`LibIndex::text_objects`]).
+    fn text_object_containing(&self, addr: u64) -> Option<(u64, u64)> {
+        // Sorted by start then end, so of the objects starting at the same
+        // address the longest comes last.
+        let i = self
+            .text_objects
+            .partition_point(|&(start, _)| start <= addr);
+        let &(start, end) = self.text_objects[..i].last()?;
+        (addr < end).then_some((start, end))
     }
 
     /// Smallest defined-symbol address greater than `addr` within `section`.
@@ -1593,7 +1685,8 @@ fn decode_dynamic_relocs(
 fn find_symbol(lib: Lib<'_, '_>, name: &str) -> Result<SymInfo> {
     // Synthetic anonymous unit: resolve the address encoded in the name to the
     // executable section that contains it. Size is left at 0 so the caller
-    // infers it from the next symbol boundary.
+    // infers it from the next symbol boundary, unless the address starts an
+    // unnamed table, whose run is known.
     if let Some(hex) = name.strip_prefix(ANON_UNIT_PREFIX) {
         let addr = u64::from_str_radix(hex.trim_start_matches("0x"), 16)
             .with_context(|| format!("malformed anonymous unit name '{name}'"))?;
@@ -1602,10 +1695,17 @@ fn find_symbol(lib: Lib<'_, '_>, name: &str) -> Result<SymInfo> {
             .with_context(|| {
                 format!("anonymous unit address {addr:#x} not in any executable section")
             })?;
+        // An unnamed table in `.text` is as long as its run; anything else
+        // ends where the next symbol or function does.
+        let data = lib
+            .index
+            .text_object_containing(addr)
+            .filter(|&(start, _)| start == addr);
         return Ok(SymInfo {
             vaddr: addr,
-            size: 0,
+            size: data.map_or(0, |(start, end)| end - start),
             section: section.index(),
+            object: data.is_some(),
         });
     }
 
@@ -1679,6 +1779,19 @@ fn shadowed_unit_name(name: &str, addr: u64) -> String {
 /// Returns `None` when nothing is known to own `addr`; the caller decides
 /// whether to fall back to an anonymous unit starting there.
 fn resolve_owning_unit(lib: Lib<'_, '_>, addr: u64) -> Option<(String, u64)> {
+    // Data in an executable section, wherever in it the address lands. Code
+    // reaches into these constant tables (`adrp`/`add` to `_vpsm4_ex_consts +
+    // 0xb0`), and as no unwind range covers data and a section copy is never
+    // made of `.text`, nothing below would find such an address an owner. An
+    // unnamed run, or one only a code label names, goes by its address, which
+    // `find_symbol` resolves back to it.
+    if let Some((start, _)) = lib.index.text_object_containing(addr) {
+        let name = find_symbol_at_address(lib.index, start)
+            .filter(|name| find_symbol(lib, name).is_ok_and(|sym| sym.object))
+            .unwrap_or_else(|| anon_unit_name(start));
+        return Some((name, addr - start));
+    }
+
     // A symbol defined at exactly this address, as long as it has a usable
     // size: zero-size boundary markers (e.g. `__TMC_END__`, which sits at the
     // exact end of .data with nothing after it) own nothing.
@@ -5880,6 +5993,84 @@ mod tests {
                 "{reloc:?} is not to `first` in the copy"
             );
         }
+    }
+
+    /// `test/aarch64/libtextdata.so.1`, built from `libtextdata.S`: two
+    /// constant tables in `.text`, one typed as an object and one marked only
+    /// by a `$d` mapping symbol.
+    fn textdata_lib() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/aarch64/libtextdata.so.1"
+        ))
+    }
+
+    /// The unit `name` out of `units`, with its bytes checked against the
+    /// library's: a table in `.text` is copied as it is and gets no
+    /// relocations, though its words decode as far branches and literal loads
+    /// (see `libtextdata.S`).
+    fn text_table(units: &[ExtractedUnit], name: &str, vaddr: u64, len: u64) {
+        let unit = units
+            .iter()
+            .find(|u| u.name == name)
+            .unwrap_or_else(|| panic!("no unit '{name}'"));
+        let bytes = std::fs::read(textdata_lib()).expect("read the fixture");
+        let elf = parse_lib(&bytes);
+        let text = elf.section_by_name(".text").expect(".text");
+        let at = (vaddr - text.address()) as usize;
+        assert_eq!(
+            unit.bytes,
+            &text.data().expect(".text bytes")[at..at + len as usize],
+            "'{name}' is not the table's bytes"
+        );
+        assert!(
+            unit.relocations.is_empty(),
+            "'{name}' was scanned as code: {:?}",
+            unit.relocations
+        );
+        // It goes out with the code, which reaches it with `adr` (±1 MiB).
+        assert_eq!(unit.section_kind, SectionKind::Text);
+    }
+
+    /// `typed` reaches 16 bytes into `consts`, an `STT_OBJECT` in `.text`:
+    ///
+    /// ```text
+    /// 630: adrp x1, 0x0
+    /// 634: add  x1, x1, #0x650      ; consts + 16
+    /// ```
+    ///
+    /// No unwind range covers the object, so the reference used to resolve
+    /// nowhere, and the merged pair kept the library's address. Reached by
+    /// name, the object was decoded as code: in OpenSSL's `_vpsm4_ex_consts`
+    /// that gave an out-of-reach literal load, which failed a merge of aarch64
+    /// libcrypto.
+    #[test]
+    fn an_object_in_text_is_copied_as_data_and_reached_inside() {
+        let state = extract_aarch64_from(&textdata_lib(), "typed");
+        let units = extract_aarch64_units_of(&textdata_lib(), "typed");
+        assert_eq!(
+            units["typed"],
+            ["0x4 Lo12[0] -> consts+16", "0x0 AdrpPage[] -> consts+16"]
+        );
+        text_table(&state.units, "consts", 0x640, 32);
+    }
+
+    /// `untyped` reaches 8 bytes into a table nothing names, which runs from
+    /// its `$d` to the end of `.text`:
+    ///
+    /// ```text
+    /// 660: adr  x1, 0x678           ; table + 8
+    /// ```
+    ///
+    /// No unwind range covers it, so the reference used to resolve nowhere and
+    /// the merged `adr` kept pointing at the library's address.
+    #[test]
+    fn an_unnamed_table_in_text_is_copied_as_data_and_reached_inside() {
+        let state = extract_aarch64_from(&textdata_lib(), "untyped");
+        let units = extract_aarch64_units_of(&textdata_lib(), "untyped");
+        let table = anon_unit_name(0x670);
+        assert_eq!(units["untyped"], [format!("0x0 Adr[] -> {table}+8")]);
+        text_table(&state.units, &table, 0x670, 24);
     }
 
     /// `test/aarch64/libstatics.so.1`, built from `libstatics-a.c` and
