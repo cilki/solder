@@ -337,10 +337,12 @@ pub fn validate_executable(elf: &ElfFile64<'_>, path: &Path) -> Result<(&'static
     let e_machine = header.e_machine(endian);
 
     let Some(arch) = Arch::of_machine(e_machine.0) else {
+        let supported: Vec<&str> = crate::arch::SUPPORTED.iter().map(|a| a.name).collect();
         bail!(
-            "{}: unsupported architecture e_machine=0x{:04x} (only EM_X86_64 is supported)",
+            "{}: unsupported architecture e_machine=0x{:04x} (supported: {})",
             path.display(),
-            e_machine.0
+            e_machine.0,
+            supported.join(", ")
         );
     };
 
@@ -1575,6 +1577,32 @@ mod executable_tests {
                 "{name} is a PIE executable"
             );
         }
+    }
+
+    /// An executable for each supported machine gets through to its own
+    /// descriptor; any other is refused with the list of what would be taken.
+    #[test]
+    fn an_executable_is_accepted_for_each_supported_machine_and_no_other() {
+        let mut bytes = std::fs::read(GREP).expect("test binary");
+        for (e_machine, name) in [
+            (object::elf::EM_X86_64, "x86-64"),
+            (object::elf::EM_AARCH64, "aarch64"),
+        ] {
+            bytes[0x12..0x14].copy_from_slice(&e_machine.0.to_le_bytes());
+            let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*bytes)
+                .expect("parse the fixture");
+            let (arch, _) = validate_executable(&elf, Path::new(GREP))
+                .unwrap_or_else(|e| panic!("{name} should be accepted: {e:#}"));
+            assert_eq!(arch.name, name);
+        }
+
+        bytes[0x12..0x14].copy_from_slice(&object::elf::EM_RISCV.0.to_le_bytes());
+        let err = format!(
+            "{:#}",
+            validate(&bytes).expect_err("riscv is not supported")
+        );
+        assert!(err.contains("e_machine=0x00f3"), "{err}");
+        assert!(err.contains("supported: x86-64, aarch64"), "{err}");
     }
 
     /// An executable with no section header table is not something the merge

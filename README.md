@@ -208,8 +208,10 @@ Each `DT_NEEDED` soname is looked up in the first of these that contains it:
 4. `LD_LIBRARY_PATH`
 5. `DT_RUNPATH` of the executable
 6. `/etc/ld.so.cache`
-7. `/lib64`, `/usr/lib64`, `/lib`, `/usr/lib`, `/lib/x86_64-linux-gnu`,
-   `/usr/lib/x86_64-linux-gnu`
+7. `/lib64`, `/usr/lib64`, `/lib`, `/usr/lib`, and the multiarch pair for the
+   executable's architecture: `/lib/x86_64-linux-gnu` and
+   `/usr/lib/x86_64-linux-gnu`, or `/lib/aarch64-linux-gnu` and
+   `/usr/lib/aarch64-linux-gnu`
 
 That is the dynamic linker's own order with `$SYSROOT/lib` and `-L` spliced in
 after `DT_RPATH`. Note that `-L` therefore does *not* override an executable
@@ -234,18 +236,20 @@ beside itself (`-Wl,-rpath,'$ORIGIN/libs'`) resolves them from there:
 
 - `$ORIGIN` / `${ORIGIN}` — the directory holding the executable, symlinks
   resolved
-- `$LIB` / `${LIB}` — `lib64`, solder being x86-64 only
+- `$LIB` / `${LIB}` — `lib64`, which is what glibc uses on both x86-64 and
+  aarch64
 
 `$PLATFORM` is deliberately *not* substituted: it stands for whatever the
 loader makes of the CPU the merged binary eventually runs on, which is not
 knowable at merge time. An entry containing it is skipped with a warning, the
 same way the loader skips it when it has no platform string.
 
-`/etc/ld.so.cache` is filtered the way the loader filters it: only x86-64
-`libc6` entries are considered, so the i386 or x32 build of a soname is never
-picked, and a `glibc-hwcaps` variant loses to the baseline library — whether
-the machine that will run the merged executable implements the instructions
-that variant was built for is not knowable from here.
+`/etc/ld.so.cache` is filtered the way the loader filters it: only `libc6`
+entries for the executable's own architecture are considered, so the i386 or
+x32 build of a soname (or the ILP32 one on aarch64) is never picked, and a
+`glibc-hwcaps` variant loses to the baseline library — whether the machine
+that will run the merged executable implements the instructions that variant
+was built for is not knowable from here.
 
 A soname none of that turns up is only an error when you asked for it. Named
 with `-m`, it fails the merge, like any other `-m` entry that cannot take
@@ -373,7 +377,11 @@ dynamic, or relink against a soname.
 
 ## Limitations
 
-- x86_64 only
+- x86-64 and aarch64 only. On aarch64 a function's addresses are built from an
+  `adrp` page and a low-twelve-bit immediate in separate instructions, which
+  `solder` pairs by following the page's register through the function. Where
+  it cannot follow it (a page spilled to the stack through an `sp` it cannot
+  track, say) it refuses the merge rather than guess
 - The executable has to still have its section header table. The loader never
   reads one, but the merge does, for the two things nothing else records:
   `.dynsym` and `.gnu.version` have no length anywhere in `.dynamic` — there is

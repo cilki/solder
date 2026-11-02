@@ -19,15 +19,11 @@
 //! field the architecture's module encodes. The stages outside this module go through the
 //! descriptor and never name an architecture, so a third one is a new module
 //! and an entry in [`SUPPORTED`].
-//!
-//! [`SUPPORTED`] still lists only x86-64 even though [`AARCH64`] is
-//! described: see there for what is missing.
 
 pub mod aarch64;
 mod site;
 pub mod x86_64;
 
-#[cfg_attr(not(test), allow(unused_imports))]
 pub use aarch64::AARCH64;
 pub use site::{Site, Word};
 pub use x86_64::X86_64;
@@ -205,7 +201,7 @@ impl Arch {
 }
 
 /// Every architecture the merge accepts an executable for.
-pub static SUPPORTED: &[&Arch] = &[&X86_64];
+pub static SUPPORTED: &[&Arch] = &[&X86_64, &AARCH64];
 
 /// The extractor's view of an architecture's machine code: the steps of
 /// extracting a function that depend on how its instructions are encoded.
@@ -447,17 +443,15 @@ mod tests {
     fn an_executable_is_matched_to_its_descriptor_by_e_machine() {
         let arch = Arch::of_machine(object::elf::EM_X86_64.0).expect("x86-64 is supported");
         assert!(std::ptr::eq(arch, &X86_64));
+        let arch = Arch::of_machine(object::elf::EM_AARCH64.0).expect("aarch64 is supported");
+        assert!(std::ptr::eq(arch, &AARCH64));
     }
 
     /// Opening the gate for a machine is what adding its descriptor to
     /// `SUPPORTED` does, so until there is one nothing else gets through.
     #[test]
     fn a_machine_without_a_descriptor_is_not_supported() {
-        for e_machine in [
-            object::elf::EM_AARCH64.0,
-            object::elf::EM_386.0,
-            object::elf::EM_RISCV.0,
-        ] {
+        for e_machine in [object::elf::EM_386.0, object::elf::EM_RISCV.0] {
             assert!(Arch::of_machine(e_machine).is_none(), "{e_machine}");
         }
     }
@@ -465,11 +459,12 @@ mod tests {
     /// Every descriptor, supported or not yet.
     const DESCRIBED: [&Arch; 2] = [&X86_64, &AARCH64];
 
+    /// A descriptor nothing lets through is code only the tests run.
     #[test]
-    fn every_supported_architecture_is_described() {
-        for arch in SUPPORTED {
+    fn every_described_architecture_is_supported() {
+        for arch in DESCRIBED {
             assert!(
-                DESCRIBED.iter().any(|d| std::ptr::eq(*d, *arch)),
+                SUPPORTED.iter().any(|s| std::ptr::eq(*s, arch)),
                 "{}",
                 arch.name
             );

@@ -1,6 +1,3 @@
-// Only the tests reach it until the extractor decodes aarch64 code; see the
-// module's own comment.
-#[cfg_attr(not(test), allow(dead_code))]
 mod arch;
 mod dep_graph;
 mod eh_frame;

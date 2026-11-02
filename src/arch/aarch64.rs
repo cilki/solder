@@ -27,7 +27,6 @@
 //! [`AARCH64`]'s [`MachineCode`], the relocator writes their [`InsnField`]s
 //! through [`Site::Aarch64`](super::Site::Aarch64), and the writer emits its
 //! trampolines through the descriptor.
-//! `arch::SUPPORTED` still refuses aarch64 executables.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2520,13 +2519,6 @@ fn plt_stub_slot_at(sec_data: &[u8], sec_addr: u64, addr: u64) -> Option<u64> {
 
 /// aarch64 (`EM_AARCH64`), LP64, per the ARM ELF ABI (AAELF64) and glibc's
 /// `sysdeps/aarch64`.
-///
-/// Not in [`SUPPORTED`](super::SUPPORTED) yet, so an aarch64 executable is
-/// still refused at the gate; opening it, and turning round the tests that
-/// check it refuses aarch64, is the step left. Until then this is what the
-/// per-architecture tables of the search, the reader, the extractor, the
-/// patcher and the writer are tested against.
-#[cfg_attr(not(test), allow(dead_code))]
 pub static AARCH64: Arch = {
     use Unliftable::{Copy, Ifunc};
     use object::elf::{
