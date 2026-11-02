@@ -1273,7 +1273,8 @@ struct LibIndex {
     addr_to_name: FastMap<u64, String>,
     /// Every defined symbol address paired with its section index (as a plain
     /// `usize`, since `SectionIndex` isn't `Ord`), sorted by address, for
-    /// `infer_symbol_size`'s "next symbol boundary" search.
+    /// `infer_symbol_size`'s "next symbol boundary" search. A label inside
+    /// code is left out (see [`is_code_label`]).
     addrs_by_section: Vec<(u64, usize)>,
     /// The same for the symbols that have a size, which are the addresses at
     /// which the library is known to start an object of its own. A zero-size
@@ -1329,6 +1330,18 @@ fn is_mapping_symbol(name: &str) -> bool {
     )
 }
 
+/// Whether `sym` is a plain label hand-written assembly left in `.symtab`: a
+/// local symbol with no type and no size, such as OpenSSL's
+/// `ossl_md5_blocks_loop`, the head of a loop inside the zero-size
+/// `ossl_md5_block_asm_data_order`. A label says nothing about where the
+/// function around it ends, and taken for a bound it cut that function's
+/// inferred size at the loop. Assembly marks its real entry points with
+/// `.type` or `.globl`, and a typed symbol, a global one, or one with a size
+/// still bounds.
+fn is_code_label(sym: &object::read::elf::ElfSymbol64<'_, '_>) -> bool {
+    sym.kind() == object::SymbolKind::Unknown && sym.is_local() && sym.size() == 0
+}
+
 impl LibIndex {
     fn build(elf: &object::read::elf::ElfFile64<'_>, path: &Path, arch: &Arch) -> Result<Self> {
         let mut by_name: FastMap<String, SymInfo> = FastMap::default();
@@ -1373,7 +1386,9 @@ impl LibIndex {
                 }
                 continue;
             }
-            addrs_by_section.push((addr, si.0));
+            if !(in_text && is_code_label(&sym)) {
+                addrs_by_section.push((addr, si.0));
+            }
             if sym.size() > 0 {
                 object_addrs_by_section.push((addr, si.0));
             }
@@ -6237,5 +6252,46 @@ mod tests {
             );
             assert_eq!(follow(veneer), vaddr_of(target), "branch at {branch:#x}");
         }
+    }
+
+    /// `test/aarch64/liblabels.so.1`, built from `liblabels.S`.
+    fn labels_lib() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/aarch64/liblabels.so.1"
+        ))
+    }
+
+    /// `sum` is a function with no size whose loop starts at a plain label,
+    /// as OpenSSL's `ossl_md5_block_asm_data_order` is (see `liblabels.S`):
+    ///
+    /// ```text
+    /// 624: sum:      mov  x3, #0
+    /// 628: sum_loop: ldr  w4, [x0], #4
+    /// 634:           b.ne sum_loop
+    /// 638:           adrp x2, bias
+    /// 63c:           ldr  w4, [x2, #:lo12:bias]
+    /// 648: next:
+    /// ```
+    ///
+    /// The label used to bound `sum`'s inferred size, so the unit kept only
+    /// its first instruction and fell off its end into whatever the merge
+    /// put next: the merged openssl's `dgst -md5` crashed that way. The unit
+    /// runs to `next`, the loop's branch stays inside it, and the read after
+    /// the loop is relocated.
+    #[test]
+    fn a_code_label_does_not_bound_the_function_it_is_in() {
+        let units = extract_aarch64_units_of(&labels_lib(), "sum");
+        assert!(!units.contains_key("sum_loop"), "{units:?}");
+        assert_eq!(
+            units["sum"],
+            [
+                "0x18 Lo12[20] -> liblabels.so.1:.rodata+0x0+0",
+                "0x14 AdrpPage[] -> liblabels.so.1:.rodata+0x0+0",
+            ]
+        );
+        let state = extract_aarch64_from(&labels_lib(), "sum");
+        let sum = state.units.iter().find(|u| u.name == "sum").expect("sum");
+        assert_eq!(sum.bytes.len(), 0x648 - 0x624);
     }
 }

@@ -55,3 +55,10 @@ symbol. It is assembled from `libtextdata.S`:
 ```sh
 cc -shared -Wl,-soname,libtextdata.so.1 -o libtextdata.so.1 libtextdata.S
 ```
+
+`liblabels.so.1` has a function with no size whose loop starts at a plain
+label, as OpenSSL's aarch64 MD5 does. It is assembled from `liblabels.S`:
+
+```sh
+cc -shared -Wl,-soname,liblabels.so.1 -o liblabels.so.1 liblabels.S
+```
