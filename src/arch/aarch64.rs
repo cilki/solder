@@ -700,6 +700,77 @@ fn add_sub_imm(word: u32) -> Option<(usize, usize, i64)> {
     ))
 }
 
+/// The `add`/`sub sp, sp, xm{, uxtx|sxtx #shift}` that `word` is, as `(m,
+/// shift, sub)`: how GCC moves `sp` by a frame too large for an immediate,
+/// after putting the size in a scratch register with `mov`/`movk`:
+///
+/// ```text
+/// mov  x13, #0x4810
+/// sub  sp, sp, x13
+/// ```
+///
+/// Register 31 is `xzr` in the `m` place.
+fn sp_add_sub_reg(word: u32) -> Option<(usize, u32, bool)> {
+    let sub = match word & 0xffe0_0000 {
+        0x8b20_0000 => false,
+        0xcb20_0000 => true,
+        _ => return None,
+    };
+    let (rd, rn) = (word & 31, (word >> 5) & 31);
+    // uxtx or sxtx: all 64 bits of the register, shifted left by at most 4.
+    let option = (word >> 13) & 7;
+    let shift = (word >> 10) & 7;
+    (rd == 31 && rn == 31 && option & 0b011 == 0b011 && shift <= 4).then_some((
+        ((word >> 16) & 31) as usize,
+        shift,
+        sub,
+    ))
+}
+
+/// Where [`sp_add_sub_reg`] leaves `sp`, from `sp` before it, when the
+/// register it adds or subtracts holds `by`, shifted left by `shift`.
+fn moved_by_reg(sp: Frame, by: Known, shift: u32, sub: bool) -> Frame {
+    match (sp, by) {
+        (Frame::Unreached, _) => Frame::Unreached,
+        (Frame::At(at), Known::Value(v)) => {
+            let by = (v << shift) as i64;
+            Frame::At(if sub {
+                at.wrapping_sub(by)
+            } else {
+                at.wrapping_add(by)
+            })
+        }
+        _ => Frame::Unknown,
+    }
+}
+
+/// The `movz`/`movn`/`movk` that `word` is, as its destination and the value
+/// it leaves there, given what the destination held before: a `movk` only
+/// replaces 16 bits of it. A 32-bit form clears the upper half.
+fn move_wide(word: u32, old: Known) -> Option<(usize, Known)> {
+    if word & 0x1f80_0000 != 0x1280_0000 {
+        return None;
+    }
+    let wide = word & (1 << 31) != 0;
+    let opc = (word >> 29) & 3;
+    let hw = (word >> 21) & 3;
+    if opc == 0b01 || (!wide && hw > 1) {
+        return None;
+    }
+    let shift = hw * 16;
+    let imm = u64::from((word >> 5) & 0xffff) << shift;
+    let mask = if wide { u64::MAX } else { 0xffff_ffff };
+    let value = match opc {
+        0b00 => Known::Value(!imm & mask),
+        0b10 => Known::Value(imm),
+        _ => match old {
+            Known::Value(v) => Known::Value((v & !(0xffff << shift) | imm) & mask),
+            other => other,
+        },
+    };
+    Some(((word & 31) as usize, value))
+}
+
 /// Opcodes whose first operand is a general-purpose register they write
 /// without reading. Any register operand after it is read.
 fn writes_first_operand(opcode: Opcode) -> bool {
@@ -896,6 +967,9 @@ struct PageFlow {
     /// Per word, where it branches to if it is the `br` of a switch whose
     /// jump table was read (see [`PageFlow::find_jump_tables`]).
     br_targets: Vec<Option<Vec<usize>>>,
+    /// Per word, what the register an `add`/`sub sp, sp, xm` moves `sp` by
+    /// holds before it ([`PageFlow::address_constants`]), if the word is one.
+    sp_by: Vec<Option<Known>>,
 }
 
 /// Reads `len` bytes of the library at a virtual address, if they are
@@ -943,9 +1017,33 @@ impl PageFlow {
             vaddr,
             calls,
             br_targets: vec![None; n],
+            sp_by: vec![None; n],
         };
         flow.find_jump_tables(data);
+        flow.find_sp_moves();
         flow
+    }
+
+    /// Fill in [`PageFlow::sp_by`], once the jump tables have settled the
+    /// edges the constants are followed along.
+    fn find_sp_moves(&mut self) {
+        let moves: Vec<(usize, usize)> = (0..self.words.len())
+            .filter(|&i| self.insns[i].is_some())
+            .filter_map(|i| Some((i, sp_add_sub_reg(self.words[i])?.0)))
+            .collect();
+        if moves.is_empty() {
+            return;
+        }
+        let constants = self.address_constants();
+        for (i, m) in moves {
+            self.sp_by[i] = Some(if m < GPRS {
+                constants[i]
+                    .as_ref()
+                    .map_or(Known::Any, |state| state.regs[m])
+            } else {
+                Known::Value(0)
+            });
+        }
     }
 
     fn pc(&self, i: usize) -> u64 {
@@ -1095,7 +1193,7 @@ impl PageFlow {
             }
         }
         (out.regs, out.returned) = self.step_regs(i, insn, &state.regs, state.returned)?;
-        self.track_frame(insn, word, state, &mut out);
+        self.track_frame(i, insn, word, state, &mut out);
         Ok(out)
     }
 
@@ -1208,7 +1306,21 @@ impl PageFlow {
     /// Follow what instruction `insn` (word `word`), which is not a load or
     /// store [`PageFlow::frame_access`] ran, does to `sp`, the frame pointer
     /// and the stack slots, from `state` into `out`.
-    fn track_frame(&self, insn: &Instruction, word: u32, state: &PageState, out: &mut PageState) {
+    fn track_frame(
+        &self,
+        i: usize,
+        insn: &Instruction,
+        word: u32,
+        state: &PageState,
+        out: &mut PageState,
+    ) {
+        // `add`/`sub sp, sp, xm`, by the constant `xm` holds if it is one.
+        if let Some((_, shift, sub)) = sp_add_sub_reg(word) {
+            let by = self.sp_by[i].unwrap_or(Known::Any);
+            out.set_sp(moved_by_reg(state.sp, by, shift, sub));
+            return;
+        }
+
         let frame_of = |r: usize| match r {
             31 => state.sp,
             29 => state.fp,
@@ -1825,6 +1937,27 @@ impl PageFlow {
             return out;
         }
 
+        // movz, movn, movk.
+        let rd = (word & 31) as usize;
+        let old = state.regs.get(rd).copied().unwrap_or(Known::Any);
+        if let Some((rd, value)) = move_wide(word, old) {
+            if rd < GPRS {
+                out.regs[rd] = value;
+            }
+            return out;
+        }
+
+        // add/sub sp, sp, xm: a large frame, its size in a register.
+        if let Some((m, shift, sub)) = sp_add_sub_reg(word) {
+            let by = if m < GPRS {
+                state.regs[m]
+            } else {
+                Known::Value(0)
+            };
+            out.sp = moved_by_reg(state.sp, by, shift, sub);
+            return out;
+        }
+
         // add/sub xd, xn, #imm, sp included.
         if let Some((d, n, by)) = add_sub_imm(word) {
             match (d, n) {
@@ -2164,7 +2297,7 @@ fn is_call(opcode: Opcode) -> bool {
 /// stored anywhere but such a slot, compared, truncated, or used any other
 /// way than as a `:lo12:` base or `mov` source; a slot read other than as
 /// the whole page, or that cannot be told apart from its neighbours because
-/// `sp` moved by a register; a base that holds a page on some paths and not
+/// `sp` moved by a register that does not hold one constant; a base that holds a page on some paths and not
 /// on others, or the pages of two `adrp`s that disagree; and a `:lo12:`
 /// offset of 4 KiB or more. A merge that moves the code with such a
 /// reference in it would leave it pointing at the wrong address.
@@ -3713,6 +3846,95 @@ mod tests {
         }
     }
 
+    const MOV_X13_FRAME: u32 = 0xd289_020d; // mov x13, #0x4810
+    const SUB_SP_X13: u32 = 0xcb2d_63ff; // sub sp, sp, x13
+    const ADD_SP_X13: u32 = 0x8b2d_63ff; // add sp, sp, x13
+
+    /// A frame too large for an immediate, as in pcre2's `pcre2_compile_8`:
+    /// its size is put in a register first, then subtracted from `sp`. A
+    /// page spilled below it is placed, and paired where it is reloaded,
+    /// whether the size takes one `mov` or a `mov` and a `movk`.
+    #[test]
+    fn a_page_spilled_under_a_frame_sized_by_a_register_is_paired() {
+        for frame in [
+            &[MOV_X13_FRAME][..],
+            // mov x13, #0x10000; movk x13, #0x10
+            &[0xd2a0_002d, 0xf280_020d],
+        ] {
+            let mut words = frame.to_vec();
+            let at = words.len() * INSN_LEN;
+            words.extend([
+                SUB_SP_X13,   // at + 0x00
+                ADRP_X0,      // at + 0x04
+                STR_X0_SP_24, // at + 0x08
+                0x9400_0000,  // at + 0x0c  bl .
+                LDR_X0_SP_24, // at + 0x10
+                ADD_X0_LO12,  // at + 0x14
+            ]);
+            words.extend(frame);
+            words.extend([ADD_SP_X13, RET]);
+            let pairs = pair_lo12_refs(&code(&words), BASE, &|_| Callee::Local, &no_data);
+            assert_eq!(
+                pairs.unwrap(),
+                [lo12(at + 0x14, &[at + 0x04], 0x41_0ff0)],
+                "{words:08x?}"
+            );
+        }
+    }
+
+    /// The register-sized frame is followed both ways: a slot under it is
+    /// left behind once the `add` pops the frame, so the same slot under
+    /// the next frame holds no page.
+    #[test]
+    fn a_page_spilled_under_a_frame_sized_by_a_register_is_popped_with_it() {
+        let words = [
+            MOV_X13_FRAME,
+            SUB_SP_X13,
+            ADRP_X0,
+            STR_X0_SP_24,
+            ADD_SP_X13,
+            SUB_SP_X13,
+            LDR_X0_SP_24,
+            ADD_X0_LO12,
+            RET,
+        ];
+        assert_eq!(
+            pair_lo12_refs(&code(&words), BASE, &|_| Callee::Local, &no_data).unwrap(),
+            []
+        );
+    }
+
+    /// `movz`, `movn` and `movk`, 64- and 32-bit, leave the value the
+    /// architecture says; a `movk` into a register not known stays unknown.
+    #[test]
+    fn move_wide_immediates_are_followed() {
+        let any = Known::Any;
+        assert_eq!(
+            move_wide(MOV_X13_FRAME, any),
+            Some((13, Known::Value(0x4810)))
+        );
+        assert_eq!(
+            move_wide(0x9280_0000, any),
+            Some((0, Known::Value(u64::MAX)))
+        ); // mov x0, #-1
+        assert_eq!(
+            move_wide(0x1280_0000, any),
+            Some((0, Known::Value(0xffff_ffff)))
+        ); // mov w0, #-1
+        // movk x13, #0x10
+        assert_eq!(
+            move_wide(0xf280_020d, Known::Value(0x1_0000)),
+            Some((13, Known::Value(0x1_0010)))
+        );
+        // movk w0, #0x1234, lsl #16
+        assert_eq!(
+            move_wide(0x72a2_4680, Known::Value(u64::MAX)),
+            Some((0, Known::Value(0x1234_ffff)))
+        );
+        assert_eq!(move_wide(0xf280_020d, any), Some((13, any)));
+        assert_eq!(move_wide(SUB_SP_X13, any), None);
+    }
+
     /// Where the slot a page was spilled to cannot be told apart from the
     /// ones around it, a reload from it may or may not be the page, and
     /// completing it is refused rather than guessed.
@@ -3721,6 +3943,34 @@ mod tests {
         const SUB_SP_X1: u32 = 0xcb21_63ff; // sub sp, sp, x1
         let err = pairing_error(&[ADRP_X0, SUB_SP_X1, STR_X0_SP_24, RET]);
         assert!(err.contains("has moved by an amount"), "{err}");
+
+        // The register a frame is sized by holds a different constant down
+        // each path, or one loaded from memory.
+        for words in [
+            &[
+                0xb400_0062,   // 0x00  cbz  x2, 0x0c
+                MOV_X13_FRAME, // 0x04
+                0x1400_0002,   // 0x08  b    0x10
+                0xd280_040d,   // 0x0c  mov  x13, #0x20
+                SUB_SP_X13,    // 0x10
+                ADRP_X0,
+                STR_X0_SP_24,
+                RET,
+            ][..],
+            &[
+                0xf940_004d, // ldr x13, [x2]
+                SUB_SP_X13,
+                ADRP_X0,
+                STR_X0_SP_24,
+                RET,
+            ],
+        ] {
+            let err = pairing_error(words);
+            assert!(
+                err.contains("has moved by an amount"),
+                "{words:08x?}: {err}"
+            );
+        }
 
         for words in [
             // The slot holds the page down one path only.
