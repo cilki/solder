@@ -374,6 +374,21 @@ dynamic, or relink against a soname.
   exactly like the input to all of them — down to `readelf -x .fini_array`
   printing the destructor list the merge replaced and `readelf -x
   .preinit_array` answering that there is no such section
+- Names the merged code and data in `.symtab`, as a static link would have,
+  so `gdb`, `perf`, `nm` and `objdump -d` see functions in `.solder.text`
+  rather than one unnamed run of bytes: an `STT_FILE` per merged library, then
+  an `STT_FUNC` per extracted function and an `STT_OBJECT` per extracted data
+  object or copied section, at the address the merge gave it. Helpers a
+  stripped library gave no name keep the `.solder.anon.<address>` name the
+  merge calls them by, the address being where they were in the library, and
+  copied sections are named `<library>:<section>`. The trampolines follow
+  under an `STT_FILE` named `solder`, each as `<symbol>@solder.plt` after the
+  `foo@plt` binutils gives a PLT entry. Every one of these is `STB_LOCAL`, so
+  none becomes an export and two libraries defining the same static do not
+  look like a duplicate definition. An executable that still has a `.symtab`
+  keeps every entry of it: the new locals go in before its globals, which is
+  where ELF wants locals, and a second merge extends the table the first one
+  wrote
 
 ## Limitations
 
@@ -432,16 +447,19 @@ dynamic, or relink against a soname.
   `pthread_cancel` forced unwind cannot pass it. `gdb` is reduced to guessing
   its way through that code from the prologues. Don't merge a library the
   program unwinds through
-- Merged code carries no symbols either. Nothing names the extracted functions
-  in any symbol table, so a debugger or profiler sees `.solder.text` as one
-  unnamed blob. The names the executable *imported* from the merged library do
-  stay behind in `.dynsym`, as undefined entries that no relocation refers to
-  any more, so `nm -D` on a merged binary still lists exactly the symbols that
-  were merged in as undefined. That part is cosmetic rather than a load
-  failure — their GOT slots are pre-filled and their relocations neutralized,
-  so nothing asks the loader to resolve them — but it does mean the symbol
-  tables are not a way to tell whether a merge worked. Read the
-  `.solder.*` section headers, or `DT_NEEDED`, instead
+- The merged code is named only in `.symtab` (see
+  [How It Works](#how-it-works)). The names the executable *imported* from the
+  merged library stay behind in `.dynsym` as well, as undefined entries that
+  no relocation refers to any more, so `nm -D` on a merged binary still lists
+  exactly the symbols that were merged in as undefined. That part is cosmetic
+  rather than a load failure — their GOT slots are pre-filled and their
+  relocations neutralized, so nothing asks the loader to resolve them — but it
+  means `.dynsym` is not a way to tell whether a merge worked. Read `nm` (the
+  merged functions are the local `t` entries), the `.solder.*` section
+  headers, or `DT_NEEDED`, instead
+- The merge adds a `.symtab` even to a stripped executable, which is all three
+  fixtures. It costs only unmapped bytes at the end of the file; run `strip`
+  over the merged binary if you want it gone again
 - RELRO does not reach the merged region, and the rebuilt `DT_FINI_ARRAY`
   leaves it. `PT_GNU_RELRO` names the bytes `ld.so` makes read-only once it has
   finished relocating, which is why the linker puts `.got`, `.init_array` and

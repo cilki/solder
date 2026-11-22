@@ -561,7 +561,10 @@ fn rewrite_section_headers(
         offset
     };
     let mut added = 0usize;
+    // Which section index each of those mappings got, for the symbols below.
+    let mut region_sections: Vec<(std::ops::Range<u64>, u16)> = Vec::new();
     for region in &regions[..regions.len().saturating_sub(1)] {
+        region_sections.push((region.range.clone(), (table.sections.len() + added) as u16));
         let (name, sh_flags) = if region.flags & PF_X.0 != 0 {
             (".solder.text", (SHF_ALLOC | SHF_EXECINSTR).0)
         } else if region.flags & PF_W.0 != 0 {
@@ -615,6 +618,17 @@ fn rewrite_section_headers(
         added += 1;
     }
 
+    // Name the merged code and data in `.symtab`, the way a static link would
+    // have, so `gdb`, `perf` and `nm` see functions in `.solder.text` instead
+    // of one anonymous run of bytes.
+    added += write_symbol_table(
+        out,
+        &mut shdrs,
+        &mut names,
+        &table,
+        &merged_symbols(plan, &region_sections),
+    )?;
+
     // Lay the rebuilt `.shstrtab` and section header table past the last
     // PT_LOAD, where a linker puts them: neither is mapped at runtime.
     let names_offset = out.len() as u64;
@@ -628,6 +642,310 @@ fn rewrite_section_headers(
     write_u64_le(out, 0x28, new_shoff);
     write_u16_le(out, 0x3c, (table.sections.len() + added) as u16);
     Ok(())
+}
+
+/// `STB_LOCAL` binding, `st_info`'s high nibble.
+const STB_LOCAL: u8 = 0;
+const STT_OBJECT: u8 = 1;
+const STT_FUNC: u8 = 2;
+const STT_FILE: u8 = 4;
+/// `SHN_ABS`: the `st_shndx` of a symbol no section holds, as `STT_FILE` is.
+const SHN_ABS: u16 = 0xfff1;
+/// What the `STT_FILE` ahead of the trampolines is called: `solder` wrote
+/// them, no library did.
+const TRAMPOLINE_FILE: &str = "solder";
+/// Suffix of a trampoline's symbol, after the `foo@plt` binutils gives the PLT
+/// entry that does the same job in a linker's output.
+const TRAMPOLINE_SUFFIX: &str = "@solder.plt";
+
+/// A `.symtab` entry the merge adds, before its name has an offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergedSymbol {
+    name: String,
+    info: u8,
+    shndx: u16,
+    value: u64,
+    size: u64,
+}
+
+/// The `.symtab` entries naming what the merge put in the merged region: per
+/// library, an `STT_FILE` with the library's file name followed by one
+/// `STT_FUNC` per code unit and one `STT_OBJECT` per data unit, then the
+/// trampolines under an `STT_FILE` of their own.
+///
+/// Every one of them is `STB_LOCAL`. They describe code only the merged region
+/// calls, and nothing may bind to it from outside — `.symtab` is never read by
+/// the loader anyway — and two merged libraries that both define a static
+/// `init` would otherwise look like a duplicate definition to every tool.
+///
+/// `region_sections` maps the merged region's mappings, as offsets from its
+/// start, to the `.solder.*` section that covers each. A unit outside all of
+/// them has no section to be relative to and is left unnamed; layout never
+/// puts one there.
+fn merged_symbols(
+    plan: &MergePlan,
+    region_sections: &[(std::ops::Range<u64>, u16)],
+) -> Vec<MergedSymbol> {
+    let section_of = |vaddr: u64| {
+        let offset = vaddr.checked_sub(plan.load_address)?;
+        region_sections
+            .iter()
+            .find(|(range, _)| range.contains(&offset))
+            .map(|&(_, index)| index)
+    };
+
+    // Libraries in the order their first unit was laid out, so the table
+    // reads in the same order as `.solder.text`.
+    let mut libs: Vec<&std::path::Path> = Vec::new();
+    for au in &plan.units {
+        if !libs.contains(&au.unit.source_lib.as_path()) {
+            libs.push(&au.unit.source_lib);
+        }
+    }
+
+    let file_symbol = |name: String| MergedSymbol {
+        name,
+        info: (STB_LOCAL << 4) | STT_FILE,
+        shndx: SHN_ABS,
+        value: 0,
+        size: 0,
+    };
+
+    let mut symbols = Vec::new();
+    for lib in libs {
+        let units: Vec<MergedSymbol> = plan
+            .units
+            .iter()
+            .filter(|au| au.unit.source_lib == lib)
+            .filter_map(|au| {
+                let kind = match au.unit.section_kind {
+                    crate::types::SectionKind::Text => STT_FUNC,
+                    _ => STT_OBJECT,
+                };
+                Some(MergedSymbol {
+                    name: au.unit.name.clone(),
+                    info: (STB_LOCAL << 4) | kind,
+                    shndx: section_of(au.assigned_vaddr)?,
+                    value: au.assigned_vaddr,
+                    size: au.unit.bytes.len() as u64,
+                })
+            })
+            .collect();
+        if units.is_empty() {
+            continue;
+        }
+        let file = lib.file_name().unwrap_or(lib.as_os_str());
+        symbols.push(file_symbol(file.to_string_lossy().into_owned()));
+        symbols.extend(units);
+    }
+
+    let stubs: Vec<MergedSymbol> = plan
+        .trampoline_stubs
+        .iter()
+        .filter_map(|stub| {
+            Some(MergedSymbol {
+                name: format!("{}{TRAMPOLINE_SUFFIX}", stub.symbol_name),
+                info: (STB_LOCAL << 4) | STT_FUNC,
+                shndx: section_of(stub.vaddr)?,
+                value: stub.vaddr,
+                size: plan.arch.trampoline.len,
+            })
+        })
+        .collect();
+    if !stubs.is_empty() {
+        symbols.push(file_symbol(TRAMPOLINE_FILE.to_owned()));
+        symbols.extend(stubs);
+    }
+    symbols
+}
+
+/// A `.symtab` and the `.strtab` its names are in, as bytes, with the index
+/// of its first non-local symbol (its `sh_info`).
+struct SymbolTable {
+    symbols: Vec<u8>,
+    strings: Vec<u8>,
+    first_global: u32,
+}
+
+/// Build the `.symtab` holding `new`, keeping every entry of `old` — the
+/// executable's own table and its `.strtab`, with its `sh_info` — when it had
+/// one.
+///
+/// The ELF rule is that all locals precede all globals, with `sh_info` the
+/// index of the first global. The new symbols are all local, so they go after
+/// the old locals and before the old globals, which therefore move. Nothing
+/// in an executable refers to `.symtab` indices — its relocations are in
+/// `.rela.dyn`/`.rela.plt` and index `.dynsym` — so that renumbering is safe.
+/// The old strings stay at their offsets, so their `st_name`s stay valid; the
+/// new names are appended after them.
+fn build_symbol_table(old: Option<(&[u8], &[u8], usize)>, new: &[MergedSymbol]) -> SymbolTable {
+    let (old_symbols, mut strings, first_global) = match old {
+        Some((symbols, strings, first_global)) => (symbols, strings.to_vec(), first_global),
+        // A fresh table starts with the null symbol, and its strings with the
+        // empty name that symbol has.
+        None => (&[0u8; SYM_ENTRY_SIZE][..], vec![0], 1),
+    };
+    let split = first_global * SYM_ENTRY_SIZE;
+
+    let mut symbols = Vec::with_capacity(old_symbols.len() + new.len() * SYM_ENTRY_SIZE);
+    symbols.extend_from_slice(&old_symbols[..split]);
+    for sym in new {
+        let name = strings.len() as u32;
+        strings.extend_from_slice(sym.name.as_bytes());
+        strings.push(0);
+
+        let mut entry = [0u8; SYM_ENTRY_SIZE];
+        write_u32_le(&mut entry, 0, name);
+        entry[4] = sym.info;
+        entry[5] = 0; // st_other: STV_DEFAULT
+        write_u16_le(&mut entry, 6, sym.shndx);
+        write_u64_le(&mut entry, 8, sym.value);
+        write_u64_le(&mut entry, 16, sym.size);
+        symbols.extend_from_slice(&entry);
+    }
+    symbols.extend_from_slice(&old_symbols[split..]);
+
+    SymbolTable {
+        symbols,
+        strings,
+        first_global: (first_global + new.len()) as u32,
+    }
+}
+
+/// The executable's own `.symtab`, as `write_symbol_table` extends it.
+struct ExistingSymtab<'a> {
+    /// Its section header's index.
+    index: usize,
+    /// Index of its `.strtab`, its `sh_link`.
+    strtab_index: usize,
+    symbols: &'a [u8],
+    strings: &'a [u8],
+    /// Its `sh_info`.
+    first_global: usize,
+}
+
+/// Find the executable's own `.symtab`. `Ok(None)` when it has none, and an
+/// error for one too malformed to extend — including one whose strings share
+/// `.shstrtab` or `.dynstr`, both of which the merge rebuilds on their own.
+fn existing_symbol_table<'a>(
+    out: &'a [u8],
+    shdrs: &[u8],
+    table: &SectionTable,
+) -> Result<Option<ExistingSymtab<'a>>> {
+    use crate::elf_reader::SH_INFO;
+    const SH_LINK: usize = 40;
+
+    let read_u32 = |at: usize| u32::from_le_bytes(shdrs[at..at + 4].try_into().expect("4 bytes"));
+    let Some(index) = (0..table.sections.len())
+        .find(|i| read_u32(i * SHDR_SIZE + SH_TYPE) == object::elf::SHT_SYMTAB.0)
+    else {
+        return Ok(None);
+    };
+    let strtab_index = read_u32(index * SHDR_SIZE + SH_LINK) as usize;
+    let first_global = read_u32(index * SHDR_SIZE + SH_INFO) as usize;
+
+    let bytes_of = |header: &crate::elf_reader::SectionHeader| {
+        let start = header.offset as usize;
+        out.get(start..start.checked_add(header.size as usize)?)
+    };
+    let symbols = bytes_of(&table.sections[index])
+        .filter(|s| s.len() % SYM_ENTRY_SIZE == 0 && first_global * SYM_ENTRY_SIZE <= s.len())
+        .filter(|_| first_global >= 1)
+        .context("its entries are not a whole number of symbols, or sh_info is out of range")?;
+    let strings = table
+        .sections
+        .get(strtab_index)
+        .filter(|s| strtab_index != 0 && strtab_index != table.shstrndx && s.name != ".dynstr")
+        .and_then(bytes_of)
+        .context("its sh_link does not name a .strtab of its own")?;
+    Ok(Some(ExistingSymtab {
+        index,
+        strtab_index,
+        symbols,
+        strings,
+        first_global,
+    }))
+}
+
+/// Write `.symtab`/`.strtab` naming `symbols` at the end of `out`, and make the
+/// section header table describe them: the executable's own pair is repointed
+/// at the rebuilt copies, which keep all of its entries, or a fresh pair is
+/// added to `shdrs` when it had none — which is the usual case, as a stripped
+/// executable keeps its section headers but not its symbols. Neither is
+/// mapped. Returns how many headers were added.
+fn write_symbol_table(
+    out: &mut Vec<u8>,
+    shdrs: &mut Vec<u8>,
+    names: &mut Vec<u8>,
+    table: &SectionTable,
+    symbols: &[MergedSymbol],
+) -> Result<usize> {
+    use crate::elf_reader::SH_INFO;
+    use object::elf::{SHT_STRTAB, SHT_SYMTAB};
+    const SH_LINK: usize = 40;
+
+    if symbols.is_empty() {
+        return Ok(0);
+    }
+    // A broken table of the executable's own is left exactly as it was: better
+    // the merged code unnamed than the executable's symbols dropped.
+    let existing = match existing_symbol_table(out, shdrs, table) {
+        Ok(existing) => existing,
+        Err(e) => {
+            tracing::warn!(
+                "not naming the merged code: the executable's .symtab is unusable: {e:#}"
+            );
+            return Ok(0);
+        }
+    };
+    let built = build_symbol_table(
+        existing
+            .as_ref()
+            .map(|old| (old.symbols, old.strings, old.first_global)),
+        symbols,
+    );
+
+    let mut added = 0;
+    let header_count = shdrs.len() / SHDR_SIZE;
+    let (symtab_index, strtab_index) = match existing {
+        Some(old) => (old.index, old.strtab_index),
+        None => {
+            // Two fresh headers at the end; only the fields a header of each
+            // kind needs beyond the zeroes are filled in below.
+            for name in [".symtab", ".strtab"] {
+                let mut shdr = [0u8; SHDR_SIZE];
+                let name_off = names.len() as u32;
+                names.extend_from_slice(name.as_bytes());
+                names.push(0);
+                write_u32_le(&mut shdr, SH_NAME, name_off);
+                shdrs.extend_from_slice(&shdr);
+                added += 1;
+            }
+            (header_count, header_count + 1)
+        }
+    };
+
+    pad_to(out, 8);
+    let symtab_offset = out.len() as u64;
+    out.extend_from_slice(&built.symbols);
+    let strtab_offset = out.len() as u64;
+    out.extend_from_slice(&built.strings);
+
+    let sym = symtab_index * SHDR_SIZE;
+    write_u32_le(shdrs, sym + SH_TYPE, SHT_SYMTAB.0);
+    write_u64_le(shdrs, sym + SH_OFFSET, symtab_offset);
+    write_u64_le(shdrs, sym + SH_SIZE, built.symbols.len() as u64);
+    write_u32_le(shdrs, sym + SH_LINK, strtab_index as u32);
+    write_u32_le(shdrs, sym + SH_INFO, built.first_global);
+    write_u64_le(shdrs, sym + SH_ADDRALIGN, 8);
+    write_u64_le(shdrs, sym + SH_ENTSIZE, SYM_ENTRY_SIZE as u64);
+
+    let str_ = strtab_index * SHDR_SIZE;
+    write_u32_le(shdrs, str_ + SH_TYPE, SHT_STRTAB.0);
+    write_u64_le(shdrs, str_ + SH_OFFSET, strtab_offset);
+    write_u64_le(shdrs, str_ + SH_SIZE, built.strings.len() as u64);
+    write_u64_le(shdrs, str_ + SH_ADDRALIGN, 1);
+    Ok(added)
 }
 
 /// Fail before writing anything if a slot the dynamic loader has to write at
@@ -1756,6 +2074,170 @@ mod section_header_tests {
         );
     }
 
+    /// The `.symtab` entries of `bytes` as `(name, address, size, kind, local,
+    /// section name)`, read with `object` the way a tool would.
+    fn symtab_entries(bytes: &[u8]) -> Vec<(String, u64, u64, object::SymbolKind, bool, String)> {
+        use object::{Object, ObjectSection, ObjectSymbol};
+
+        let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(bytes)
+            .expect("parse the merged output");
+        elf.symbols()
+            .map(|sym| {
+                let section = sym
+                    .section_index()
+                    .and_then(|i| elf.section_by_index(i).ok())
+                    .and_then(|s| s.name().ok().map(str::to_owned))
+                    .unwrap_or_default();
+                (
+                    sym.name().expect("a symbol name").to_owned(),
+                    sym.address(),
+                    sym.size(),
+                    sym.kind(),
+                    sym.is_local(),
+                    section,
+                )
+            })
+            .collect()
+    }
+
+    /// `sh_info` and `sh_link` of the output's `.symtab`.
+    fn symtab_info_and_link(bytes: &[u8]) -> (u32, u32) {
+        use crate::elf_reader::SH_INFO;
+        let table = section_table(bytes);
+        let at = table.offset + section(&table, ".symtab").index * SHDR_SIZE;
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        (u32_at(at + SH_INFO), u32_at(at + 40))
+    }
+
+    /// Every unit the merge placed is named in `.symtab` at the address layout
+    /// gave it, inside the `.solder.*` section of its own kind, as a local:
+    /// before, the merged code carried no symbols at all, so `gdb` showed
+    /// `?? ()` for every merged frame and `perf` filed every sample in it under
+    /// one unknown range. `test/grep` is stripped, so the table is a new one.
+    #[test]
+    fn the_merged_units_and_trampolines_are_named_in_symtab() {
+        use object::SymbolKind;
+
+        let original = std::fs::read(GREP).expect("read the fixture");
+        assert!(
+            section_table(&original).by_name(".symtab").is_none(),
+            "test/grep has a .symtab; this test is about adding one"
+        );
+
+        let (plan, bytes) = merged_grep();
+        let symbols = symtab_entries(&bytes);
+        let find = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.0 == name)
+                .unwrap_or_else(|| panic!("no '{name}' in the merged .symtab: {symbols:?}"))
+        };
+
+        for (name, kind, section) in [
+            ("fn_a", SymbolKind::Text, ".solder.text"),
+            ("ro_a", SymbolKind::Data, ".solder.rodata"),
+            ("data_a", SymbolKind::Data, ".solder.data"),
+        ] {
+            let unit = plan
+                .units
+                .iter()
+                .find(|u| u.unit.name == name)
+                .expect("the unit was placed");
+            let sym = find(name);
+            assert_eq!(sym.1, unit.assigned_vaddr, "'{name}' is misplaced");
+            assert_eq!(
+                sym.2,
+                unit.unit.bytes.len() as u64,
+                "'{name}' is the wrong size"
+            );
+            assert_eq!(sym.3, kind, "'{name}' is the wrong kind");
+            assert!(sym.4, "'{name}' must stay local, not become an export");
+            assert_eq!(sym.5, section, "'{name}' is in the wrong section");
+        }
+
+        // The units are grouped under the library they came from, which is
+        // what lets `nm` and `gdb` say where a merged function came from.
+        let file = symbols
+            .iter()
+            .position(|s| s.3 == SymbolKind::File && s.0 == "libtest.so.1")
+            .expect("an STT_FILE for the merged library");
+        let fn_a = symbols.iter().position(|s| s.0 == "fn_a").unwrap();
+        assert!(file < fn_a, "the library's STT_FILE comes after its units");
+
+        // Each trampoline is named after what it forwards to.
+        assert!(!plan.trampoline_stubs.is_empty());
+        for stub in &plan.trampoline_stubs {
+            let sym = find(&format!("{}@solder.plt", stub.symbol_name));
+            assert_eq!(sym.1, stub.vaddr);
+            assert_eq!(sym.2, plan.arch.trampoline.len);
+            assert_eq!(sym.3, SymbolKind::Text);
+            assert!(sym.4);
+            assert_eq!(sym.5, ".solder.text");
+        }
+
+        // Nothing but locals, so the first global is past the end; and the
+        // names resolve through the `.strtab` the table links to.
+        let (info, link) = symtab_info_and_link(&bytes);
+        assert_eq!(
+            info as usize,
+            symbols.len() + 1,
+            "sh_info counts the null symbol too"
+        );
+        let table = section_table(&bytes);
+        assert_eq!(table.sections[link as usize].name, ".strtab");
+    }
+
+    /// A second merge over an already-merged executable finds the `.symtab`
+    /// the first one wrote and has to extend it, not replace it: the first
+    /// merge's names describe code that is still there.
+    #[test]
+    fn a_second_merge_keeps_the_symbols_the_first_one_wrote() {
+        let out = tempfile::NamedTempFile::new().expect("temp output");
+        std::fs::copy(GREP, out.path()).expect("seed the output with the fixture");
+        let first = merge_grep_over(out.path());
+        let once = std::fs::read(out.path()).expect("read the first merge back");
+        let second = merge_into(
+            &once,
+            &crate::arch::X86_64,
+            out.path(),
+            InitFiniArrays::default(),
+            &[],
+        );
+        let twice = std::fs::read(out.path()).expect("read the second merge back");
+
+        let fn_a_at = |plan: &MergePlan| {
+            plan.units
+                .iter()
+                .find(|u| u.unit.name == "fn_a")
+                .unwrap()
+                .assigned_vaddr
+        };
+        assert_ne!(fn_a_at(&first), fn_a_at(&second));
+
+        let symbols = symtab_entries(&twice);
+        let mut fn_a: Vec<u64> = symbols
+            .iter()
+            .filter(|s| s.0 == "fn_a")
+            .map(|s| s.1)
+            .collect();
+        fn_a.sort_unstable();
+        let mut expected = vec![fn_a_at(&first), fn_a_at(&second)];
+        expected.sort_unstable();
+        assert_eq!(fn_a, expected, "one 'fn_a' per merge");
+
+        // Everything the first merge named survives with its address.
+        for sym in symtab_entries(&once) {
+            assert!(
+                symbols.iter().any(|s| s.0 == sym.0 && s.1 == sym.1),
+                "the second merge dropped '{}' at {:#x}",
+                sym.0,
+                sym.1
+            );
+        }
+        let (info, _) = symtab_info_and_link(&twice);
+        assert_eq!(info as usize, symbols.len() + 1);
+    }
+
     /// Tools that rebuild a file from its sections (`strip`, `objcopy`) drop
     /// anything no section claims, which was all of the merged code and data.
     #[test]
@@ -2048,5 +2530,90 @@ mod section_header_tests {
             fixture_len,
             "the file the link points at was not merged"
         );
+    }
+}
+
+#[cfg(test)]
+mod symbol_table_tests {
+    use super::*;
+
+    fn entry(name: u32, info: u8, value: u64) -> [u8; SYM_ENTRY_SIZE] {
+        let mut e = [0u8; SYM_ENTRY_SIZE];
+        write_u32_le(&mut e, 0, name);
+        e[4] = info;
+        write_u64_le(&mut e, 8, value);
+        e
+    }
+
+    fn name_of<'s>(symbols: &[u8], strings: &'s [u8], index: usize) -> &'s str {
+        let st_name = u32::from_le_bytes(
+            symbols[index * SYM_ENTRY_SIZE..][..4]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        crate::elf_reader::cstr_at(strings, st_name as usize).expect("a name")
+    }
+
+    /// An unstripped executable's `.symtab` has globals after its locals, and
+    /// ELF wants every local first with `sh_info` the first global's index. The
+    /// merged symbols are all local, so they go between the two, the globals
+    /// move up past them, and every old name still resolves.
+    #[test]
+    fn merged_locals_go_between_the_old_locals_and_the_old_globals() {
+        let strings = b"\0local_fn\0main\0".to_vec();
+        let mut symbols = Vec::new();
+        symbols.extend_from_slice(&[0u8; SYM_ENTRY_SIZE]);
+        symbols.extend_from_slice(&entry(1, (STB_LOCAL << 4) | STT_FUNC, 0x1000));
+        symbols.extend_from_slice(&entry(10, (1 << 4) | STT_FUNC, 0x2000));
+
+        let new = [MergedSymbol {
+            name: "pcre2_match_8".to_owned(),
+            info: (STB_LOCAL << 4) | STT_FUNC,
+            shndx: 29,
+            value: 0x43000,
+            size: 64,
+        }];
+        let built = build_symbol_table(Some((&symbols, &strings, 2)), &new);
+
+        assert_eq!(built.symbols.len(), 4 * SYM_ENTRY_SIZE);
+        assert_eq!(built.first_global, 3);
+        let names: Vec<&str> = (1..4)
+            .map(|i| name_of(&built.symbols, &built.strings, i))
+            .collect();
+        assert_eq!(names, ["local_fn", "pcre2_match_8", "main"]);
+        // The old strings are kept where they were, so the moved global's
+        // entry is byte for byte what it was.
+        assert_eq!(built.strings[..strings.len()], strings[..]);
+        assert_eq!(
+            built.symbols[3 * SYM_ENTRY_SIZE..],
+            symbols[2 * SYM_ENTRY_SIZE..]
+        );
+
+        let merged = &built.symbols[2 * SYM_ENTRY_SIZE..3 * SYM_ENTRY_SIZE];
+        assert_eq!(merged[4], (STB_LOCAL << 4) | STT_FUNC);
+        assert_eq!(u16::from_le_bytes([merged[6], merged[7]]), 29);
+        assert_eq!(
+            u64::from_le_bytes(merged[8..16].try_into().unwrap()),
+            0x43000
+        );
+        assert_eq!(u64::from_le_bytes(merged[16..24].try_into().unwrap()), 64);
+    }
+
+    /// With no table to extend, the new one starts with the null symbol and an
+    /// empty first string, as every `.symtab`/`.strtab` must.
+    #[test]
+    fn a_fresh_table_starts_with_the_null_symbol() {
+        let new = [MergedSymbol {
+            name: "f".to_owned(),
+            info: (STB_LOCAL << 4) | STT_FUNC,
+            shndx: 1,
+            value: 0x10,
+            size: 1,
+        }];
+        let built = build_symbol_table(None, &new);
+        assert_eq!(built.symbols[..SYM_ENTRY_SIZE], [0u8; SYM_ENTRY_SIZE]);
+        assert_eq!(built.strings, b"\0f\0");
+        assert_eq!(built.first_global, 2);
+        assert_eq!(name_of(&built.symbols, &built.strings, 1), "f");
     }
 }
